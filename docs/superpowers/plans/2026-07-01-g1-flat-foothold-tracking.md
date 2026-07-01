@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a separately registered G1 flat-ground foothold-tracking task that trains a 29-DoF four-expert MoE policy from a fixed 44-D foothold command, with resumable curriculum state, play-time visualization, and optional W&B monitoring.
+**Goal:** Add a reusable `FootholdPlannerSensor` and a separately registered G1 flat-ground task that trains a 29-DoF four-expert MoE policy from a versioned 44-D Sensor observation.
 
-**Architecture:** Pure PyTorch modules own foothold geometry, gait transitions, flat target generation, swing references, and curriculum state; these can be tested without launching Isaac Sim. A single Isaac Lab `CommandTerm` adapts those modules to robot/contact state and exposes one authoritative runtime state to observations, rewards, metrics, and markers. New environment and agent configurations inherit the existing G1 parkour task but leave the existing task IDs unchanged.
+**Architecture:** Pure PyTorch modules own geometry, flat planning, gait transitions, swing references, and curriculum state. An independent Isaac Lab `SensorBase` adapter reads robot/contact state, accepts navigation velocity through a setter, and exposes structured `FootholdPlannerData`; observation, reward, critic, metrics, and visualization code consume that single object. The 44-D policy vector is packed by an observation adapter, not by the Sensor.
 
 **Tech Stack:** Python 3.10+, PyTorch 2.7, Isaac Lab manager-based environments, Instinct-RL `WasabiPPO`, Gymnasium, pytest 9, TensorBoard, optional Weights & Biases.
 
@@ -14,7 +14,8 @@
 - Preserve `Instinct-Parkour-G1-v0` and `Instinct-Parkour-G1-Play-v0` behavior.
 - Register new IDs `Instinct-Parkour-Foothold-G1-v0` and `Instinct-Parkour-Foothold-G1-Play-v0`.
 - Keep the actor action dimension at 29 and use four MoE experts from the first training run.
-- Keep the actor foothold interface exactly 44 dimensions; raw depth and binary contacts are excluded from actor observations.
+- Keep the version-1 actor foothold observation exactly 44 dimensions; raw depth and binary contacts are excluded.
+- Keep `FootholdPlannerSensor.data` structured and independent from the 44-D policy format.
 - Use virtual sole centers and sole polygons derived from ankle links; never use the ankle-link origin as the touchdown target.
 - Use a gravity-aligned stance-sole frame frozen at swing start.
 - Start AMP discriminator training immediately, but schedule its reward coefficient through `0.00`, `0.02`, `0.05`, and `0.10`.
@@ -29,14 +30,18 @@
 **Create**
 
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/__init__.py`: public pure-domain API.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/types.py`: command layout, gait-state enum, immutable result records.
+- `source/instinctlab/instinctlab/tasks/parkour/foothold/types.py`: observation layout, gait-state enum, provider records.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/geometry.py`: sole transforms and frozen-frame coordinate conversion.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/flat_provider.py`: curriculum-bounded flat foothold target generation.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/trajectory.py`: two-segment quintic swing reference.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/state_machine.py`: vectorized phase/contact transition logic.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/curriculum.py`: serializable per-environment curriculum state.
 - `source/instinctlab/instinctlab/tasks/parkour/foothold/metrics.py`: touchdown percentile reduction.
-- `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/foothold_command.py`: Isaac Lab adapter and authoritative runtime buffers.
+- `source/instinctlab/instinctlab/sensors/foothold_planner/__init__.py`: public Sensor exports.
+- `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py`: `SensorBase` adapter, PhysX pose/contact views, state updates, markers.
+- `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_cfg.py`: Sensor configuration.
+- `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_data.py`: structured tensor data.
+- `source/instinctlab/instinctlab/tasks/parkour/mdp/foothold_observations.py`: Sensor-to-actor/critic adapters.
 - `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_foothold_flat_cfg.py`: train/play environments.
 - `source/instinctlab/instinctlab/tasks/parkour/config/g1/agents/instinct_rl_foothold_cfg.py`: MoE, PPO, AMP, and rollout settings.
 - `source/instinctlab/instinctlab/utils/wrappers/instinct_rl/foothold_runner.py`: environment-state checkpoint adapter and optional W&B lifecycle.
@@ -44,8 +49,7 @@
 
 **Modify**
 
-- `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/commands_cfg.py`: add `FootholdCommandCfg`.
-- `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/__init__.py`: export command and config.
+- `source/instinctlab/instinctlab/sensors/__init__.py`: export the new Sensor, config, and data class.
 - `source/instinctlab/instinctlab/tasks/parkour/mdp/rewards.py`: phase-gated swing, touchdown, and support rewards.
 - `source/instinctlab/instinctlab/tasks/parkour/mdp/curriculums.py`: feed episode outcomes into curriculum.
 - `source/instinctlab/instinctlab/tasks/parkour/config/g1/__init__.py`: register two new task IDs.
@@ -58,7 +62,7 @@
 
 ---
 
-### Task 1: Freeze the 44-D command and sole-frame mathematics
+### Task 1: Freeze the 44-D observation and sole-frame mathematics
 
 **Files:**
 - Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/__init__.py`
@@ -68,7 +72,7 @@
 - Test: `tests/parkour/foothold/test_geometry.py`
 
 **Interfaces:**
-- Produces: `FOOTHOLD_COMMAND_DIM: int = 44`, `CommandSlice`, `GaitState`, `SoleGeometry`, `make_frozen_stance_frame(origin_w, yaw_w)`, `world_to_frozen(points_w, frame)`, and `frozen_to_world(points_f, frame)`.
+- Produces: `FOOTHOLD_OBSERVATION_DIM: int = 44`, `ObservationSlice`, `GaitState`, `SoleGeometry`, `make_frozen_stance_frame(origin_w, yaw_w)`, `world_to_frozen(points_w, frame)`, and `frozen_to_world(points_f, frame)`.
 
 - [ ] **Step 1: Write failing layout and round-trip tests**
 
@@ -81,14 +85,14 @@ from instinctlab.tasks.parkour.foothold.geometry import (
     make_frozen_stance_frame,
     world_to_frozen,
 )
-from instinctlab.tasks.parkour.foothold.types import CommandSlice, FOOTHOLD_COMMAND_DIM
+from instinctlab.tasks.parkour.foothold.types import FOOTHOLD_OBSERVATION_DIM, ObservationSlice
 
 
-def test_command_layout_is_contiguous_and_44d():
-    slices = [member.value for member in CommandSlice]
+def test_observation_layout_is_contiguous_and_44d():
+    slices = [member.value for member in ObservationSlice]
     assert slices[0].start == 0
     assert all(left.stop == right.start for left, right in zip(slices, slices[1:]))
-    assert slices[-1].stop == FOOTHOLD_COMMAND_DIM == 44
+    assert slices[-1].stop == FOOTHOLD_OBSERVATION_DIM == 44
 
 
 def test_frozen_stance_frame_round_trip():
@@ -114,26 +118,32 @@ Expected: collection fails with `ModuleNotFoundError: No module named 'instinctl
 - [ ] **Step 3: Implement the exact layout and geometry API**
 
 ```python
-class CommandSlice(Enum):
+class ObservationSlice(Enum):
     SWING_ONE_HOT = slice(0, 2)
     PHASE_SIN_COS = slice(2, 4)
     NORMALIZED_TIME = slice(4, 5)
-    CURRENT_POSITION = slice(5, 8)
-    CURRENT_YAW_SIN_COS = slice(8, 10)
-    CURRENT_NORMAL = slice(10, 13)
-    NEXT_POSITION = slice(13, 16)
-    NEXT_YAW_SIN_COS = slice(16, 18)
-    NEXT_NORMAL = slice(18, 21)
-    FEASIBLE_VELOCITY = slice(21, 24)
-    APEX_HEIGHT = slice(24, 25)
-    CORRIDOR_HEIGHTS = slice(25, 33)
-    CORRIDOR_CONFIDENCES = slice(33, 41)
-    PLANNER_VALID = slice(41, 42)
-    NEXT_VALID = slice(42, 43)
-    TERRAIN_CONFIDENCE = slice(43, 44)
+    REFERENCE_POSITION = slice(5, 8)
+    REFERENCE_VELOCITY = slice(8, 11)
+    CURRENT_POSITION = slice(11, 14)
+    CURRENT_YAW_SIN_COS = slice(14, 16)
+    CURRENT_NORMAL = slice(16, 19)
+    NEXT_POSITION = slice(19, 22)
+    NEXT_YAW_SIN_COS = slice(22, 24)
+    NEXT_NORMAL = slice(24, 27)
+    FEASIBLE_VELOCITY = slice(27, 30)
+    POSITION_ERROR = slice(30, 33)
+    VELOCITY_ERROR = slice(33, 36)
+    APEX_HEIGHT = slice(36, 37)
+    PLANNER_VALID = slice(37, 38)
+    NEXT_VALID = slice(38, 39)
+    TERRAIN_CONFIDENCE = slice(39, 40)
+    SUPPORT_MARGIN = slice(40, 41)
+    EDGE_RISK = slice(41, 42)
+    UNKNOWN_FRACTION = slice(42, 43)
+    RECOVERY_STATE = slice(43, 44)
 
 
-FOOTHOLD_COMMAND_DIM = 44
+FOOTHOLD_OBSERVATION_DIM = 44
 
 
 class GaitState(IntEnum):
@@ -160,7 +170,7 @@ Expected: `3 passed`.
 
 ```bash
 git add source/instinctlab/instinctlab/tasks/parkour/foothold tests/parkour/foothold/test_types.py tests/parkour/foothold/test_geometry.py
-git commit -m "feat(foothold): define command and sole frames"
+git commit -m "feat(foothold): define observation and sole frames"
 ```
 
 ### Task 2: Generate curriculum-bounded flat footholds
@@ -323,68 +333,133 @@ git add source/instinctlab/instinctlab/tasks/parkour/foothold/state_machine.py s
 git commit -m "feat(foothold): add gait state and swing reference"
 ```
 
-### Task 4: Integrate one authoritative Isaac Lab command term
+### Task 4: Integrate the authoritative `FootholdPlannerSensor`
 
 **Files:**
-- Create: `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/foothold_command.py`
-- Modify: `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/commands_cfg.py`
-- Modify: `source/instinctlab/instinctlab/tasks/parkour/mdp/commands/__init__.py`
-- Test: `tests/parkour/foothold/test_command_packing.py`
+- Create: `source/instinctlab/instinctlab/sensors/foothold_planner/__init__.py`
+- Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_data.py`
+- Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_cfg.py`
+- Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py`
+- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/planner_core.py`
+- Modify: `source/instinctlab/instinctlab/sensors/__init__.py`
+- Test: `tests/parkour/foothold/test_sensor_data.py`
+- Test: `tests/parkour/foothold/test_sensor_state.py`
 
 **Interfaces:**
-- Produces: `FootholdCommand(CommandTerm)`, `FootholdCommandCfg`, `command: Tensor[N,44]`, `swing_reference_w`, `touchdown_latched`, `target_error`, `state_dict()`, and `load_state_dict()`.
+- Produces: `FootholdPlannerCore`, `PlannerInputs`, `FootholdPlannerSensor(SensorBase)`, `FootholdPlannerSensorCfg`, `FootholdPlannerData`, `set_navigation_command(command)`, `data`, `state_dict()`, and `load_state_dict(state)`.
 
-- [ ] **Step 1: Test command packing without simulation**
+- [ ] **Step 1: Write failing structured-data and idempotence tests**
 
 ```python
-def test_pack_command_writes_every_named_slice():
-    fields = {}
-    for index, command_slice in enumerate(CommandSlice):
-        width = command_slice.value.stop - command_slice.value.start
-        fields[command_slice] = torch.full((2, width), float(index))
-    packed = pack_foothold_command(fields)
-    assert packed.shape == (2, 44)
-    for command_slice, expected in fields.items():
-        torch.testing.assert_close(packed[:, command_slice.value], expected)
+def test_sensor_data_allocates_required_shapes():
+    data = FootholdPlannerData.zeros(num_envs=4, device="cpu")
+    assert data.sole_pos_w.shape == (4, 2, 3)
+    assert data.current_target_pos_f.shape == (4, 3)
+    assert data.swing_reference_pos_f.shape == (4, 3)
+    assert data.swing_reference_vel_f.shape == (4, 3)
+    assert data.phase.shape == (4,)
+    assert data.new_touchdown.dtype == torch.bool
+
+
+def test_same_timestamp_advances_core_once():
+    core = FootholdPlannerCore.create(num_envs=2, device="cpu")
+    inputs = PlannerInputs.zeros(num_envs=2, device="cpu")
+    inputs.timestamp[:] = 0.02
+    inputs.planner_valid[:] = True
+    core.update(inputs)
+    phase_after_first_read = core.data.phase.clone()
+    core.update(inputs)
+    torch.testing.assert_close(core.data.phase, phase_after_first_read)
 ```
 
-- [ ] **Step 2: Implement `pack_foothold_command` and the command adapter**
+- [ ] **Step 2: Verify the missing Sensor failure**
 
-`FootholdCommand.__init__` resolves left/right ankle body IDs once, creates `SoleGeometry(center_offset_b=[0.02, 0.0, -0.058], half_length=0.12, half_width=0.055)`, allocates all buffers on `env.device`, and rejects a packed tensor whose last dimension is not 44. `_resample_command(env_ids)` freezes the current stance frame and obtains current/next targets from `sample_flat_targets`. `_update_command()` advances gait, evaluates the swing reference, computes errors and metrics, and packs the 44-D tensor. `_set_debug_vis_impl()` and `_debug_vis_callback()` own current target, next target, sole polygon, reference path, support/edge/unknown overlays, and state-color markers.
+Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_sensor_data.py tests/parkour/foothold/test_sensor_state.py -q`
 
-Add this exact config surface:
+Expected: collection fails because `instinctlab.sensors.foothold_planner` does not exist.
+
+- [ ] **Step 3: Implement the structured data and Sensor configuration**
+
+```python
+@dataclass
+class FootholdPlannerData:
+    sole_pos_w: torch.Tensor
+    sole_quat_w: torch.Tensor
+    sole_vel_w: torch.Tensor
+    stance_origin_w: torch.Tensor
+    current_target_pos_f: torch.Tensor
+    current_target_yaw_f: torch.Tensor
+    current_target_normal_f: torch.Tensor
+    next_target_pos_f: torch.Tensor
+    next_target_yaw_f: torch.Tensor
+    next_target_normal_f: torch.Tensor
+    swing_reference_pos_f: torch.Tensor
+    swing_reference_vel_f: torch.Tensor
+    swing_reference_acc_f: torch.Tensor
+    feasible_velocity_f: torch.Tensor
+    phase: torch.Tensor
+    normalized_time_to_touchdown: torch.Tensor
+    gait_state: torch.Tensor
+    swing_side: torch.Tensor
+    swing_mask: torch.Tensor
+    stance_mask: torch.Tensor
+    new_touchdown: torch.Tensor
+    planner_valid: torch.Tensor
+    next_target_valid: torch.Tensor
+    terrain_confidence: torch.Tensor
+    support_margin: torch.Tensor
+    edge_risk: torch.Tensor
+    unknown_fraction: torch.Tensor
+    recovery_state: torch.Tensor
+    position_error_f: torch.Tensor
+    velocity_error_f: torch.Tensor
+
+
+@dataclass
+class PlannerInputs:
+    timestamp: torch.Tensor
+    sole_pos_w: torch.Tensor
+    sole_quat_w: torch.Tensor
+    sole_vel_w: torch.Tensor
+    contact: torch.Tensor
+    navigation_command: torch.Tensor
+    planner_valid: torch.Tensor
+```
 
 ```python
 @configclass
-class FootholdCommandCfg(CommandTermCfg):
-    class_type: type = FootholdCommand
-    asset_name: str = "robot"
+class FootholdPlannerSensorCfg(SensorBaseCfg):
+    class_type: type = FootholdPlannerSensor
     left_ankle_body: str = "left_ankle_roll_link"
     right_ankle_body: str = "right_ankle_roll_link"
     sole_center_offset: tuple[float, float, float] = (0.02, 0.0, -0.058)
     sole_half_length: float = 0.12
     sole_half_width: float = 0.055
     reset_hold_s: float = 0.4
-    nominal_swing_s: float = 0.32
+    nominal_swing_s: float = 0.36
     apex_height: float = 0.10
+    contact_force_threshold: float = 1.0
+    virtual_demo: bool = False
     debug_vis: bool = False
 ```
 
-- [ ] **Step 3: Run CPU tests and a one-environment construction check**
+- [ ] **Step 4: Implement the Isaac Lab adapter**
 
-Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_command_packing.py -q`
+Follow the existing `VolumePoints` and Isaac Lab `ContactSensor` patterns: create one rigid-body view and one rigid-contact view for the two ankle bodies in `_initialize_impl`; convert PhysX `xyzw` quaternions to `wxyz`; compute sole state with `SoleGeometry`; allocate all tensors on `self.device`; and use contact-force norm plus hysteresis for measured contact.
 
-Expected: pass.
+`set_navigation_command(command)` requires shape `(num_envs, 3)`, copies to an internal device buffer, and marks only changed environments for replanning. `_update_buffers_impl(env_ids)` reads PhysX state, advances the pure core once for the Sensor timestamp, and updates `FootholdPlannerData`. In virtual mode, a virtual stance pose advances on virtual touchdown; real mode uses measured sole/contact state. `reset(env_ids)` clears phase, accepted targets, touchdown latches, and virtual stance state.
 
-Run: `conda run -n hiking python scripts/list_envs.py | rg 'Instinct-Parkour'`
+- [ ] **Step 5: Run tests**
 
-Expected at this task: existing parkour IDs still list; new IDs are added in Task 8.
+Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_sensor_data.py tests/parkour/foothold/test_sensor_state.py -q`
 
-- [ ] **Step 4: Commit**
+Expected: all tests pass.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/mdp/commands tests/parkour/foothold/test_command_packing.py
-git commit -m "feat(foothold): integrate foothold command term"
+git add source/instinctlab/instinctlab/sensors source/instinctlab/instinctlab/tasks/parkour/foothold/planner_core.py tests/parkour/foothold/test_sensor_data.py tests/parkour/foothold/test_sensor_state.py
+git commit -m "feat(foothold): add planner sensor"
 ```
 
 ### Task 5: Add phase-gated observations and rewards
@@ -392,14 +467,28 @@ git commit -m "feat(foothold): integrate foothold command term"
 **Files:**
 - Modify: `source/instinctlab/instinctlab/tasks/parkour/mdp/rewards.py`
 - Create: `source/instinctlab/instinctlab/tasks/parkour/mdp/foothold_observations.py`
+- Test: `tests/parkour/foothold/test_observation_packing.py`
 - Test: `tests/parkour/foothold/test_rewards.py`
 
 **Interfaces:**
-- Produces: `foothold_command(env)`, `foothold_critic_state(env)`, `swing_position_reward`, `swing_velocity_reward`, `touchdown_pose_reward`, `support_polygon_reward`, and `slip_penalty`.
+- Consumes: `env.scene.sensors["foothold_planner"].data`.
+- Produces: `get_foothold_data(env)`, `foothold_actor_observation(env)`, `foothold_critic_state(env)`, `swing_position_reward`, `swing_velocity_reward`, `touchdown_pose_reward`, `support_polygon_reward`, and `slip_penalty`.
 
-- [ ] **Step 1: Test phase masks and one-shot touchdown**
+- [ ] **Step 1: Test exact 44-D packing, phase masks, and one-shot touchdown**
 
 ```python
+def test_actor_observation_uses_version_one_layout():
+    data = FootholdPlannerData.zeros(num_envs=2, device="cpu")
+    data.swing_reference_pos_f[:] = torch.tensor([0.1, 0.2, 0.3])
+    data.swing_reference_vel_f[:] = torch.tensor([0.4, 0.5, 0.6])
+    data.position_error_f[:] = torch.tensor([0.01, 0.02, 0.03])
+    packed = pack_foothold_observation_v1(data)
+    assert packed.shape == (2, 44)
+    torch.testing.assert_close(packed[:, ObservationSlice.REFERENCE_POSITION.value], data.swing_reference_pos_f)
+    torch.testing.assert_close(packed[:, ObservationSlice.REFERENCE_VELOCITY.value], data.swing_reference_vel_f)
+    torch.testing.assert_close(packed[:, ObservationSlice.POSITION_ERROR.value], data.position_error_f)
+
+
 def test_swing_reward_is_zero_outside_swing():
     error = torch.tensor([0.00, 0.05])
     mask = torch.tensor([False, True])
@@ -413,18 +502,24 @@ def test_touchdown_reward_only_uses_new_latch():
     torch.testing.assert_close(touchdown_latched_reward(pose_error, new_touchdown, sigma=0.05), torch.tensor([1.0, 0.0]))
 ```
 
-- [ ] **Step 2: Implement terms and run tests**
+- [ ] **Step 2: Verify failure, implement adapters and terms, then verify success**
 
-Use `exp(-(error/sigma)^2)` for positive tracking terms. Apply swing terms only in `LEFT_SWING`/`RIGHT_SWING`, touchdown terms only on the rising edge of `touchdown_latched`, and support/slip terms only for the stance foot. Read every target, phase, and mask from `env.command_manager.get_term("foothold")`; do not recompute planner state in reward functions.
+`get_foothold_data(env)` calls `env.command_manager.get_command("base_velocity")`, forwards its first three values through `sensor.set_navigation_command(command[:, :3])`, then returns `sensor.data`. Because the Sensor caches by simulation timestamp, the first reward/observation consumer updates it and later consumers receive the same state without advancing phase twice. `pack_foothold_observation_v1(data)` fills every `ObservationSlice` and asserts dimension 44. `foothold_actor_observation(env)` returns that packed tensor. `foothold_critic_state(env)` concatenates the actor tensor with privileged raw/debounced contact, full sole state, touchdown error, support values, and oracle-agreement fields.
 
-Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_rewards.py -q`
+Use `exp(-(error/sigma)^2)` for positive tracking terms. Apply swing terms only where `data.swing_mask` is true, touchdown terms only where `data.new_touchdown` is true, and support/slip terms only where `data.stance_mask` is true. Return zero when `data.planner_valid` is false or `data.recovery_state` is true. No function resamples a target, changes phase, or reconstructs a reference.
 
-Expected: pass.
+Run before: `conda run -n hiking python -m pytest tests/parkour/foothold/test_observation_packing.py tests/parkour/foothold/test_rewards.py -q`
+
+Expected before: missing adapter failure.
+
+Run after: `conda run -n hiking python -m pytest tests/parkour/foothold/test_observation_packing.py tests/parkour/foothold/test_rewards.py -q`
+
+Expected after: all tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/mdp/rewards.py source/instinctlab/instinctlab/tasks/parkour/mdp/foothold_observations.py tests/parkour/foothold/test_rewards.py
+git add source/instinctlab/instinctlab/tasks/parkour/mdp/rewards.py source/instinctlab/instinctlab/tasks/parkour/mdp/foothold_observations.py tests/parkour/foothold/test_observation_packing.py tests/parkour/foothold/test_rewards.py
 git commit -m "feat(foothold): add phase gated rewards"
 ```
 
@@ -483,22 +578,25 @@ git commit -m "feat(foothold): add resumable curriculum schedule"
 - Test: `tests/parkour/foothold/test_runner_state.py`
 
 **Interfaces:**
-- Produces: `InstinctLabOnPolicyRunner`, `InstinctRlVecEnvWrapper.training_state_dict()`, and `InstinctRlVecEnvWrapper.load_training_state_dict(state)`.
+- Produces: `InstinctLabOnPolicyRunner`, `add_environment_state(checkpoint, state)`, `pop_environment_state(checkpoint)`, `InstinctRlVecEnvWrapper.training_state_dict()`, and `InstinctRlVecEnvWrapper.load_training_state_dict(state)`.
 
 - [ ] **Step 1: Test environment-state checkpoint protocol with fakes**
 
 ```python
-def test_runner_adds_and_restores_environment_state(tmp_path):
-    runner = make_fake_runner(tmp_path)
-    runner.save(tmp_path / "model.pt")
-    runner.env.training_value = -1
-    runner.load(tmp_path / "model.pt")
-    assert runner.env.training_value == 17
+def test_runner_adds_and_restores_environment_state():
+    checkpoint = {"iter": 12, "model_state_dict": {"weight": torch.tensor([1.0])}}
+    environment_state = {"sensor": {"phase": torch.tensor([0.25])}}
+    saved = add_environment_state(checkpoint, environment_state)
+    restored_checkpoint, restored_environment = pop_environment_state(saved)
+    assert restored_checkpoint["iter"] == 12
+    torch.testing.assert_close(restored_environment["sensor"]["phase"], torch.tensor([0.25]))
 ```
 
 - [ ] **Step 2: Implement the runner adapter**
 
-Add wrapper methods that delegate to `self.unwrapped.training_state_dict()` and `self.unwrapped.load_training_state_dict(state)` when present, otherwise return an empty dictionary and accept an empty dictionary. Subclass `OnPolicyRunner`. In `save`, call the parent, reopen the checkpoint with `weights_only=True`, add `environment_state=self.env.training_state_dict()`, and atomically replace the file through a sibling `.tmp` path. In `load`, read `environment_state`, call the parent, and then restore it; when loading an older checkpoint without that key, print one warning and retain level zero. Override `rollout_step` to assign `self.alg.discriminator_reward_coef = amp_reward_coef(self.current_learning_iteration)` before delegating to the parent.
+`add_environment_state` copies the checkpoint dictionary and writes one `environment_state` key. `pop_environment_state` copies its input, removes that key, and returns `(checkpoint_without_environment, environment_state_or_empty_dict)`.
+
+Add wrapper methods that delegate to `self.unwrapped.training_state_dict()` and `self.unwrapped.load_training_state_dict(state)` when present, otherwise return an empty dictionary and accept an empty dictionary. The foothold environment state contains curriculum state plus `env.scene.sensors["foothold_planner"].state_dict()`. Subclass `OnPolicyRunner`. In `save`, call the parent, reopen the checkpoint with `weights_only=True`, call `add_environment_state`, and atomically replace the file through a sibling `.tmp` path. In `load`, call `pop_environment_state`, load the runner checkpoint, and then restore environment state; when loading an older checkpoint without that key, print one warning and reset Sensor/curriculum state. Override `rollout_step` to assign `self.alg.discriminator_reward_coef = amp_reward_coef(self.current_learning_iteration)` before delegating to the parent.
 
 Override `log` and, under `torch.inference_mode()`, evaluate the actor gate logits with the current flattened policy observation:
 
@@ -572,7 +670,20 @@ def test_existing_and_new_ids_are_registered():
 
 - [ ] **Step 2: Implement the new environment configuration**
 
-Inherit `G1ParkourEnvCfg`; replace rough terrain with a plane; disable the depth-camera observation; add command name `foothold`; define actor observations as base angular velocity, projected gravity, joint position/velocity, previous action histories, and the current 44-D command only. Define critic observations as actor terms plus base linear velocity, raw/debounced contacts, sole pose/velocity, target errors, support/edge values, and oracle agreement. Configure the phase-gated reward groups from Task 5. The play class uses one environment and enables command debug visualization.
+Inherit `G1ParkourEnvCfg`; replace rough terrain with a plane; disable the depth-camera observation; retain the existing `base_velocity` navigation command; and add:
+
+```python
+foothold_planner = FootholdPlannerSensorCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/.*_ankle_roll_link",
+    update_period=0.02,
+    virtual_demo=False,
+    debug_vis=False,
+)
+```
+
+Define actor observations as base angular velocity, projected gravity, joint position/velocity, previous-action histories, and `foothold_actor_observation`. Define critic observations as actor terms plus base linear velocity, raw/debounced contacts, and `foothold_critic_state`. Configure phase-gated rewards from Task 5.
+
+The play class uses one environment, deep-copies the robot spawn config before setting `fix_root_link=True`, changes the Sensor to `virtual_demo=True`, and enables Sensor debug visualization. The training class keeps the root free and `virtual_demo=False`.
 
 - [ ] **Step 3: Implement the agent config**
 
@@ -658,7 +769,9 @@ def touchdown_statistics(values: torch.Tensor) -> dict[str, float]:
     return {"median": quantiles[0].item(), "p95": quantiles[1].item()}
 ```
 
-Compute XY/Z/yaw/timing median and P95 only on new touchdown latches; log early contact, overdue, plan-invalid, recovery, fall, slip, impact, support margin, curriculum distribution, AMP coefficient, PPO/Wasabi losses, MoE expert load/entropy, and FPS/GPU metrics. Add `--foothold_debug_vis` to play; stable colors are current target green, next target cyan, sole polygons white, reference trajectory yellow, early contact orange, overdue magenta, invalid/recovery red. Show gait state, phase, target error, and validity as viewer text.
+Compute XY/Z/yaw/timing median and P95 only on `data.new_touchdown`; log early contact, overdue, plan-invalid, recovery, fall, slip, impact, support margin, curriculum distribution, AMP coefficient, PPO/Wasabi losses, MoE expert load/entropy, and FPS/GPU metrics.
+
+Add `--foothold_debug_vis` to play. When the play Sensor is in virtual mode, feed six steps at `(0.5, 0.0, 0.0)`, six at `(0.4, 0.0, 0.3)`, and six at `(0.0, 0.2, 0.0)`, then repeat. Stable colors are current target green, next target cyan, sole polygons white, reference trajectory yellow, early contact orange, overdue magenta, and invalid/recovery red. Show gait state, phase, target error, Sensor validity, measured contact, and virtual touchdown separately.
 
 - [ ] **Step 3: Document and run the validation ladder**
 
@@ -694,6 +807,8 @@ git commit -m "feat(foothold): visualize and validate tracking"
 - [ ] Run `pre-commit run --all-files`; expect every hook to pass.
 - [ ] Run `git diff main...HEAD --check`; expect no output.
 - [ ] Confirm the old G1 parkour IDs still instantiate with unchanged configuration classes.
-- [ ] Confirm the actor observation contains 44 current-command values, no command history, no raw depth, and no contact bits.
-- [ ] Confirm a checkpoint round-trip restores iteration, policy, normalizers, curriculum level/EMA/frontier, gait buffers, and AMP schedule position.
+- [ ] Confirm `FootholdPlannerSensor.data` is structured and the observation adapter alone produces the 44-D vector.
+- [ ] Confirm the actor observation contains no command history, raw depth, or contact bits.
+- [ ] Confirm reward, critic, metrics, and markers consume the same timestamp-cached Sensor data.
+- [ ] Confirm a checkpoint round-trip restores iteration, policy, normalizers, curriculum level/EMA/frontier, Sensor gait/target buffers, and AMP schedule position.
 - [ ] Do not start the 4096-environment run until the 256-environment gate is reviewed and accepted.
