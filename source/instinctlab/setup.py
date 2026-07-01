@@ -27,7 +27,7 @@ INSTALL_REQUIRES = [
 # Installation operation
 setup(
     name="instinctlab",
-    packages=["instinctlab"],
+    packages=["instinctlab", "instinctlab_foothold"],
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],

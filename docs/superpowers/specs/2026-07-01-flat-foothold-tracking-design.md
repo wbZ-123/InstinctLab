@@ -62,7 +62,7 @@ Navigation target
     -> metrics and play visualization
 ```
 
-The planner core remains a pure, simulator-independent component. `FootholdPlannerSensor` is the Isaac Lab `SensorBase` adapter that reads robot state, caches one update per simulation timestamp, owns per-environment reset/state buffers, and exposes results through `data`. It does not bind its structured output to one policy-network shape.
+The planner core lives in the lightweight top-level `instinctlab_foothold` Python package and remains simulator-independent. It imports PyTorch but never imports `instinctlab`, Isaac Lab, `pxr`, or Omniverse modules, so CPU unit tests run without launching `SimulationApp`. `FootholdPlannerSensor` is the Isaac Lab `SensorBase` adapter that reads robot state, caches one update per simulation timestamp, owns per-environment reset/state buffers, and exposes results through `data`. It does not bind its structured output to one policy-network shape.
 
 The first sub-project uses a `FlatProvider`. The later oracle provider crops a local elevation map from simulation truth and combines reachability with sole-point support tests. The future depth provider replaces only the map source.
 

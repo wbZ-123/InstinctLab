@@ -29,14 +29,14 @@
 
 **Create**
 
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/__init__.py`: public pure-domain API.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/types.py`: observation layout, gait-state enum, provider records.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/geometry.py`: sole transforms and frozen-frame coordinate conversion.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/flat_provider.py`: curriculum-bounded flat foothold target generation.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/trajectory.py`: two-segment quintic swing reference.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/state_machine.py`: vectorized phase/contact transition logic.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/curriculum.py`: serializable per-environment curriculum state.
-- `source/instinctlab/instinctlab/tasks/parkour/foothold/metrics.py`: touchdown percentile reduction.
+- `source/instinctlab/instinctlab_foothold/__init__.py`: public simulator-independent API.
+- `source/instinctlab/instinctlab_foothold/types.py`: observation layout, gait-state enum, provider records.
+- `source/instinctlab/instinctlab_foothold/geometry.py`: sole transforms and frozen-frame coordinate conversion.
+- `source/instinctlab/instinctlab_foothold/flat_provider.py`: curriculum-bounded flat foothold target generation.
+- `source/instinctlab/instinctlab_foothold/trajectory.py`: two-segment quintic swing reference.
+- `source/instinctlab/instinctlab_foothold/state_machine.py`: vectorized phase/contact transition logic.
+- `source/instinctlab/instinctlab_foothold/curriculum.py`: serializable per-environment curriculum state.
+- `source/instinctlab/instinctlab_foothold/metrics.py`: touchdown percentile reduction.
 - `source/instinctlab/instinctlab/sensors/foothold_planner/__init__.py`: public Sensor exports.
 - `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py`: `SensorBase` adapter, PhysX pose/contact views, state updates, markers.
 - `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_cfg.py`: Sensor configuration.
@@ -65,27 +65,28 @@
 ### Task 1: Freeze the 44-D observation and sole-frame mathematics
 
 **Files:**
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/__init__.py`
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/types.py`
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/geometry.py`
+- Create: `source/instinctlab/instinctlab_foothold/__init__.py`
+- Create: `source/instinctlab/instinctlab_foothold/types.py`
+- Create: `source/instinctlab/instinctlab_foothold/geometry.py`
+- Modify: `source/instinctlab/setup.py`
 - Test: `tests/parkour/foothold/test_types.py`
 - Test: `tests/parkour/foothold/test_geometry.py`
 
 **Interfaces:**
 - Produces: `FOOTHOLD_OBSERVATION_DIM: int = 44`, `ObservationSlice`, `GaitState`, `SoleGeometry`, `make_frozen_stance_frame(origin_w, yaw_w)`, `world_to_frozen(points_w, frame)`, and `frozen_to_world(points_f, frame)`.
 
-- [ ] **Step 1: Write failing layout and round-trip tests**
+- [x] **Step 1: Write failing layout and round-trip tests**
 
 ```python
 import torch
 
-from instinctlab.tasks.parkour.foothold.geometry import (
+from instinctlab_foothold.geometry import (
     SoleGeometry,
     frozen_to_world,
     make_frozen_stance_frame,
     world_to_frozen,
 )
-from instinctlab.tasks.parkour.foothold.types import FOOTHOLD_OBSERVATION_DIM, ObservationSlice
+from instinctlab_foothold.types import FOOTHOLD_OBSERVATION_DIM, ObservationSlice
 
 
 def test_observation_layout_is_contiguous_and_44d():
@@ -109,13 +110,13 @@ def test_sole_center_is_offset_from_ankle():
     torch.testing.assert_close(center, torch.tensor([[0.02, 0.0, -0.058]]))
 ```
 
-- [ ] **Step 2: Run the tests and confirm the missing-module failure**
+- [x] **Step 2: Run the tests and confirm the missing-module failure**
 
 Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_types.py tests/parkour/foothold/test_geometry.py -q`
 
-Expected: collection fails with `ModuleNotFoundError: No module named 'instinctlab.tasks.parkour.foothold'`.
+Expected: collection fails with `ModuleNotFoundError: No module named 'instinctlab_foothold'`.
 
-- [ ] **Step 3: Implement the exact layout and geometry API**
+- [x] **Step 3: Implement the exact layout and geometry API**
 
 ```python
 class ObservationSlice(Enum):
@@ -160,23 +161,23 @@ class GaitState(IntEnum):
 
 Implement `FrozenFrame(origin_w: Tensor, cos_yaw: Tensor, sin_yaw: Tensor)` with explicit yaw rotation formulas, and `SoleGeometry.center_world()` plus four polygon corners using quaternion rotation from `isaaclab.utils.math` only behind a function-local import. This keeps the layout tests importable on CPU without Isaac Sim.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `conda run -n hiking python -m pytest tests/parkour/foothold/test_types.py tests/parkour/foothold/test_geometry.py -q`
 
 Expected: `3 passed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/foothold tests/parkour/foothold/test_types.py tests/parkour/foothold/test_geometry.py
+git add source/instinctlab/instinctlab_foothold source/instinctlab/setup.py tests/parkour/foothold/test_types.py tests/parkour/foothold/test_geometry.py
 git commit -m "feat(foothold): define observation and sole frames"
 ```
 
 ### Task 2: Generate curriculum-bounded flat footholds
 
 **Files:**
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/flat_provider.py`
+- Create: `source/instinctlab/instinctlab_foothold/flat_provider.py`
 - Test: `tests/parkour/foothold/test_flat_provider.py`
 
 **Interfaces:**
@@ -273,15 +274,15 @@ Expected after: `2 passed`.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/foothold/flat_provider.py tests/parkour/foothold/test_flat_provider.py
+git add source/instinctlab/instinctlab_foothold/flat_provider.py tests/parkour/foothold/test_flat_provider.py
 git commit -m "feat(foothold): add flat target provider"
 ```
 
 ### Task 3: Add the gait state machine and swing reference
 
 **Files:**
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/state_machine.py`
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/trajectory.py`
+- Create: `source/instinctlab/instinctlab_foothold/state_machine.py`
+- Create: `source/instinctlab/instinctlab_foothold/trajectory.py`
 - Test: `tests/parkour/foothold/test_state_machine.py`
 - Test: `tests/parkour/foothold/test_trajectory.py`
 
@@ -329,7 +330,7 @@ Expected: all tests pass.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/foothold/state_machine.py source/instinctlab/instinctlab/tasks/parkour/foothold/trajectory.py tests/parkour/foothold
+git add source/instinctlab/instinctlab_foothold/state_machine.py source/instinctlab/instinctlab_foothold/trajectory.py tests/parkour/foothold
 git commit -m "feat(foothold): add gait state and swing reference"
 ```
 
@@ -340,7 +341,7 @@ git commit -m "feat(foothold): add gait state and swing reference"
 - Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_data.py`
 - Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_cfg.py`
 - Create: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py`
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/planner_core.py`
+- Create: `source/instinctlab/instinctlab_foothold/planner_core.py`
 - Modify: `source/instinctlab/instinctlab/sensors/__init__.py`
 - Test: `tests/parkour/foothold/test_sensor_data.py`
 - Test: `tests/parkour/foothold/test_sensor_state.py`
@@ -458,7 +459,7 @@ Expected: all tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/sensors source/instinctlab/instinctlab/tasks/parkour/foothold/planner_core.py tests/parkour/foothold/test_sensor_data.py tests/parkour/foothold/test_sensor_state.py
+git add source/instinctlab/instinctlab/sensors source/instinctlab/instinctlab_foothold/planner_core.py tests/parkour/foothold/test_sensor_data.py tests/parkour/foothold/test_sensor_state.py
 git commit -m "feat(foothold): add planner sensor"
 ```
 
@@ -526,7 +527,7 @@ git commit -m "feat(foothold): add phase gated rewards"
 ### Task 6: Make curriculum and AMP scheduling resumable
 
 **Files:**
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/curriculum.py`
+- Create: `source/instinctlab/instinctlab_foothold/curriculum.py`
 - Modify: `source/instinctlab/instinctlab/tasks/parkour/mdp/curriculums.py`
 - Test: `tests/parkour/foothold/test_curriculum.py`
 
@@ -563,7 +564,7 @@ Expected: pass.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/foothold/curriculum.py source/instinctlab/instinctlab/tasks/parkour/mdp/curriculums.py tests/parkour/foothold/test_curriculum.py
+git add source/instinctlab/instinctlab_foothold/curriculum.py source/instinctlab/instinctlab/tasks/parkour/mdp/curriculums.py tests/parkour/foothold/test_curriculum.py
 git commit -m "feat(foothold): add resumable curriculum schedule"
 ```
 
@@ -733,7 +734,7 @@ git commit -m "feat(foothold): register flat tracking task"
 
 **Files:**
 - Modify: `source/instinctlab/instinctlab/tasks/parkour/scripts/play.py`
-- Create: `source/instinctlab/instinctlab/tasks/parkour/foothold/metrics.py`
+- Create: `source/instinctlab/instinctlab_foothold/metrics.py`
 - Modify: `source/instinctlab/instinctlab/tasks/parkour/README.md`
 - Test: `tests/parkour/foothold/test_metric_reduction.py`
 
@@ -746,7 +747,7 @@ git commit -m "feat(foothold): register flat tracking task"
 import pytest
 import torch
 
-from instinctlab.tasks.parkour.foothold.metrics import touchdown_statistics
+from instinctlab_foothold.metrics import touchdown_statistics
 
 
 def test_touchdown_percentiles():
@@ -795,7 +796,7 @@ Expected: all unit tests pass; 10 iterations finish, create a checkpoint, and co
 - [ ] **Step 5: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/tasks/parkour/foothold/metrics.py source/instinctlab/instinctlab/tasks/parkour/scripts/play.py source/instinctlab/instinctlab/tasks/parkour/README.md tests/parkour/foothold/test_metric_reduction.py
+git add source/instinctlab/instinctlab_foothold/metrics.py source/instinctlab/instinctlab/tasks/parkour/scripts/play.py source/instinctlab/instinctlab/tasks/parkour/README.md tests/parkour/foothold/test_metric_reduction.py
 git commit -m "feat(foothold): visualize and validate tracking"
 ```
 
