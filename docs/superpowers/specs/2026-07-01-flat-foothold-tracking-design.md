@@ -24,6 +24,8 @@ The program targets one resumable 4096-environment main training lineage. Small 
 - Per-environment L0-L2 curriculum with a global difficulty frontier.
 - Four-expert MoE instrumentation and progressive AMP scheduling hooks.
 - Curriculum and schedule state that survives checkpoint resume.
+- Play-mode visualization for footholds, sole frames, swing references, and planner state.
+- Real-time Weights & Biases monitoring with an offline fallback.
 - Unit, visualization, vectorized smoke, short-training, and resume tests.
 
 ### 2.2 Deferred to later sub-projects
@@ -346,6 +348,22 @@ Visualize:
 - State-machine state and touchdown gate.
 - Capture point/DCM diagnostic.
 
+The Play task enables these markers by default and the training task disables them by default. Visualization can be toggled at runtime without changing observations or command state.
+
+Marker conventions are stable across runs:
+
+- Left-foot targets and sole outlines: blue.
+- Right-foot targets and sole outlines: red.
+- Current executable target: opaque.
+- Preview target: translucent.
+- Valid swing reference: green.
+- Invalid or overdue reference: orange.
+- Safe support region: green.
+- Unknown or rejected region: gray.
+- Edge exclusion region: yellow.
+
+The Play overlay also reports swing-foot identity, gait state, phase, time to touchdown, planner validity, terrain confidence, and current curriculum level.
+
 ### 12.3 Vectorized validation
 
 - 64 environments force all L0-L2 levels and exceptional states.
@@ -363,7 +381,32 @@ Visualize:
 - Episode fall rate below 2%.
 - Resume restores curriculum and AMP progress without reverting to L0.
 
-## 13. Later Provider Contracts
+## 13. Training Observability
+
+Training supports real-time Weights & Biases monitoring. A lost network connection must not terminate training: metrics continue to local logs and are buffered for later synchronization.
+
+Every run records:
+
+- Git commit and dirty-state summary.
+- Environment and agent configuration.
+- Parent checkpoint and checkpoint iteration.
+- Random seed, environment count, device, and effective rollout length.
+
+The live dashboard includes:
+
+- PPO losses, KL, entropy, learning rate, action standard deviation, and throughput.
+- Wasabi discriminator loss, actor/reference scores, gradient penalty, and current AMP reward coefficient.
+- Total reward and each foothold reward group.
+- Touchdown XYZ, yaw, and timing median/P95.
+- Early-contact, overdue, planner-failure, fall, and recovery rates.
+- Sole support ratio, minimum edge margin, landing impact, and stance slip.
+- Per-level curriculum occupancy and global frontier.
+- MoE mean gate probability, expert occupancy, maximum occupancy, and gate entropy.
+- Simulation FPS, policy FPS, map/planner update time, and GPU memory.
+
+Metrics are aggregated across environments before logging. Raw per-environment streams are not uploaded. Play or evaluation video upload is optional and rate-limited.
+
+## 14. Later Provider Contracts
 
 Future oracle and depth sub-projects must preserve the actor contract above.
 
@@ -380,7 +423,7 @@ The depth provider preserves invalid returns before clipping and never conflates
 
 The terrain planner performs full-sole support filtering, kinematic filtering, a capture-point/DCM viability check, and at least two-step preview. It returns the first executable step, one preview step, timing, `feasible_velocity`, corridor samples, and confidence.
 
-## 14. Git and Delivery
+## 15. Git and Delivery
 
 - Existing parkour task registrations and behavior remain unchanged.
 - The new task lives on the dedicated `feat/foothold-01-flat-tracking` branch/worktree.
