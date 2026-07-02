@@ -24,6 +24,33 @@ Both modules import PyTorch and the lightweight foothold types only. Neither imp
 
 This separation lets the Sensor use the same state machine with flat, oracle-map, and depth-map target providers, while trajectory mathematics can be tested without contact logic.
 
+### 2.1 Non-invasive integration constraints
+
+Task 3 is an auxiliary foothold-planning component for the existing InstinctLab
+training pipeline. It must not become a replacement locomotion controller or
+silently change existing task behavior.
+
+- Existing environments, actor observations, actions, terminations, and rewards
+  remain unchanged unless a new foothold configuration explicitly opts in.
+- The state machine is a pure state estimator. It must not reset an environment,
+  override policy actions, write robot state, or issue joint commands.
+- Initial integration uses shadow/diagnostic behavior: gait modes and failure
+  reasons are exposed as data for metrics, visualization, and carefully scoped
+  foothold rewards.
+- `RECOVERY`, `EARLY_CONTACT`, `OVERDUE`, `STANCE_LOST`, and `PLAN_INVALID` are
+  diagnostic states in the initial training integration. They do not add hard
+  episode terminations by default.
+- Existing fall and safety termination rules remain authoritative.
+- If the foothold plan is invalid or the state machine enters `RECOVERY`, the
+  policy/action pipeline continues to use the existing locomotion behavior;
+  the state machine must not freeze or replace the action.
+- Any future hard recovery action or additional termination requires an
+  explicit configuration switch and training evidence that it improves rather
+  than destabilizes learning.
+- Regression verification must include an existing non-foothold task to confirm
+  that importing or adding the module does not alter its configuration or
+  runtime behavior.
+
 ## 3. Gait state machine
 
 ### 3.1 Public interface
@@ -112,6 +139,12 @@ active swing -> OVERDUE       -> RECOVERY
 ```
 
 `RECOVERY` is latched in Task 3. A later Sensor or environment reset reinitializes it. This avoids silently resuming normal stepping without a recovery planner.
+
+Latching is internal bookkeeping only. It does not command the robot to stop,
+reset the simulator, or terminate the episode. During early training, poor
+foothold tracking may produce frequent failure labels; these labels are first
+used for diagnosis and optional reward masking, while the existing policy keeps
+control of the robot.
 
 Contact confirmation is time-based rather than sample-count based. A true contact accumulates `contact_elapsed_s` and resets `no_contact_elapsed_s`; a false contact does the opposite. This supports both touchdown confirmation and stance-loss/liftoff confirmation while preserving behavior if the control period changes.
 
@@ -203,3 +236,8 @@ All Task 3 tests run on CPU without `SimulationApp`.
 ## 6. Integration boundary
 
 Task 2 supplies the accepted target position and feasible navigation velocity. Task 3 supplies gait mode, swing side, normalized phase, and translational swing reference. Task 4 will combine them in `FootholdPlannerSensor`, compute `touchdown_accepted` from measured sole state, and expose the authoritative structured data used by observations, rewards, metrics, and visualization.
+
+Task 4 must preserve the non-invasive boundary above: the Sensor publishes
+data, while the environment retains ownership of actions, resets, and
+terminations. Foothold-specific observations and rewards are enabled only by
+the new foothold task configuration.

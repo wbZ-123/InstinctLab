@@ -12,6 +12,16 @@
 
 - Work only in `/home/zhangweibo/InstinctLab-foothold` on `feat/foothold-01-flat-tracking`.
 - Keep `instinctlab_foothold` importable without Isaac Lab, `pxr`, Omniverse, or `SimulationApp`.
+- Treat the state machine as an opt-in auxiliary estimator for the existing
+  training pipeline, not as a replacement controller.
+- Do not reset environments, override policy actions, write robot state, issue
+  joint commands, or add hard terminations from Task 3 state transitions.
+- Keep existing task configurations and behavior unchanged; only the new
+  foothold configuration may opt in.
+- In the initial integration, expose recovery and failure states for
+  diagnostics, metrics, visualization, reward masking, or soft penalties only.
+- When a plan is invalid or recovery is latched, preserve the existing
+  locomotion action path rather than freezing or replacing it.
 - Use side index `0 = left`, `1 = right`.
 - Preserve stable `GaitState` integer IDs from `instinctlab_foothold.types`.
 - Use time in seconds for state-machine timers and m, m/s, m/s² for trajectory outputs.
