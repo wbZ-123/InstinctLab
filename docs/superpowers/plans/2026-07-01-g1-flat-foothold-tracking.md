@@ -280,6 +280,11 @@ git commit -m "feat(foothold): add flat target provider"
 
 ### Task 3: Add the gait state machine and swing reference
 
+> **Superseded Task 3 details:** Use
+> `docs/superpowers/plans/2026-07-02-gait-state-and-swing-reference.md`.
+> The revised plan adds physical-duration scaling, explicit touchdown
+> acceptance, confirmed liftoff gating, and observable failure reasons.
+
 **Files:**
 - Create: `source/instinctlab/instinctlab_foothold/state_machine.py`
 - Create: `source/instinctlab/instinctlab_foothold/trajectory.py`
