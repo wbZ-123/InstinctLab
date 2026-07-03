@@ -25,6 +25,12 @@
 - Use side index `0 = left`, `1 = right`.
 - Preserve stable `GaitState` integer IDs from `instinctlab_foothold.types`.
 - Use time in seconds for state-machine timers and m, m/s, m/s² for trajectory outputs.
+- Treat the Task 3 swing apex as a baseline only:
+  `max(start_z, goal_z) + apex_height` at phase `0.5`.
+- Record that terrain-aware swing clearance is required in the Sensor phase:
+  later integration must sample the height map or point cloud along the swing
+  corridor and upgrade the apex to account for intermediate obstacles, stair
+  lips, and edge geometry.
 - Write and observe each failing test before adding the production behavior.
 - Run tests with `PYTHONPATH="$PWD/source/instinctlab"` and disable pytest cache.
 

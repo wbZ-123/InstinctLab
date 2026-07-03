@@ -196,6 +196,32 @@ apex_z = max(start_z, goal_z) + apex_height
 
 The first vertical segment uses local phase `2u`; the second uses `2u - 1`. Both meet the apex with zero vertical velocity and acceleration. Horizontal motion continues through the apex rather than stopping mid-step.
 
+The Task 3 apex is intentionally a first-pass clearance model:
+
+```text
+apex_z = max(start_z, goal_z) + apex_height
+apex_phase = 0.5
+```
+
+This is sufficient for the simulator-independent trajectory primitive, but it
+does not prove that the swing foot clears terrain between the start and goal.
+If the path crosses a higher intermediate obstacle, stair lip, or edge, this
+basic trajectory may still collide.
+
+Task 4 must therefore keep terrain-aware swing clearance as an explicit follow-up
+requirement. Once the Sensor owns local height-map or point-cloud data, the
+clearance model should be upgraded to sample the swing corridor and use:
+
+```text
+apex_z = max(start_z, goal_z, path_max_height) + clearance_margin
+```
+
+The apex timing should also remain configurable in the Sensor layer rather than
+being treated as physically fixed. For example, stairs or near-foot obstacles may
+benefit from an earlier apex, while descending or delayed touchdown cases may
+benefit from a later apex. The fixed `0.5` apex in Task 3 is only the baseline
+reference used before terrain-aware swing planning is connected.
+
 Derivatives are converted to physical units inside the function:
 
 ```text
@@ -241,3 +267,9 @@ Task 4 must preserve the non-invasive boundary above: the Sensor publishes
 data, while the environment retains ownership of actions, resets, and
 terminations. Foothold-specific observations and rewards are enabled only by
 the new foothold task configuration.
+
+Task 4 must also connect terrain information to the swing reference. The
+Sensor should be able to provide or derive a `path_max_height` / clearance signal
+from the local height map or point cloud along the swing corridor, so that later
+trajectory references avoid mid-swing terrain collisions rather than only
+clearing the start and target heights.
