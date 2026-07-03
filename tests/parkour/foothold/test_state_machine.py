@@ -587,3 +587,21 @@ def test_4096_environments_advance_independently():
         state.hold_elapsed_s[invalid_envs],
         torch.zeros(num_envs // 2),
     )
+
+
+
+def test_task3_types_are_public_package_api():
+    import instinctlab_foothold
+
+    expected_names = (
+        "GaitMachineConfig",
+        "GaitMachineState",
+        "SwingReference",
+        "advance_gait",
+        "gait_phase",
+        "initial_gait_state",
+        "quintic_swing_reference",
+    )
+
+    for name in expected_names:
+        assert hasattr(instinctlab_foothold, name)

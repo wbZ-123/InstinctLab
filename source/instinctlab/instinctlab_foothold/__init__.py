@@ -9,6 +9,15 @@ from .flat_provider import (
     sample_flat_targets,
 )
 
+from .state_machine import (
+    GaitMachineConfig,
+    GaitMachineState,
+    advance_gait,
+    gait_phase,
+    initial_gait_state,
+)
+from .trajectory import SwingReference, quintic_swing_reference
+
 __all__ = [
     "FOOTHOLD_OBSERVATION_DIM",
     "FrozenFrame",
@@ -22,4 +31,11 @@ __all__ = [
     "FlatTargetBatch",
     "TerrainCorridor",
     "sample_flat_targets",
+    "GaitMachineConfig",
+    "GaitMachineState",
+    "SwingReference",
+    "advance_gait",
+    "gait_phase",
+    "initial_gait_state",
+    "quintic_swing_reference",
 ]
