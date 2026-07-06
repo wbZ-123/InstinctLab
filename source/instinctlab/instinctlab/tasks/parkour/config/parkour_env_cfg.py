@@ -27,6 +27,7 @@ from instinctlab.assets.unitree_g1 import beyondmimic_action_scale
 from instinctlab.managers import MultiRewardCfg
 from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.sensors import Grid3dPointsGeneratorCfg, NoisyGroupedRayCasterCameraCfg, VolumePointsCfg
+from instinctlab.sensors.foothold_planner import FootholdPlannerCfg
 from instinctlab.terrains import GreedyconcatEdgeCylinderCfg, TerrainImporterCfg
 from instinctlab.utils.noise import (
     CropAndResizeCfg,
@@ -334,6 +335,14 @@ class SceneCfg(InteractiveSceneCfg):
         update_period=0.02,
     )
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    foothold_planner = FootholdPlannerCfg(
+        robot_name="robot",
+        contact_sensor_name="contact_forces",
+        left_ankle_body_name="left_ankle_roll_link",
+        right_ankle_body_name="right_ankle_roll_link",
+        left_contact_body_name="left_ankle_roll_link",
+        right_contact_body_name="right_ankle_roll_link",
+    )
     leg_volume_points = VolumePointsCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_ankle_roll_link",
         points_generator=Grid3dPointsGeneratorCfg(
@@ -925,3 +934,5 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
         # update sensor update periods
         if self.scene.contact_forces is not None:
             self.scene.contact_forces.update_period = self.sim.dt
+        if self.scene.foothold_planner is not None:
+            self.scene.foothold_planner.update_period = self.sim.dt
