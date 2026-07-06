@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+import torch
+
+from isaaclab.sensors import SensorBase
+
+from instinctlab_foothold import (
+    FlatProviderConfig,
+    GaitMachineConfig,
+    GaitMachineState,
+    GaitState,
+    SoleGeometry,
+    advance_gait,
+    gait_phase,
+    initial_gait_state,
+    quintic_swing_reference,
+    sample_flat_targets,
+)
+
+from .foothold_planner_data import FootholdPlannerData
+
+if TYPE_CHECKING:
+    from .foothold_planner_cfg import FootholdPlannerCfg
+
+
+class FootholdPlanner(SensorBase):
+    """Foothold planner sensor.
+
+    This sensor computes foothold targets and swing references, then exposes
+    them through ``sensor.data`` for rewards, observations, and debug
+    visualization.
+    """
+
+    cfg: FootholdPlannerCfg
+
+    def __init__(self, cfg: FootholdPlannerCfg):
+        super().__init__(cfg)
+        self._data = FootholdPlannerData()
+        self._sole_geometry = SoleGeometry(
+            center_offset_b=torch.tensor(cfg.sole_center_offset_b),
+            half_length=cfg.sole_half_length,
+            half_width=cfg.sole_half_width,
+        )
+        self._flat_provider_cfg = FlatProviderConfig()
+        self._gait_cfg = GaitMachineConfig(
+            reset_hold_s=cfg.reset_hold_s,
+            swing_s=cfg.swing_duration_s,
+        )
+
+    @property
+    def data(self) -> FootholdPlannerData:
+        self._update_outdated_buffers()
+        return self._data
+
+    def reset(self, env_ids: Sequence[int] | None = None):
+        super().reset(env_ids)
+
+        if not hasattr(self, "_gait_state"):
+            return
+
+        if env_ids is None:
+            reset_env_ids = slice(None)
+            num_reset_envs = self._num_envs
+        elif isinstance(env_ids, slice):
+            reset_env_ids = env_ids
+            num_reset_envs = torch.arange(
+                self._num_envs,
+                device=self._device,
+            )[env_ids].shape[0]
+        else:
+            reset_env_ids = env_ids
+            num_reset_envs = len(env_ids)
+
+        reset_state = initial_gait_state(
+            num_envs=num_reset_envs,
+            device=self._device,
+        )
+        self._write_gait_state(reset_env_ids, reset_state)
+
+        if self._data.gait_mode is not None:
+            self._data.gait_mode[reset_env_ids] = reset_state.mode
+        if self._data.swing_side is not None:
+            self._data.swing_side[reset_env_ids] = reset_state.swing_side
+        if self._data.phase is not None:
+            self._data.phase[reset_env_ids] = 0.0
+        if self._data.touchdown_accepted is not None:
+            self._data.touchdown_accepted[reset_env_ids] = False
+        if self._data.planner_valid is not None:
+            self._data.planner_valid[reset_env_ids] = True
+
+    def _initialize_impl(self):
+        super()._initialize_impl()
+
+        self._generator = torch.Generator(device=self._device)
+
+        self._robot = self._scene[self.cfg.robot_name]
+
+        self._contact_sensor = self._scene.sensors[
+            self.cfg.contact_sensor_name
+        ]
+
+        left_ids, left_names = self._robot.find_bodies(
+            self.cfg.left_ankle_body_name,
+            preserve_order=True,
+        )
+        right_ids, right_names = self._robot.find_bodies(
+            self.cfg.right_ankle_body_name,
+            preserve_order=True,
+        )
+
+        if len(left_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one left ankle body, "
+                f"but found {left_names} for pattern "
+                f"{self.cfg.left_ankle_body_name!r}."
+            )
+        if len(right_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one right ankle body, "
+                f"but found {right_names} for pattern "
+                f"{self.cfg.right_ankle_body_name!r}."
+            )
+
+        self._left_ankle_body_id = left_ids[0]
+        self._right_ankle_body_id = right_ids[0]
+
+        left_contact_ids, left_contact_names = self._contact_sensor.find_bodies(
+            self.cfg.left_contact_body_name,
+            preserve_order=True,
+        )
+        right_contact_ids, right_contact_names = self._contact_sensor.find_bodies(
+            self.cfg.right_contact_body_name,
+            preserve_order=True,
+        )
+
+        if len(left_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one left contact body, "
+                f"but found {left_contact_names} for pattern "
+                f"{self.cfg.left_contact_body_name!r}."
+            )
+        if len(right_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one right contact body, "
+                f"but found {right_contact_names} for pattern "
+                f"{self.cfg.right_contact_body_name!r}."
+            )
+
+        self._left_contact_body_id = left_contact_ids[0]
+        self._right_contact_body_id = right_contact_ids[0]
+
+        self._data.gait_mode = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.long,
+        )
+        self._data.swing_side = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.long,
+        )
+        self._data.phase = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+
+        self._data.target_foothold_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.target_foothold_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.feasible_velocity_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.swing_reference_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.actual_stance_foot_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.actual_swing_foot_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.swing_start_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+
+        self._data.touchdown_accepted = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.planner_valid = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._gait_state = initial_gait_state(
+            num_envs=self._num_envs,
+            device=self._device,
+        )
+
+    def _select_gait_state(
+        self,
+        env_ids,
+    ) -> GaitMachineState:
+        return GaitMachineState(
+            mode=self._gait_state.mode[env_ids],
+            swing_side=self._gait_state.swing_side[env_ids],
+            elapsed_s=self._gait_state.elapsed_s[env_ids],
+            hold_elapsed_s=self._gait_state.hold_elapsed_s[env_ids],
+            contact_elapsed_s=self._gait_state.contact_elapsed_s[env_ids],
+            no_contact_elapsed_s=self._gait_state.no_contact_elapsed_s[
+                env_ids
+            ],
+            swing_has_lifted=self._gait_state.swing_has_lifted[env_ids],
+        )
+
+    def _write_gait_state(
+        self,
+        env_ids,
+        state: GaitMachineState,
+    ) -> None:
+        self._gait_state.mode[env_ids] = state.mode
+        self._gait_state.swing_side[env_ids] = state.swing_side
+        self._gait_state.elapsed_s[env_ids] = state.elapsed_s
+        self._gait_state.hold_elapsed_s[env_ids] = state.hold_elapsed_s
+        self._gait_state.contact_elapsed_s[env_ids] = (
+            state.contact_elapsed_s
+        )
+        self._gait_state.no_contact_elapsed_s[env_ids] = (
+            state.no_contact_elapsed_s
+        )
+        self._gait_state.swing_has_lifted[env_ids] = state.swing_has_lifted
+
+    def _update_buffers_impl(self, env_ids: Sequence[int]):
+        if env_ids is None:
+            env_ids = slice(None)
+
+        if isinstance(env_ids, slice):
+            selected_env_ids = torch.arange(
+                self._num_envs,
+                device=self._device,
+            )[env_ids]
+        else:
+            selected_env_ids = torch.as_tensor(
+                env_ids,
+                device=self._device,
+                dtype=torch.long,
+            )
+
+        assert self._data.planner_valid is not None
+        assert self._data.touchdown_accepted is not None
+        assert self._data.actual_stance_foot_pos_w is not None
+        assert self._data.actual_swing_foot_pos_w is not None
+        assert self._data.swing_start_pos_w is not None
+        assert self._data.swing_side is not None
+        assert self._data.target_foothold_f is not None
+        assert self._data.feasible_velocity_f is not None
+        assert self._data.target_foothold_w is not None
+        assert self._data.gait_mode is not None
+        assert self._data.phase is not None
+        assert self._data.swing_reference_pos_w is not None
+
+        self._data.planner_valid[env_ids] = True
+
+        foot_target_error = torch.linalg.norm(
+            (
+                self._data.actual_swing_foot_pos_w[env_ids]
+                - self._data.target_foothold_w[env_ids]
+            )[:, :2],
+            dim=-1,
+        )
+        foot_height_error = torch.abs(
+            self._data.actual_swing_foot_pos_w[env_ids, 2]
+            - self._data.target_foothold_w[env_ids, 2]
+        )
+
+        contact_forces = self._contact_sensor.data.net_forces_w_history[
+            env_ids,
+            :,
+            [self._left_contact_body_id, self._right_contact_body_id],
+            :,
+        ]
+        contact = torch.max(
+            torch.linalg.norm(contact_forces, dim=-1),
+            dim=1,
+        )[0] > self.cfg.contact_force_threshold_n
+
+        selected_env_count = contact.shape[0]
+        selected_rows = torch.arange(
+            selected_env_count,
+            device=self._device,
+        )
+        current_swing_side = self._data.swing_side[env_ids]
+        swing_foot_contact = contact[
+            selected_rows,
+            current_swing_side,
+        ]
+        self._data.touchdown_accepted[env_ids] = (
+            swing_foot_contact
+            & (foot_target_error <= self.cfg.touchdown_xy_tolerance_m)
+            & (foot_height_error <= self.cfg.touchdown_z_tolerance_m)
+        )
+
+        gait_state = advance_gait(
+            state=self._select_gait_state(env_ids),
+            contact=contact,
+            touchdown_accepted=self._data.touchdown_accepted[env_ids],
+            planner_valid=self._data.planner_valid[env_ids],
+            dt=self.cfg.control_dt_s,
+            cfg=self._gait_cfg,
+        )
+        self._write_gait_state(env_ids, gait_state)
+
+        self._data.gait_mode[env_ids] = gait_state.mode
+        self._data.swing_side[env_ids] = gait_state.swing_side
+        self._data.phase[env_ids] = gait_phase(
+            gait_state,
+            self._gait_cfg,
+        )
+
+        left_ankle_pos_w = self._robot.data.body_pos_w[
+            env_ids,
+            self._left_ankle_body_id,
+        ]
+        right_ankle_pos_w = self._robot.data.body_pos_w[
+            env_ids,
+            self._right_ankle_body_id,
+        ]
+
+        left_ankle_quat_w = self._robot.data.body_quat_w[
+            env_ids,
+            self._left_ankle_body_id,
+        ]
+        right_ankle_quat_w = self._robot.data.body_quat_w[
+            env_ids,
+            self._right_ankle_body_id,
+        ]
+
+        left_sole_pos_w = self._sole_geometry.center_world(
+            left_ankle_pos_w,
+            left_ankle_quat_w,
+        )
+        right_sole_pos_w = self._sole_geometry.center_world(
+            right_ankle_pos_w,
+            right_ankle_quat_w,
+        )
+
+        swing_side = self._data.swing_side[env_ids]
+        swing_is_left = swing_side == 0
+
+        self._data.actual_stance_foot_pos_w[env_ids] = torch.where(
+            swing_is_left.unsqueeze(-1),
+            right_sole_pos_w,
+            left_sole_pos_w,
+        )
+
+        self._data.actual_swing_foot_pos_w[env_ids] = torch.where(
+            swing_is_left.unsqueeze(-1),
+            left_sole_pos_w,
+            right_sole_pos_w,
+        )
+
+        stance_pos_w = self._data.actual_stance_foot_pos_w[env_ids]
+        num_selected_envs = stance_pos_w.shape[0]
+        active_swing = (
+            (gait_state.mode == GaitState.LEFT_SWING)
+            | (gait_state.mode == GaitState.RIGHT_SWING)
+        )
+        new_swing = active_swing & (gait_state.elapsed_s <= 1.0e-6)
+
+        if torch.any(new_swing).item():
+            new_swing_env_ids = selected_env_ids[new_swing]
+            new_swing_stance_pos_w = stance_pos_w[new_swing]
+            new_swing_side = swing_side[new_swing]
+            new_swing_count = new_swing_stance_pos_w.shape[0]
+
+            desired_velocity = torch.zeros(
+                new_swing_count,
+                3,
+                device=self._device,
+            )
+            level = torch.zeros(
+                new_swing_count,
+                device=self._device,
+                dtype=torch.long,
+            )
+
+            flat_result = sample_flat_targets(
+                stance_xy=new_swing_stance_pos_w[:, :2],
+                swing_side=new_swing_side,
+                desired_velocity=desired_velocity,
+                level=level,
+                generator=self._generator,
+                cfg=self._flat_provider_cfg,
+            )
+
+            self._data.swing_start_pos_w[new_swing_env_ids] = (
+                self._data.actual_swing_foot_pos_w[env_ids][new_swing]
+            )
+            self._data.target_foothold_f[new_swing_env_ids] = (
+                flat_result.position_f
+            )
+            self._data.feasible_velocity_f[new_swing_env_ids] = (
+                flat_result.feasible_velocity_f
+            )
+            self._data.target_foothold_w[new_swing_env_ids] = (
+                flat_result.position_f
+            )
+            self._data.target_foothold_w[new_swing_env_ids, 2] = (
+                new_swing_stance_pos_w[:, 2]
+            )
+
+        apex_height = torch.full(
+            (num_selected_envs,),
+            self.cfg.swing_apex_height_m,
+            device=self._device,
+        )
+
+        swing_reference = quintic_swing_reference(
+            start=self._data.swing_start_pos_w[env_ids],
+            goal=self._data.target_foothold_w[env_ids],
+            phase=self._data.phase[env_ids],
+            apex_height=apex_height,
+            swing_duration_s=self.cfg.swing_duration_s,
+        )
+
+        self._data.swing_reference_pos_w[env_ids] = swing_reference.position
