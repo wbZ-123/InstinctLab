@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
+import isaaclab.sim as sim_utils
+import isaaclab.utils.string as string_utils
 from isaaclab.sensors import SensorBase
+from isaaclab.utils.math import convert_quat
+from isaacsim.core.simulation_manager import SimulationManager
+from pxr import PhysxSchema
 
 from instinctlab_foothold import (
     FlatProviderConfig,
@@ -96,18 +102,51 @@ class FootholdPlanner(SensorBase):
 
         self._generator = torch.Generator(device=self._device)
 
-        self._robot = self._scene[self.cfg.robot_name]
+        self._physics_sim_view = SimulationManager.get_physics_sim_view()
+        robot_prim_path = self.cfg.prim_path
+        template_robot_prim_path = (
+            f"{self._parent_prims[0].GetPath().pathString}/"
+            f"{robot_prim_path.rsplit('/', 1)[-1]}"
+        )
+        body_names = []
+        for prim in sim_utils.get_all_matching_child_prims(
+            template_robot_prim_path,
+            predicate=lambda p: p.HasAPI(PhysxSchema.PhysxRigidBodyAPI),
+            depth=1,
+        ):
+            body_names.append(prim.GetName())
 
-        self._contact_sensor = self._scene.sensors[
-            self.cfg.contact_sensor_name
+        if not body_names:
+            raise RuntimeError(
+                "FootholdPlanner could not find any rigid bodies under "
+                f"'{template_robot_prim_path}'."
+            )
+
+        body_names_regex = r"(" + "|".join(re.escape(name) for name in body_names) + r")"
+        body_paths_regex = f"{robot_prim_path}/{body_names_regex}"
+        body_paths_glob = body_paths_regex.replace(".*", "*")
+
+        self._robot_body_physx_view = (
+            self._physics_sim_view.create_rigid_body_view(body_paths_glob)
+        )
+        self._num_robot_bodies = (
+            self._robot_body_physx_view.count // self._num_envs
+        )
+        self._robot_body_names = [
+            path.split("/")[-1]
+            for path in self._robot_body_physx_view.prim_paths[
+                : self._num_robot_bodies
+            ]
         ]
 
-        left_ids, left_names = self._robot.find_bodies(
+        left_ids, left_names = string_utils.resolve_matching_names(
             self.cfg.left_ankle_body_name,
+            self._robot_body_names,
             preserve_order=True,
         )
-        right_ids, right_names = self._robot.find_bodies(
+        right_ids, right_names = string_utils.resolve_matching_names(
             self.cfg.right_ankle_body_name,
+            self._robot_body_names,
             preserve_order=True,
         )
 
@@ -126,31 +165,6 @@ class FootholdPlanner(SensorBase):
 
         self._left_ankle_body_id = left_ids[0]
         self._right_ankle_body_id = right_ids[0]
-
-        left_contact_ids, left_contact_names = self._contact_sensor.find_bodies(
-            self.cfg.left_contact_body_name,
-            preserve_order=True,
-        )
-        right_contact_ids, right_contact_names = self._contact_sensor.find_bodies(
-            self.cfg.right_contact_body_name,
-            preserve_order=True,
-        )
-
-        if len(left_contact_ids) != 1:
-            raise RuntimeError(
-                "FootholdPlanner expected exactly one left contact body, "
-                f"but found {left_contact_names} for pattern "
-                f"{self.cfg.left_contact_body_name!r}."
-            )
-        if len(right_contact_ids) != 1:
-            raise RuntimeError(
-                "FootholdPlanner expected exactly one right contact body, "
-                f"but found {right_contact_names} for pattern "
-                f"{self.cfg.right_contact_body_name!r}."
-            )
-
-        self._left_contact_body_id = left_contact_ids[0]
-        self._right_contact_body_id = right_contact_ids[0]
 
         self._data.gait_mode = torch.zeros(
             self._num_envs,
@@ -294,16 +308,12 @@ class FootholdPlanner(SensorBase):
             - self._data.target_foothold_w[env_ids, 2]
         )
 
-        contact_forces = self._contact_sensor.data.net_forces_w_history[
-            env_ids,
-            :,
-            [self._left_contact_body_id, self._right_contact_body_id],
-            :,
-        ]
-        contact = torch.max(
-            torch.linalg.norm(contact_forces, dim=-1),
-            dim=1,
-        )[0] > self.cfg.contact_force_threshold_n
+        contact = torch.ones(
+            selected_env_ids.shape[0],
+            2,
+            device=self._device,
+            dtype=torch.bool,
+        )
 
         selected_env_count = contact.shape[0]
         selected_rows = torch.arange(
@@ -338,23 +348,30 @@ class FootholdPlanner(SensorBase):
             self._gait_cfg,
         )
 
-        left_ankle_pos_w = self._robot.data.body_pos_w[
-            env_ids,
+        robot_body_poses_w = self._robot_body_physx_view.get_transforms().view(
+            self._num_envs,
+            self._num_robot_bodies,
+            7,
+        )[env_ids]
+        left_ankle_pos_w = robot_body_poses_w[
+            :,
             self._left_ankle_body_id,
+            :3,
         ]
-        right_ankle_pos_w = self._robot.data.body_pos_w[
-            env_ids,
+        right_ankle_pos_w = robot_body_poses_w[
+            :,
             self._right_ankle_body_id,
+            :3,
         ]
 
-        left_ankle_quat_w = self._robot.data.body_quat_w[
-            env_ids,
-            self._left_ankle_body_id,
-        ]
-        right_ankle_quat_w = self._robot.data.body_quat_w[
-            env_ids,
-            self._right_ankle_body_id,
-        ]
+        left_ankle_quat_w = convert_quat(
+            robot_body_poses_w[:, self._left_ankle_body_id, 3:],
+            to="wxyz",
+        )
+        right_ankle_quat_w = convert_quat(
+            robot_body_poses_w[:, self._right_ankle_body_id, 3:],
+            to="wxyz",
+        )
 
         left_sole_pos_w = self._sole_geometry.center_world(
             left_ankle_pos_w,

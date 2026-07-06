@@ -336,6 +336,7 @@ class SceneCfg(InteractiveSceneCfg):
     )
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
     foothold_planner = FootholdPlannerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot",
         robot_name="robot",
         contact_sensor_name="contact_forces",
         left_ankle_body_name="left_ankle_roll_link",
