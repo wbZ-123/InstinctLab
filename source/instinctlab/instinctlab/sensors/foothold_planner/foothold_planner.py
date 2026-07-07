@@ -166,6 +166,73 @@ class FootholdPlanner(SensorBase):
         self._left_ankle_body_id = left_ids[0]
         self._right_ankle_body_id = right_ids[0]
 
+        contact_body_names = []
+        for prim in sim_utils.get_all_matching_child_prims(
+            template_robot_prim_path,
+            predicate=lambda p: p.HasAPI(PhysxSchema.PhysxContactReportAPI),
+            depth=1,
+        ):
+            contact_body_names.append(prim.GetName())
+
+        if not contact_body_names:
+            raise RuntimeError(
+                "FootholdPlanner could not find any contact-reporting "
+                f"bodies under '{template_robot_prim_path}'."
+            )
+
+        contact_body_names_regex = (
+            r"("
+            + "|".join(re.escape(name) for name in contact_body_names)
+            + r")"
+        )
+        contact_body_paths_regex = (
+            f"{robot_prim_path}/{contact_body_names_regex}"
+        )
+        contact_body_paths_glob = contact_body_paths_regex.replace(".*", "*")
+
+        self._contact_physx_view = (
+            self._physics_sim_view.create_rigid_contact_view(
+                contact_body_paths_glob,
+                max_contact_data_count=len(contact_body_names)
+                * self._num_envs,
+            )
+        )
+        self._num_contact_bodies = (
+            self._contact_physx_view.sensor_count // self._num_envs
+        )
+        self._contact_body_names = contact_body_names
+
+        left_contact_ids, left_contact_names = (
+            string_utils.resolve_matching_names(
+                self.cfg.left_contact_body_name,
+                self._contact_body_names,
+                preserve_order=True,
+            )
+        )
+        right_contact_ids, right_contact_names = (
+            string_utils.resolve_matching_names(
+                self.cfg.right_contact_body_name,
+                self._contact_body_names,
+                preserve_order=True,
+            )
+        )
+
+        if len(left_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one left contact body, "
+                f"but found {left_contact_names} for pattern "
+                f"{self.cfg.left_contact_body_name!r}."
+            )
+        if len(right_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one right contact body, "
+                f"but found {right_contact_names} for pattern "
+                f"{self.cfg.right_contact_body_name!r}."
+            )
+
+        self._left_contact_body_id = left_contact_ids[0]
+        self._right_contact_body_id = right_contact_ids[0]
+
         self._data.gait_mode = torch.zeros(
             self._num_envs,
             device=self._device,
@@ -308,11 +375,23 @@ class FootholdPlanner(SensorBase):
             - self._data.target_foothold_w[env_ids, 2]
         )
 
-        contact = torch.ones(
-            selected_env_ids.shape[0],
-            2,
-            device=self._device,
-            dtype=torch.bool,
+        net_contact_forces_w = (
+            self._contact_physx_view.get_net_contact_forces(
+                dt=self._sim_physics_dt,
+            ).view(
+                self._num_envs,
+                self._num_contact_bodies,
+                3,
+            )[env_ids]
+        )
+        foot_contact_forces_w = net_contact_forces_w[
+            :,
+            [self._left_contact_body_id, self._right_contact_body_id],
+            :,
+        ]
+        contact = (
+            torch.linalg.norm(foot_contact_forces_w, dim=-1)
+            > self.cfg.contact_force_threshold_n
         )
 
         selected_env_count = contact.shape[0]
