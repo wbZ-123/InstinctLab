@@ -7,6 +7,29 @@ from types import SimpleNamespace
 import torch
 
 
+class _FakeCommandManager:
+    def __init__(self, command: torch.Tensor):
+        self.command = command
+
+    def get_command(self, command_name: str) -> torch.Tensor:
+        assert command_name == "base_velocity"
+        return self.command
+
+
+class _FakePlanner:
+    def __init__(self, data):
+        self._data = data
+        self.desired_velocity = None
+
+    def set_desired_velocity(self, desired_velocity_f: torch.Tensor) -> None:
+        self.desired_velocity = desired_velocity_f.clone()
+
+    @property
+    def data(self):
+        assert self.desired_velocity is not None
+        return self._data
+
+
 def _load_foothold_reward_module():
     module_path = (
         Path(__file__).resolve().parents[3]
@@ -57,6 +80,31 @@ def test_swing_tracking_rewards_reference_match_and_masks_non_swing():
     reward = foothold.foothold_swing_tracking_exp(env, std=0.2)
 
     torch.testing.assert_close(reward, torch.tensor([1.0, 0.0]))
+
+
+def test_swing_tracking_syncs_base_velocity_before_reading_planner_data():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        gait_mode=torch.tensor([1]),
+        actual_swing_foot_pos_w=torch.tensor([[1.0, 2.0, 0.3]]),
+        swing_reference_pos_w=torch.tensor([[1.0, 2.0, 0.3]]),
+    )
+    planner = _FakePlanner(planner_data)
+    command = torch.tensor([[0.5, -0.1, 0.2]])
+    env = SimpleNamespace(
+        command_manager=_FakeCommandManager(command),
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": planner,
+            }
+        ),
+    )
+
+    reward = foothold.foothold_swing_tracking_exp(env, std=0.2)
+
+    torch.testing.assert_close(planner.desired_velocity, command)
+    torch.testing.assert_close(reward, torch.tensor([1.0]))
 
 
 def test_touchdown_tracking_rewards_accepted_touchdown_only():

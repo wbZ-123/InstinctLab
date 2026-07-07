@@ -561,9 +561,15 @@ class FootholdPlanner(SensorBase):
                 device=self._device,
                 dtype=torch.long,
             )
+            stance_xy_f = torch.zeros(
+                new_swing_count,
+                2,
+                device=self._device,
+                dtype=new_swing_stance_pos_w.dtype,
+            )
 
             flat_result = sample_flat_targets(
-                stance_xy=new_swing_stance_pos_w[:, :2],
+                stance_xy=stance_xy_f,
                 swing_side=new_swing_side,
                 desired_velocity=desired_velocity,
                 level=level,
@@ -581,7 +587,7 @@ class FootholdPlanner(SensorBase):
                 flat_result.feasible_velocity_f
             )
             self._data.target_foothold_w[new_swing_env_ids] = (
-                flat_result.position_f
+                new_swing_stance_pos_w + flat_result.position_f
             )
             self._data.target_foothold_w[new_swing_env_ids, 2] = (
                 new_swing_stance_pos_w[:, 2]

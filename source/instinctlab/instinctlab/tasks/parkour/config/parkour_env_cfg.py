@@ -680,12 +680,20 @@ class G1Rewards:
     foothold_swing_tracking = RewTerm(
         func=mdp.foothold_swing_tracking_exp,
         weight=0.2,
-        params={"sensor_name": "foothold_planner", "std": 0.15},
+        params={
+            "sensor_name": "foothold_planner",
+            "command_name": "base_velocity",
+            "std": 0.15,
+        },
     )
     foothold_touchdown_tracking = RewTerm(
         func=mdp.foothold_touchdown_tracking_exp,
         weight=0.1,
-        params={"sensor_name": "foothold_planner", "std": 0.10},
+        params={
+            "sensor_name": "foothold_planner",
+            "command_name": "base_velocity",
+            "std": 0.10,
+        },
     )
 
     # Regularization rewards

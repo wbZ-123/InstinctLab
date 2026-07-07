@@ -7,6 +7,20 @@ def _foothold_planner_data(env, sensor_name: str):
     return env.scene.sensors[sensor_name].data
 
 
+def _sync_desired_velocity_command(
+    env,
+    sensor_name: str,
+    command_name: str | None,
+) -> None:
+    if command_name is None or not hasattr(env, "command_manager"):
+        return
+
+    planner = env.scene.sensors[sensor_name]
+    planner.set_desired_velocity(
+        env.command_manager.get_command(command_name),
+    )
+
+
 def _is_swing_mode(gait_mode: torch.Tensor) -> torch.Tensor:
     return (gait_mode == 1) | (gait_mode == 2)
 
@@ -18,9 +32,11 @@ def _is_touchdown_confirm_mode(gait_mode: torch.Tensor) -> torch.Tensor:
 def foothold_swing_tracking_exp(
     env,
     sensor_name: str = "foothold_planner",
+    command_name: str | None = "base_velocity",
     std: float = 0.15,
 ):
     """Reward swing foot center tracking of the planner reference path."""
+    _sync_desired_velocity_command(env, sensor_name, command_name)
     data = _foothold_planner_data(env, sensor_name)
 
     position_error = data.actual_swing_foot_pos_w - data.swing_reference_pos_w
@@ -33,9 +49,11 @@ def foothold_swing_tracking_exp(
 def foothold_touchdown_tracking_exp(
     env,
     sensor_name: str = "foothold_planner",
+    command_name: str | None = "base_velocity",
     std: float = 0.10,
 ):
     """Reward accepted touchdown close to the planner target foothold."""
+    _sync_desired_velocity_command(env, sensor_name, command_name)
     data = _foothold_planner_data(env, sensor_name)
 
     position_error = data.actual_swing_foot_pos_w - data.target_foothold_w
