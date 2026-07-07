@@ -688,7 +688,7 @@ class G1Rewards:
     )
     foothold_touchdown_tracking = RewTerm(
         func=mdp.foothold_touchdown_tracking_exp,
-        weight=0.1,
+        weight=0.05,
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
