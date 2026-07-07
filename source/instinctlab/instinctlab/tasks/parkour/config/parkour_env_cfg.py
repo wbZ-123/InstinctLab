@@ -700,8 +700,38 @@ class G1Rewards:
         weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )
+    foothold_reset_mode_indicator = RewTerm(
+        func=mdp.foothold_reset_mode_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_left_swing_mode_indicator = RewTerm(
+        func=mdp.foothold_left_swing_mode_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_right_swing_mode_indicator = RewTerm(
+        func=mdp.foothold_right_swing_mode_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
     foothold_touchdown_confirm_indicator = RewTerm(
         func=mdp.foothold_touchdown_confirm_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_early_contact_indicator = RewTerm(
+        func=mdp.foothold_early_contact_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_overdue_indicator = RewTerm(
+        func=mdp.foothold_overdue_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_stance_lost_indicator = RewTerm(
+        func=mdp.foothold_stance_lost_indicator,
         weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )

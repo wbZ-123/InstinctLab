@@ -29,6 +29,13 @@ def _is_touchdown_confirm_mode(gait_mode: torch.Tensor) -> torch.Tensor:
     return gait_mode == 3
 
 
+def _is_mode(
+    gait_mode: torch.Tensor,
+    mode: int,
+) -> torch.Tensor:
+    return (gait_mode == mode).float()
+
+
 def foothold_swing_tracking_exp(
     env,
     sensor_name: str = "foothold_planner",
@@ -76,6 +83,33 @@ def foothold_swing_mode_indicator(
     return _is_swing_mode(data.gait_mode).float()
 
 
+def foothold_reset_mode_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner state machine is holding after reset."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 0)
+
+
+def foothold_left_swing_mode_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner state machine is in left swing."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 1)
+
+
+def foothold_right_swing_mode_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner state machine is in right swing."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 2)
+
+
 def foothold_touchdown_confirm_indicator(
     env,
     sensor_name: str = "foothold_planner",
@@ -83,6 +117,33 @@ def foothold_touchdown_confirm_indicator(
     """Return 1 when the planner accepted touchdown and swapped support."""
     data = _foothold_planner_data(env, sensor_name)
     return _is_touchdown_confirm_mode(data.gait_mode).float()
+
+
+def foothold_early_contact_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner reports early swing-foot contact."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 4)
+
+
+def foothold_overdue_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the swing phase is overdue."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 5)
+
+
+def foothold_stance_lost_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the support foot loses confirmed contact."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 6)
 
 
 def foothold_touchdown_accepted_indicator(
