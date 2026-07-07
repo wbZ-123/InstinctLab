@@ -677,6 +677,16 @@ class G1Rewards:
     dont_wait = RewTerm(func=mdp.dont_wait, weight=-0.5, params={"command_name": "base_velocity"})
     is_alive = RewTerm(func=mdp.is_alive, weight=3.0)
     stand_still = RewTerm(func=mdp.stand_still, weight=-0.3, params={"command_name": "base_velocity", "offset": 4.0})
+    foothold_swing_tracking = RewTerm(
+        func=mdp.foothold_swing_tracking_exp,
+        weight=0.2,
+        params={"sensor_name": "foothold_planner", "std": 0.15},
+    )
+    foothold_touchdown_tracking = RewTerm(
+        func=mdp.foothold_touchdown_tracking_exp,
+        weight=0.1,
+        params={"sensor_name": "foothold_planner", "std": 0.10},
+    )
 
     # Regularization rewards
     volume_points_penetration = RewTerm(
