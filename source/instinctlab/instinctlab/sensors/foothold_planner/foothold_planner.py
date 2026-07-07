@@ -61,6 +61,55 @@ class FootholdPlanner(SensorBase):
         self._update_outdated_buffers()
         return self._data
 
+    def set_desired_velocity(
+        self,
+        desired_velocity_f: torch.Tensor,
+        env_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Set the desired velocity used by the flat foothold sampler.
+
+        Args:
+            desired_velocity_f: Desired ``[vx, vy, wz]`` commands in the
+                planner frame. Shape can be ``(3,)`` for all environments or
+                ``(num_selected_envs, 3)`` for a subset.
+            env_ids: Environment ids to update. Defaults to all environments.
+        """
+        if self._data.desired_velocity_f is None:
+            raise RuntimeError(
+                "FootholdPlanner desired velocity buffer is not initialized."
+            )
+
+        if env_ids is None:
+            resolved_env_ids = slice(None)
+            num_selected_envs = self._num_envs
+        elif isinstance(env_ids, slice):
+            resolved_env_ids = env_ids
+            num_selected_envs = torch.arange(
+                self._num_envs,
+                device=self._device,
+            )[env_ids].shape[0]
+        else:
+            resolved_env_ids = env_ids
+            num_selected_envs = len(env_ids)
+
+        desired_velocity_f = desired_velocity_f.to(
+            device=self._device,
+            dtype=self._data.desired_velocity_f.dtype,
+        )
+        if desired_velocity_f.shape == (3,):
+            desired_velocity_f = desired_velocity_f.unsqueeze(0).expand(
+                num_selected_envs,
+                -1,
+            )
+        if desired_velocity_f.shape != (num_selected_envs, 3):
+            raise ValueError(
+                "desired_velocity_f must have shape (3,) or "
+                f"({num_selected_envs}, 3), got "
+                f"{tuple(desired_velocity_f.shape)}."
+            )
+
+        self._data.desired_velocity_f[resolved_env_ids] = desired_velocity_f
+
     def reset(self, env_ids: Sequence[int] | None = None):
         super().reset(env_ids)
 
@@ -258,6 +307,11 @@ class FootholdPlanner(SensorBase):
             3,
             device=self._device,
         )
+        self._data.desired_velocity_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
         self._data.feasible_velocity_f = torch.zeros(
             self._num_envs,
             3,
@@ -282,6 +336,12 @@ class FootholdPlanner(SensorBase):
             self._num_envs,
             3,
             device=self._device,
+        )
+        self._data.foot_contact = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+            dtype=torch.bool,
         )
 
         self._data.touchdown_accepted = torch.zeros(
@@ -355,11 +415,13 @@ class FootholdPlanner(SensorBase):
         assert self._data.swing_start_pos_w is not None
         assert self._data.swing_side is not None
         assert self._data.target_foothold_f is not None
+        assert self._data.desired_velocity_f is not None
         assert self._data.feasible_velocity_f is not None
         assert self._data.target_foothold_w is not None
         assert self._data.gait_mode is not None
         assert self._data.phase is not None
         assert self._data.swing_reference_pos_w is not None
+        assert self._data.foot_contact is not None
 
         self._data.planner_valid[env_ids] = True
 
@@ -393,6 +455,7 @@ class FootholdPlanner(SensorBase):
             torch.linalg.norm(foot_contact_forces_w, dim=-1)
             > self.cfg.contact_force_threshold_n
         )
+        self._data.foot_contact[env_ids] = contact
 
         selected_env_count = contact.shape[0]
         selected_rows = torch.arange(
@@ -490,11 +553,9 @@ class FootholdPlanner(SensorBase):
             new_swing_side = swing_side[new_swing]
             new_swing_count = new_swing_stance_pos_w.shape[0]
 
-            desired_velocity = torch.zeros(
-                new_swing_count,
-                3,
-                device=self._device,
-            )
+            desired_velocity = self._data.desired_velocity_f[
+                new_swing_env_ids
+            ]
             level = torch.zeros(
                 new_swing_count,
                 device=self._device,

@@ -89,7 +89,12 @@ def main() -> None:
     print("[SMOKE] resetting env", flush=True)
     env.reset()
 
-    for step in range(5):
+    planner.set_desired_velocity(
+        torch.tensor([[0.5, 0.0, 0.0]], device=unwrapped.device),
+    )
+    print("[SMOKE] desired_velocity_f set to [[0.5, 0.0, 0.0]]", flush=True)
+
+    for step in range(40):
         actions = torch.zeros(
             unwrapped.num_envs,
             unwrapped.action_manager.total_action_dim,
@@ -106,8 +111,12 @@ def main() -> None:
             data.gait_mode[:1].detach().cpu().tolist(),
             "phase=",
             data.phase[:1].detach().cpu().tolist(),
+            "contact=",
+            data.foot_contact[:1].detach().cpu().tolist(),
             "target=",
             data.target_foothold_w[:1].detach().cpu().tolist(),
+            "feasible_velocity=",
+            data.feasible_velocity_f[:1].detach().cpu().tolist(),
             "touchdown=",
             data.touchdown_accepted[:1].detach().cpu().tolist(),
             flush=True,
