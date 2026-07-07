@@ -87,7 +87,48 @@ def main() -> None:
     print("[SMOKE] planner:", type(planner).__name__, flush=True)
 
     print("[SMOKE] resetting env", flush=True)
-    env.reset()
+    obs, _ = env.reset()
+
+    print(
+        "[SMOKE] observation groups:",
+        list(obs.keys()),
+        flush=True,
+    )
+
+    if "policy" in obs:
+        print(
+            "[SMOKE] policy obs keys:",
+            list(obs["policy"].keys())
+            if isinstance(obs["policy"], dict)
+            else type(obs["policy"]).__name__,
+            flush=True,
+        )
+        if isinstance(obs["policy"], dict) and "foothold_planner" in obs["policy"]:
+            print(
+                "[SMOKE] policy foothold_planner obs shape:",
+                tuple(obs["policy"]["foothold_planner"].shape),
+                flush=True,
+            )
+            print(
+                "[SMOKE] policy foothold_planner obs sample:",
+                obs["policy"]["foothold_planner"][:1].detach().cpu().tolist(),
+                flush=True,
+            )
+
+    if "critic" in obs:
+        print(
+            "[SMOKE] critic obs keys:",
+            list(obs["critic"].keys())
+            if isinstance(obs["critic"], dict)
+            else type(obs["critic"]).__name__,
+            flush=True,
+        )
+        if isinstance(obs["critic"], dict) and "foothold_planner" in obs["critic"]:
+            print(
+                "[SMOKE] critic foothold_planner obs shape:",
+                tuple(obs["critic"]["foothold_planner"].shape),
+                flush=True,
+            )
 
     print(
         "[SMOKE] planner desired velocity will be synced from base_velocity",
