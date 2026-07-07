@@ -697,22 +697,22 @@ class G1Rewards:
     )
     foothold_swing_mode_indicator = RewTerm(
         func=mdp.foothold_swing_mode_indicator,
-        weight=1.0,
+        weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_touchdown_confirm_indicator = RewTerm(
         func=mdp.foothold_touchdown_confirm_indicator,
-        weight=1.0,
+        weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_touchdown_accepted_indicator = RewTerm(
         func=mdp.foothold_touchdown_accepted_indicator,
-        weight=1.0,
+        weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_plan_invalid_indicator = RewTerm(
         func=mdp.foothold_plan_invalid_indicator,
-        weight=1.0,
+        weight=0.01,
         params={"sensor_name": "foothold_planner"},
     )
 
