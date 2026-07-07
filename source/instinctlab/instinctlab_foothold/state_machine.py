@@ -161,20 +161,26 @@ def advance_gait(
     invalid_during_hold = (state.mode == GaitState.HOLD) & ~planner_valid
     mode[invalid_during_hold] = GaitState.PLAN_INVALID
 
-    stable_hold = (
+    valid_hold = (
         (state.mode == GaitState.HOLD)
         & planner_valid
-        & torch.all(contact, dim=-1)
     )
 
     hold_elapsed_s = torch.where(
-        stable_hold,
+        valid_hold,
         state.hold_elapsed_s + dt,
         torch.zeros_like(state.hold_elapsed_s),
     )
 
-    start_left_swing = stable_hold & (
-        hold_elapsed_s >= cfg.reset_hold_s - 1.0e-6
+    confirmed_hold_contact = torch.all(
+        contact_elapsed_s >= cfg.contact_confirm_s - 1.0e-6,
+        dim=-1,
+    )
+
+    start_left_swing = (
+        valid_hold
+        & confirmed_hold_contact
+        & (hold_elapsed_s >= cfg.reset_hold_s - 1.0e-6)
     )
 
     mode[start_left_swing] = GaitState.LEFT_SWING

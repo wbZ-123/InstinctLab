@@ -43,6 +43,69 @@ def test_reset_holds_for_exactly_point_four_seconds():
     assert state.mode.item() == GaitState.LEFT_SWING
 
 
+def test_reset_hold_keeps_time_but_requires_confirmed_contact_to_start():
+    cfg = GaitMachineConfig()
+    state = initial_gait_state(1, device="cpu")
+
+    touchdown_accepted = torch.tensor([False])
+    planner_valid = torch.tensor([True])
+
+    for _ in range(20):
+        state = advance_gait(
+            state=state,
+            contact=torch.tensor([[False, False]]),
+            touchdown_accepted=touchdown_accepted,
+            planner_valid=planner_valid,
+            dt=0.02,
+            cfg=cfg,
+        )
+
+    torch.testing.assert_close(
+        state.hold_elapsed_s,
+        torch.tensor([0.40]),
+    )
+    assert state.mode.item() == GaitState.HOLD
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[True, True]]),
+        touchdown_accepted=touchdown_accepted,
+        planner_valid=planner_valid,
+        dt=0.02,
+        cfg=cfg,
+    )
+
+    assert state.mode.item() == GaitState.HOLD
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[True, True]]),
+        touchdown_accepted=touchdown_accepted,
+        planner_valid=planner_valid,
+        dt=0.02,
+        cfg=cfg,
+    )
+
+    assert state.mode.item() == GaitState.LEFT_SWING
+
+
+def test_reset_hold_does_not_start_without_confirmed_contact():
+    cfg = GaitMachineConfig()
+    state = initial_gait_state(1, device="cpu")
+
+    for _ in range(25):
+        state = advance_gait(
+            state=state,
+            contact=torch.tensor([[False, False]]),
+            touchdown_accepted=torch.tensor([False]),
+            planner_valid=torch.tensor([True]),
+            dt=0.02,
+            cfg=cfg,
+        )
+
+    assert state.mode.item() == GaitState.HOLD
+
+
 def test_invalid_plan_is_visible_then_enters_recovery():
     cfg = GaitMachineConfig()
     state = initial_gait_state(1, device="cpu")
