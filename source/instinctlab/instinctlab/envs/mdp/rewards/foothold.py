@@ -65,3 +65,39 @@ def foothold_touchdown_tracking_exp(
         * data.touchdown_accepted.float()
         * _is_touchdown_confirm_mode(data.gait_mode).float()
     )
+
+
+def foothold_swing_mode_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner state machine is in left/right swing."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_swing_mode(data.gait_mode).float()
+
+
+def foothold_touchdown_confirm_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner accepted touchdown and swapped support."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_touchdown_confirm_mode(data.gait_mode).float()
+
+
+def foothold_touchdown_accepted_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the current swing touchdown is within planner tolerance."""
+    data = _foothold_planner_data(env, sensor_name)
+    return data.touchdown_accepted.float()
+
+
+def foothold_plan_invalid_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner reports no valid foothold plan."""
+    data = _foothold_planner_data(env, sensor_name)
+    return (~data.planner_valid).float()

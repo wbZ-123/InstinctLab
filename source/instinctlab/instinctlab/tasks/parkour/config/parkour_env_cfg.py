@@ -695,6 +695,26 @@ class G1Rewards:
             "std": 0.10,
         },
     )
+    foothold_swing_mode_indicator = RewTerm(
+        func=mdp.foothold_swing_mode_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_touchdown_confirm_indicator = RewTerm(
+        func=mdp.foothold_touchdown_confirm_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_touchdown_accepted_indicator = RewTerm(
+        func=mdp.foothold_touchdown_accepted_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_plan_invalid_indicator = RewTerm(
+        func=mdp.foothold_plan_invalid_indicator,
+        weight=0.01,
+        params={"sensor_name": "foothold_planner"},
+    )
 
     # Regularization rewards
     volume_points_penetration = RewTerm(

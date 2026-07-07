@@ -139,3 +139,37 @@ def test_touchdown_tracking_rewards_accepted_touchdown_only():
     reward = foothold.foothold_touchdown_tracking_exp(env, std=0.2)
 
     torch.testing.assert_close(reward, torch.tensor([1.0, 0.0, 0.0]))
+
+
+def test_foothold_diagnostic_indicators_expose_gait_state_events():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        gait_mode=torch.tensor([0, 1, 2, 3, 7]),
+        touchdown_accepted=torch.tensor([False, False, False, True, False]),
+        planner_valid=torch.tensor([True, True, True, True, False]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    torch.testing.assert_close(
+        foothold.foothold_swing_mode_indicator(env),
+        torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        foothold.foothold_touchdown_confirm_indicator(env),
+        torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        foothold.foothold_touchdown_accepted_indicator(env),
+        torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        foothold.foothold_plan_invalid_indicator(env),
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0]),
+    )
