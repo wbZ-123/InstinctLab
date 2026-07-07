@@ -444,6 +444,16 @@ class ObservationsCfg:
             params={"command_name": "base_velocity"},
             noise=None,
         )
+        foothold_planner = ObsTerm(
+            func=mdp.foothold_planner_observation,
+            history_length=8,
+            flatten_history_dim=True,
+            params={
+                "sensor_name": "foothold_planner",
+                "command_name": "base_velocity",
+            },
+            noise=None,
+        )
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01), history_length=8, flatten_history_dim=True
         )
@@ -490,6 +500,16 @@ class ObservationsCfg:
             history_length=8,
             flatten_history_dim=True,
             params={"command_name": "base_velocity"},
+            noise=None,
+        )
+        foothold_planner = ObsTerm(
+            func=mdp.foothold_planner_observation,
+            history_length=8,
+            flatten_history_dim=True,
+            params={
+                "sensor_name": "foothold_planner",
+                "command_name": "base_velocity",
+            },
             noise=None,
         )
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, history_length=8, flatten_history_dim=True)
