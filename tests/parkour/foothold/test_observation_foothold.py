@@ -69,6 +69,10 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
         ),
         phase=torch.tensor([0.25, 0.75]),
         swing_side=torch.tensor([0, 1]),
+        default_swing_apex_height=torch.tensor([0.08, 0.08]),
+        swing_apex_height=torch.tensor([0.14, 0.08]),
+        swing_clearance_safe=torch.tensor([False, True]),
+        swing_clearance_penetration=torch.tensor([0.02, 0.00]),
     )
     command = torch.tensor(
         [
@@ -90,8 +94,8 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
 
     expected = torch.tensor(
         [
-            [0.10, 0.18, 0.00, 0.50, 0.00, 0.10, 0.25, -1.00],
-            [0.08, -0.18, 0.00, 0.40, -0.05, -0.10, 0.75, 1.00],
+            [0.10, 0.18, 0.00, 0.50, 0.00, 0.10, 0.25, -1.00, 0.14, 0.06, 0.00, 0.02,],
+            [0.08, -0.18, 0.00, 0.40, -0.05, -0.10, 0.75, 1.00, 0.08, 0.00, 1.00, 0.00,],
         ]
     )
     torch.testing.assert_close(planner.desired_velocity, command)

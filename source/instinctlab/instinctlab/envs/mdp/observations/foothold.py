@@ -37,12 +37,25 @@ def foothold_planner_observation(
         - 1.0
     ).unsqueeze(-1)
 
+    swing_apex_height = data.swing_apex_height.unsqueeze(-1)
+    swing_apex_delta = (
+        data.swing_apex_height - data.default_swing_apex_height
+    ).unsqueeze(-1)
+    swing_clearance_safe = data.swing_clearance_safe.to(
+        dtype=data.phase.dtype
+    ).unsqueeze(-1)
+    swing_clearance_penetration = data.swing_clearance_penetration.unsqueeze(-1)
+
     return torch.cat(
         (
             data.target_foothold_f,
             data.feasible_velocity_f,
             phase,
             swing_side_sign,
+            swing_apex_height,
+            swing_apex_delta,
+            swing_clearance_safe,
+            swing_clearance_penetration,
         ),
         dim=-1,
     )
