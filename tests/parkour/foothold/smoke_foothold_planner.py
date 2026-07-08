@@ -100,6 +100,48 @@ def main() -> None:
         flush=True,
     )
 
+    def report_tensor(name: str, tensor: torch.Tensor):
+        finite = torch.isfinite(tensor)
+        print(
+            f"[NAN_PROBE] {name}: "
+            f"shape={tuple(tensor.shape)} "
+            f"finite={bool(finite.all())} "
+            f"nan={int(torch.isnan(tensor).sum().item())} "
+            f"inf={int(torch.isinf(tensor).sum().item())} "
+            f"min={tensor[finite].min().item() if finite.any() else 'NA'} "
+            f"max={tensor[finite].max().item() if finite.any() else 'NA'}",
+            flush=True,
+        )
+        if not finite.all():
+            bad_idx = (~finite).nonzero()[:20].detach().cpu().tolist()
+            print(f"[NAN_PROBE] {name} bad_idx first20={bad_idx}", flush=True)
+
+    for group_name, group_obs in obs.items():
+        if isinstance(group_obs, dict):
+            for obs_name, value in group_obs.items():
+                if torch.is_tensor(value):
+                    report_tensor(f"{group_name}.{obs_name}", value)
+        elif torch.is_tensor(group_obs):
+            report_tensor(group_name, group_obs)
+
+    planner = env.unwrapped.scene.sensors["foothold_planner"]
+    data = planner.data
+
+    for field_name in [
+        "target_foothold_w",
+        "target_foothold_f",
+        "feasible_velocity_f",
+        "swing_reference_pos_w",
+        "default_swing_reference_pos_w",
+        "swing_apex_height",
+        "default_swing_apex_height",
+        "swing_clearance_penetration",
+        "phase",
+    ]:
+        value = getattr(data, field_name, None)
+        if torch.is_tensor(value):
+            report_tensor(f"planner.{field_name}", value)
+
     if "policy" in obs:
         print(
             "[SMOKE] policy obs keys:",

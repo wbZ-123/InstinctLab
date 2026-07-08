@@ -130,6 +130,14 @@ def check_swing_centerline_penetration(
     penetration_offset = obstacle.get_points_penetration_offset(
         path_points.reshape(-1, 3)
     ).reshape(num_envs, num_samples, 3)
+
+    penetration_offset = torch.nan_to_num(
+        penetration_offset,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
     penetration_depth = torch.linalg.norm(penetration_offset, dim=-1)
     max_penetration_depth, deepest_indices = torch.max(penetration_depth, dim=-1)
     collides = max_penetration_depth > penetration_tolerance

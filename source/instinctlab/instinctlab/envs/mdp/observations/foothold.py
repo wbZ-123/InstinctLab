@@ -46,7 +46,7 @@ def foothold_planner_observation(
     ).unsqueeze(-1)
     swing_clearance_penetration = data.swing_clearance_penetration.unsqueeze(-1)
 
-    return torch.cat(
+    obs = torch.cat(
         (
             data.target_foothold_f,
             data.feasible_velocity_f,
@@ -59,3 +59,5 @@ def foothold_planner_observation(
         ),
         dim=-1,
     )
+
+    return torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
