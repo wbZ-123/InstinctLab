@@ -16,7 +16,16 @@ from .state_machine import (
     gait_phase,
     initial_gait_state,
 )
+
+from .terrain_query import (
+    FlatTerrainQuery,
+    StepTerrainQuery,
+    TerrainQueryResult,
+)
+
 from .trajectory import SwingReference, quintic_swing_reference
+
+from .terrain_provider import lift_flat_targets_to_terrain
 
 __all__ = [
     "FOOTHOLD_OBSERVATION_DIM",
@@ -38,4 +47,8 @@ __all__ = [
     "gait_phase",
     "initial_gait_state",
     "quintic_swing_reference",
+    "FlatTerrainQuery",
+    "StepTerrainQuery",
+    "TerrainQueryResult",
+    "lift_flat_targets_to_terrain",
 ]
