@@ -34,6 +34,9 @@ parser.add_argument("--wz", type=float, default=0.0)
 parser.add_argument("--dt", type=float, default=0.02)
 parser.add_argument("--swing-duration", type=float, default=0.80)
 parser.add_argument("--reset-x", type=float, default=1.5)
+parser.add_argument("--terrain", choices=("flat", "step"), default="step")
+parser.add_argument("--step-x", type=float, default=0.6)
+parser.add_argument("--step-height", type=float, default=0.18)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -48,10 +51,11 @@ from isaaclab.sim import SimulationCfg, SimulationContext  # noqa: E402
 
 from instinctlab_foothold import (  # noqa: E402
     FlatProviderConfig,
+    StepTerrainQuery,
+    lift_flat_targets_to_terrain,
     quintic_swing_reference,
     sample_flat_targets,
 )
-
 
 def make_visualizer() -> VisualizationMarkers:
     marker_cfg = VisualizationMarkersCfg(
@@ -137,6 +141,13 @@ def main() -> None:
         curriculum_radius_x=(0.0, 0.0, 0.0),
         curriculum_radius_y=(0.0, 0.0, 0.0),
         curriculum_yaw_limit_rad=(0.0, 0.0, 0.0),
+    )
+    
+    terrain_query = StepTerrainQuery(
+        step_x_m=args.step_x,
+        lower_height_m=0.0,
+        upper_height_m=args.step_height if args.terrain == "step" else 0.0,
+        edge_half_width_m=0.05,
     )
 
     # left = 0, right = 1
@@ -230,7 +241,7 @@ def main() -> None:
             )
             ellipse_points = ellipse_boundary_points(stance_pos)
 
-            result = sample_flat_targets(
+            flat_result = sample_flat_targets(
                 stance_xy=stance_xy,
                 swing_side=swing_side,
                 desired_velocity=desired_velocity,
@@ -238,12 +249,18 @@ def main() -> None:
                 generator=generator,
                 cfg=cfg,
             )
-            target = result.position_f.to(device)
+            terrain_result = lift_flat_targets_to_terrain(
+                flat_result,
+                terrain_query,
+            )
+            target = terrain_result.position_f.to(device)
             print(
                 "[VIS] raw_unclipped_foothold=",
                 raw_target.detach().cpu().tolist(),
-                "feasible_target=",
+                "terrain_target=",
                 target.detach().cpu().tolist(),
+                "terrain_height=",
+                terrain_result.terrain.heights[:, 0].detach().cpu().tolist(),
                 "desired_velocity=",
                 desired_velocity.detach().cpu().tolist(),
                 flush=True,
