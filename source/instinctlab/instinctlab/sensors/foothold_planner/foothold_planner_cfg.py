@@ -33,5 +33,12 @@ class FootholdPlannerCfg(SensorBaseCfg):
 
     swing_apex_height_m: float = 0.08
 
+    enable_edge_clearance: bool = True
+    clearance_max_apex_height_m: float = 0.30
+    clearance_apex_step_m: float = 0.03
+    clearance_sample_spacing_m: float = 0.03
+
     touchdown_xy_tolerance_m: float = 0.08
     touchdown_z_tolerance_m: float = 0.06
+
+    

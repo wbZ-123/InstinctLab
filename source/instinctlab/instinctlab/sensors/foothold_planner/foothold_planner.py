@@ -667,22 +667,23 @@ class FootholdPlanner(SensorBase):
             device=self._device,
         )
 
-        edge_obstacle = self._virtual_obstacles.get("edges")
-        if edge_obstacle is not None:
-            edge_obstacle = cast("PenetrationObstacle", edge_obstacle)
-            apex_adjustment = adjust_apex_for_edge_clearance(
-                obstacle=edge_obstacle,
-                start=self._data.swing_start_pos_w[env_ids],
-                goal=self._data.target_foothold_w[env_ids],
-                default_apex_height=default_apex_height,
-                max_apex_height=0.30,
-                apex_step=0.03,
-                swing_duration_s=self.cfg.swing_duration_s,
-                sample_spacing=0.03,
-            )
-            apex_height = apex_adjustment.apex_height
-            clearance_safe = apex_adjustment.is_safe
-            clearance_penetration = apex_adjustment.penetration.max_penetration_depth
+        if self.cfg.enable_edge_clearance:
+            edge_obstacle = self._virtual_obstacles.get("edges")
+            if edge_obstacle is not None:
+                edge_obstacle = cast("PenetrationObstacle", edge_obstacle)
+                apex_adjustment = adjust_apex_for_edge_clearance(
+                    obstacle=edge_obstacle,
+                    start=self._data.swing_start_pos_w[env_ids],
+                    goal=self._data.target_foothold_w[env_ids],
+                    default_apex_height=default_apex_height,
+                    max_apex_height=self.cfg.clearance_max_apex_height_m,
+                    apex_step=self.cfg.clearance_apex_step_m,
+                    sample_spacing=self.cfg.clearance_sample_spacing_m,
+                    swing_duration_s=self.cfg.swing_duration_s,
+                )
+                apex_height = apex_adjustment.apex_height
+                clearance_safe = apex_adjustment.is_safe
+                clearance_penetration = apex_adjustment.penetration.max_penetration_depth
 
         swing_reference = quintic_swing_reference(
             start=self._data.swing_start_pos_w[env_ids],
