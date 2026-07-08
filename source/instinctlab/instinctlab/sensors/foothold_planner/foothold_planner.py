@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -22,6 +22,7 @@ from instinctlab_foothold import (
     advance_gait,
     gait_phase,
     initial_gait_state,
+    adjust_apex_for_edge_clearance,
     quintic_swing_reference,
     sample_flat_targets,
 )
@@ -29,6 +30,7 @@ from instinctlab_foothold import (
 from .foothold_planner_data import FootholdPlannerData
 
 if TYPE_CHECKING:
+    from instinctlab_foothold.clearance import PenetrationObstacle
     from .foothold_planner_cfg import FootholdPlannerCfg
 
 
@@ -63,8 +65,8 @@ class FootholdPlanner(SensorBase):
         return self._data
     
     def register_virtual_obstacles(
-    self,
-    virtual_obstacles: dict[str, object],
+        self,
+        virtual_obstacles: dict[str, object],
     ) -> None:
         """Register terrain virtual obstacles for swing clearance checks.
 
@@ -640,11 +642,47 @@ class FootholdPlanner(SensorBase):
                 new_swing_stance_pos_w[:, 2]
             )
 
-        apex_height = torch.full(
+        default_apex_height = torch.full(
             (num_selected_envs,),
             self.cfg.swing_apex_height_m,
             device=self._device,
         )
+
+        default_swing_reference = quintic_swing_reference(
+            start=self._data.swing_start_pos_w[env_ids],
+            goal=self._data.target_foothold_w[env_ids],
+            phase=self._data.phase[env_ids],
+            apex_height=default_apex_height,
+            swing_duration_s=self.cfg.swing_duration_s,
+        )
+
+        apex_height = default_apex_height
+        clearance_safe = torch.ones(
+            num_selected_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        clearance_penetration = torch.zeros(
+            num_selected_envs,
+            device=self._device,
+        )
+
+        edge_obstacle = self._virtual_obstacles.get("edges")
+        if edge_obstacle is not None:
+            edge_obstacle = cast("PenetrationObstacle", edge_obstacle)
+            apex_adjustment = adjust_apex_for_edge_clearance(
+                obstacle=edge_obstacle,
+                start=self._data.swing_start_pos_w[env_ids],
+                goal=self._data.target_foothold_w[env_ids],
+                default_apex_height=default_apex_height,
+                max_apex_height=0.30,
+                apex_step=0.03,
+                swing_duration_s=self.cfg.swing_duration_s,
+                sample_spacing=0.03,
+            )
+            apex_height = apex_adjustment.apex_height
+            clearance_safe = apex_adjustment.is_safe
+            clearance_penetration = apex_adjustment.penetration.max_penetration_depth
 
         swing_reference = quintic_swing_reference(
             start=self._data.swing_start_pos_w[env_ids],
@@ -654,4 +692,16 @@ class FootholdPlanner(SensorBase):
             swing_duration_s=self.cfg.swing_duration_s,
         )
 
+        assert self._data.default_swing_reference_pos_w is not None
+        assert self._data.swing_reference_pos_w is not None
+        assert self._data.default_swing_apex_height is not None
+        assert self._data.swing_apex_height is not None
+        assert self._data.swing_clearance_safe is not None
+        assert self._data.swing_clearance_penetration is not None
+
+        self._data.default_swing_reference_pos_w[env_ids] = default_swing_reference.position
         self._data.swing_reference_pos_w[env_ids] = swing_reference.position
+        self._data.default_swing_apex_height[env_ids] = default_apex_height
+        self._data.swing_apex_height[env_ids] = apex_height
+        self._data.swing_clearance_safe[env_ids] = clearance_safe
+        self._data.swing_clearance_penetration[env_ids] = clearance_penetration

@@ -171,6 +171,14 @@ def main() -> None:
             data.feasible_velocity_f[:1].detach().cpu().tolist(),
             "touchdown=",
             data.touchdown_accepted[:1].detach().cpu().tolist(),
+            "[SMOKE] clearance default_apex=",
+            data.default_swing_apex_height[:1].detach().cpu().tolist(),
+            "adjusted_apex=",
+            data.swing_apex_height[:1].detach().cpu().tolist(),
+            "safe=",
+            data.swing_clearance_safe[:1].detach().cpu().tolist(),
+            "penetration=",
+            data.swing_clearance_penetration[:1].detach().cpu().tolist(),
             flush=True,
         )
 
