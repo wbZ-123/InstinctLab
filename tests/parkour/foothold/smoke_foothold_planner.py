@@ -84,6 +84,11 @@ def main() -> None:
     print("[SMOKE] sensors:", sorted(unwrapped.scene.sensors.keys()), flush=True)
 
     planner = unwrapped.scene.sensors["foothold_planner"]
+    print(
+        "[SMOKE] planner virtual obstacles:",
+        list(getattr(planner, "_virtual_obstacles", {}).keys()),
+        flush=True,
+    )
     print("[SMOKE] planner:", type(planner).__name__, flush=True)
 
     print("[SMOKE] resetting env", flush=True)

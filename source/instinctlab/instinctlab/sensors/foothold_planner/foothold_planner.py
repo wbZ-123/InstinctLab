@@ -45,6 +45,7 @@ class FootholdPlanner(SensorBase):
     def __init__(self, cfg: FootholdPlannerCfg):
         super().__init__(cfg)
         self._data = FootholdPlannerData()
+        self._virtual_obstacles: dict[str, object] = {}
         self._sole_geometry = SoleGeometry(
             center_offset_b=torch.tensor(cfg.sole_center_offset_b),
             half_length=cfg.sole_half_length,
@@ -60,6 +61,18 @@ class FootholdPlanner(SensorBase):
     def data(self) -> FootholdPlannerData:
         self._update_outdated_buffers()
         return self._data
+    
+    def register_virtual_obstacles(
+    self,
+    virtual_obstacles: dict[str, object],
+    ) -> None:
+        """Register terrain virtual obstacles for swing clearance checks.
+
+        This mirrors VolumePoints.register_virtual_obstacles. The planner only
+        stores obstacle handles here; swing-clearance adjustment can consume them
+        later during reference generation.
+        """
+        self._virtual_obstacles.update(virtual_obstacles)
 
     def set_desired_velocity(
         self,

@@ -965,6 +965,14 @@ class EventCfg:
         },
     )
 
+    register_virtual_obstacles_to_foothold_planner = EventTerm(
+        func=instinct_mdp.register_virtual_obstacle_to_sensor,
+        mode="startup",
+        params={
+            "sensor_cfgs": SceneEntityCfg("foothold_planner"),
+        },
+    )
+
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
