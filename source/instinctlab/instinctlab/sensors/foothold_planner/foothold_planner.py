@@ -154,6 +154,18 @@ class FootholdPlanner(SensorBase):
             self._data.swing_side[reset_env_ids] = reset_state.swing_side
         if self._data.phase is not None:
             self._data.phase[reset_env_ids] = 0.0
+        if self._data.default_swing_reference_pos_w is not None:
+            self._data.default_swing_reference_pos_w[reset_env_ids] = 0.0
+        if self._data.swing_reference_pos_w is not None:
+            self._data.swing_reference_pos_w[reset_env_ids] = 0.0
+        if self._data.default_swing_apex_height is not None:
+            self._data.default_swing_apex_height[reset_env_ids] = 0.0
+        if self._data.swing_apex_height is not None:
+            self._data.swing_apex_height[reset_env_ids] = 0.0
+        if self._data.swing_clearance_safe is not None:
+            self._data.swing_clearance_safe[reset_env_ids] = True
+        if self._data.swing_clearance_penetration is not None:
+            self._data.swing_clearance_penetration[reset_env_ids] = 0.0
         if self._data.touchdown_accepted is not None:
             self._data.touchdown_accepted[reset_env_ids] = False
         if self._data.planner_valid is not None:
@@ -330,9 +342,31 @@ class FootholdPlanner(SensorBase):
             3,
             device=self._device,
         )
+        self._data.default_swing_reference_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
         self._data.swing_reference_pos_w = torch.zeros(
             self._num_envs,
             3,
+            device=self._device,
+        )
+        self._data.default_swing_apex_height = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.swing_apex_height = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.swing_clearance_safe = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.swing_clearance_penetration = torch.zeros(
+            self._num_envs,
             device=self._device,
         )
         self._data.actual_stance_foot_pos_w = torch.zeros(

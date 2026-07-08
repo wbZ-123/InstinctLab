@@ -13,7 +13,12 @@ class FootholdPlannerData:
     target_foothold_f: torch.Tensor | None = None
     desired_velocity_f: torch.Tensor | None = None
     feasible_velocity_f: torch.Tensor | None = None
+    default_swing_reference_pos_w: torch.Tensor | None = None
     swing_reference_pos_w: torch.Tensor | None = None
+    default_swing_apex_height: torch.Tensor | None = None
+    swing_apex_height: torch.Tensor | None = None
+    swing_clearance_safe: torch.Tensor | None = None
+    swing_clearance_penetration: torch.Tensor | None = None
     actual_stance_foot_pos_w: torch.Tensor | None = None
     actual_swing_foot_pos_w: torch.Tensor | None = None
     swing_start_pos_w: torch.Tensor | None = None
