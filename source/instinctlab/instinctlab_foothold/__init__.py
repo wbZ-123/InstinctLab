@@ -27,6 +27,14 @@ from .trajectory import SwingReference, quintic_swing_reference
 
 from .terrain_provider import lift_flat_targets_to_terrain
 
+from .clearance import (
+    ApexAdjustmentResult,
+    SwingCenterlinePenetration,
+    adjust_apex_for_edge_clearance,
+    check_swing_centerline_penetration,
+    sample_swing_centerline,
+)
+
 __all__ = [
     "FOOTHOLD_OBSERVATION_DIM",
     "FrozenFrame",
@@ -51,4 +59,9 @@ __all__ = [
     "StepTerrainQuery",
     "TerrainQueryResult",
     "lift_flat_targets_to_terrain",
+    "SwingCenterlinePenetration",
+    "check_swing_centerline_penetration",
+    "sample_swing_centerline",
+    "ApexAdjustmentResult",
+    "adjust_apex_for_edge_clearance",
 ]
