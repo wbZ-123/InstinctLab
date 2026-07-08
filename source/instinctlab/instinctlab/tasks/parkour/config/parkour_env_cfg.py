@@ -715,6 +715,15 @@ class G1Rewards:
             "std": 0.10,
         },
     )
+    foothold_clearance_safe_indicator = RewTerm(
+        func=instinct_mdp.foothold_clearance_safe_indicator,
+        weight=0.0,
+    )
+
+    foothold_clearance_penetration_l1 = RewTerm(
+        func=instinct_mdp.foothold_clearance_penetration_l1,
+        weight=0.0,
+    )
     foothold_swing_mode_indicator = RewTerm(
         func=mdp.foothold_swing_mode_indicator,
         weight=0.01,

@@ -45,6 +45,8 @@ def _load_foothold_reward_module():
         "foothold_reward_under_test",
         module_path,
     )
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -201,3 +203,41 @@ def test_foothold_diagnostic_indicators_expose_gait_state_events():
         foothold.foothold_plan_invalid_indicator(env),
         torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
     )
+
+def test_foothold_clearance_safe_indicator_returns_float_mask():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        swing_clearance_safe=torch.tensor([True, False, True]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.foothold_clearance_safe_indicator(env)
+
+    expected = torch.tensor([1.0, 0.0, 1.0])
+    torch.testing.assert_close(reward, expected)
+
+def test_foothold_clearance_penetration_l1_returns_penetration_depth():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        swing_clearance_penetration=torch.tensor([0.0, 0.02, 0.15]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.foothold_clearance_penetration_l1(env)
+
+    expected = torch.tensor([0.0, 0.02, 0.15])
+    torch.testing.assert_close(reward, expected)

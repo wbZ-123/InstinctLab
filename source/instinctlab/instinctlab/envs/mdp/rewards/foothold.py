@@ -145,6 +145,22 @@ def foothold_stance_lost_indicator(
     data = _foothold_planner_data(env, sensor_name)
     return _is_mode(data.gait_mode, 6)
 
+def foothold_clearance_safe_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the adjusted swing trajectory is clearance-safe."""
+    data = _foothold_planner_data(env, sensor_name)
+    return data.swing_clearance_safe.float()
+
+
+def foothold_clearance_penetration_l1(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return swing trajectory penetration depth into edge obstacles."""
+    data = _foothold_planner_data(env, sensor_name)
+    return data.swing_clearance_penetration
 
 def foothold_touchdown_accepted_indicator(
     env,
