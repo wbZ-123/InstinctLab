@@ -50,6 +50,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import torch
+import pytest
 
 
 def _load_monitor_module():
@@ -62,9 +63,6 @@ def _load_monitor_module():
     monitors_package.__path__ = [
         str(source_root / "instinctlab" / "monitors")
     ]
-    sys.modules["instinctlab"] = instinctlab_package
-    sys.modules["instinctlab.monitors"] = monitors_package
-
     manager_module = ModuleType("instinctlab.monitors.monitor_manager")
 
     class MonitorTerm:
@@ -73,17 +71,25 @@ def _load_monitor_module():
             self._env = env
             self.device = env.device
 
-    manager_module.MonitorTerm = MonitorTerm
-    sys.modules["instinctlab.monitors.monitor_manager"] = manager_module
-
     path = source_root / "instinctlab" / "monitors" / "foothold.py"
-    spec = importlib.util.spec_from_file_location(
-        "instinctlab.monitors.foothold_under_test", path
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "instinctlab", instinctlab_package)
+        monkeypatch.setitem(
+            sys.modules, "instinctlab.monitors", monitors_package
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "instinctlab.monitors.monitor_manager",
+            manager_module,
+        )
+        manager_module.MonitorTerm = MonitorTerm
+        spec = importlib.util.spec_from_file_location(
+            "instinctlab.monitors.foothold_under_test", path
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
     return module
 
 
