@@ -141,3 +141,42 @@ def test_touchdown_confirm_counts_only_mode_entry():
     torch.testing.assert_close(
         monitor._touchdown_confirm_count, torch.tensor([2.0])
     )
+
+def test_partial_reset_reports_completed_env_and_preserves_other_env():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.gait_mode[:] = torch.tensor([1, 1])
+    data.swing_clearance_safe[:] = torch.tensor([True, False])
+    data.swing_clearance_penetration[:] = torch.tensor([0.0, 0.04])
+    data.swing_apex_height[:] = torch.tensor([0.10, 0.16])
+    monitor.update(dt=0.02)
+    monitor.reset_idx(torch.tensor([0]))
+    episode = monitor.get_log(is_episode=True)
+
+    assert episode["swing_fraction"].item() == 1.0
+    assert episode["clearance_safe_fraction"].item() == 1.0
+    assert episode["penetration_mean"].item() == 0.0
+    assert monitor._step_count[0].item() == 0.0
+    assert monitor._step_count[1].item() == 1.0
+    torch.testing.assert_close(
+        monitor._penetration_sum[1], torch.tensor(0.04)
+    )
+
+
+def test_nonfinite_and_empty_samples_log_finite_zero():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.swing_clearance_penetration[:] = float("nan")
+    data.swing_apex_height[:] = float("inf")
+    monitor.update(dt=0.02)
+    monitor.reset_idx(torch.tensor([0]))
+    episode = monitor.get_log(is_episode=True)
+
+    assert episode["nonfinite_fraction"].item() == 1.0
+    assert episode["penetration_mean"].item() == 0.0
+    assert episode["apex_delta_mean"].item() == 0.0
+    assert all(torch.isfinite(value) for value in episode.values())
