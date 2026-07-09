@@ -25,6 +25,7 @@ import instinctlab.tasks.parkour.mdp as mdp
 import instinctlab.terrains as terrain_gen
 from instinctlab.assets.unitree_g1 import beyondmimic_action_scale
 from instinctlab.managers import MultiRewardCfg
+from instinctlab.monitors import FootholdPlannerMonitorTerm, MonitorTermCfg
 from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.sensors import Grid3dPointsGeneratorCfg, NoisyGroupedRayCasterCameraCfg, VolumePointsCfg
 from instinctlab.sensors.foothold_planner import FootholdPlannerCfg
@@ -1003,7 +1004,10 @@ class CurriculumCfg:
 
 @configclass
 class MonitorCfg:
-    pass
+    foothold_planner = MonitorTermCfg(
+        func=FootholdPlannerMonitorTerm,
+        params={"sensor_name": "foothold_planner"},
+    )
 
 
 ##

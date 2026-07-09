@@ -94,6 +94,20 @@ def main() -> None:
     print("[SMOKE] resetting env", flush=True)
     obs, _ = env.reset()
 
+    monitor_terms = unwrapped.monitor_manager.active_terms
+    print("[SMOKE] monitor terms:", sorted(monitor_terms.keys()), flush=True)
+
+    monitor = monitor_terms["foothold_planner"]
+    monitor_log = monitor.get_log(is_episode=False)
+    print("[SMOKE] foothold monitor:", monitor_log, flush=True)
+
+    assert "clearance_safe_fraction" in monitor_log
+    assert "plan_invalid_fraction" in monitor_log
+    assert all(
+        bool(torch.isfinite(value).all())
+        for value in monitor_log.values()
+    )
+
     print(
         "[SMOKE] observation groups:",
         list(obs.keys()),
