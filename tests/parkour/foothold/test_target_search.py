@@ -14,11 +14,35 @@ class FakeCylinderObstacle:
         self.radius = radius
 
     def get_points_penetration_offset(self, points: torch.Tensor) -> torch.Tensor:
-        # points: (..., 3)
-        delta = points[..., None, :2] - self.centers_xy
+        # Match the real edge-cylinder obstacle API: points must be flat (N, 3).
+        assert points.ndim == 2
+        assert points.shape[1] == 3
+
+        delta = points[:, None, :2] - self.centers_xy
         distance_xy = torch.linalg.norm(delta, dim=-1)
         penetration = self.radius - distance_xy
-        return torch.max(penetration, dim=-1).values
+        max_penetration, nearest_idx = torch.max(penetration, dim=-1)
+
+        offset = torch.zeros_like(points)
+        penetrated = max_penetration > 0.0
+        if torch.any(penetrated):
+            nearest_center = self.centers_xy[nearest_idx[penetrated]]
+            direction_xy = points[penetrated, :2] - nearest_center
+            direction_norm = torch.linalg.norm(direction_xy, dim=-1, keepdim=True)
+            safe_direction_xy = torch.where(
+                direction_norm > 1.0e-6,
+                direction_xy / direction_norm.clamp_min(1.0e-6),
+                torch.tensor(
+                    [1.0, 0.0],
+                    device=points.device,
+                    dtype=points.dtype,
+                ).expand_as(direction_xy),
+            )
+            offset[penetrated, :2] = (
+                safe_direction_xy * max_penetration[penetrated, None]
+            )
+
+        return offset
 
 
 def test_returns_nominal_target_when_sole_points_are_safe():
@@ -297,4 +321,3 @@ def test_breaks_equal_distance_ties_by_candidate_direction_order():
     expected = torch.tensor([[0.15, 0.00, 0.0]])
     torch.testing.assert_close(result.target_f, expected)
     torch.testing.assert_close(result.selected_score, torch.tensor([0.05]))
-

@@ -38,6 +38,24 @@ class FootholdPlannerCfg(SensorBaseCfg):
     clearance_apex_step_m: float = 0.03
     clearance_sample_spacing_m: float = 0.03
 
+    enable_safe_target_search: bool = True
+    safe_target_search_radii_m: tuple[float, ...] = (0.025, 0.05, 0.075, 0.10)
+    safe_target_search_directions: tuple[tuple[float, float], ...] = (
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (-1.0, -1.0),
+    )
+    safe_target_search_margin_m: float = 0.0
+    safe_target_foot_length_m: float = 0.20
+    safe_target_foot_width_m: float = 0.10
+    safe_target_foot_grid_num_x: int = 10
+    safe_target_foot_grid_num_y: int = 5
+
     touchdown_xy_tolerance_m: float = 0.08
     touchdown_z_tolerance_m: float = 0.06
 

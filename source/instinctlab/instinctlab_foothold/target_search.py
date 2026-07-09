@@ -38,8 +38,21 @@ def _is_target_safe(
     safety_margin: float,
 ) -> torch.Tensor:
     foot_points_f = _expand_foot_points(target_f, foot_points_xy)
-    penetration = obstacle.get_points_penetration_offset(foot_points_f)
-    return torch.all(penetration <= -safety_margin, dim=-1)
+    num_targets = foot_points_f.shape[0]
+    num_foot_points = foot_points_f.shape[1]
+
+    flat_foot_points_f = foot_points_f.reshape(num_targets * num_foot_points, 3)
+    penetration_offset = obstacle.get_points_penetration_offset(flat_foot_points_f)
+    if penetration_offset.ndim == 2:
+        penetration = torch.linalg.norm(penetration_offset, dim=-1)
+    else:
+        penetration = penetration_offset
+
+    penetration = penetration.reshape(
+        num_targets,
+        num_foot_points,
+    )
+    return torch.all(penetration <= safety_margin, dim=-1)
 
 
 def _is_inside_reachable_ellipse(

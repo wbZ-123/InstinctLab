@@ -26,3 +26,8 @@ class FootholdPlannerData:
 
     touchdown_accepted: torch.Tensor | None = None
     planner_valid: torch.Tensor | None = None
+
+    safe_target_valid: torch.Tensor | None = None
+    safe_target_used_fallback: torch.Tensor | None = None
+    safe_target_score: torch.Tensor | None = None
+    raw_unclipped_foothold_f: torch.Tensor | None = None

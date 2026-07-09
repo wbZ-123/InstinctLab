@@ -29,8 +29,16 @@ from instinctlab_foothold import (
 
 from .foothold_planner_data import FootholdPlannerData
 
+from instinctlab_foothold.target_search import (
+    PenetrationObstacle as TargetSearchObstacle,
+    make_sole_perimeter_points_xy,
+    search_safe_foothold_target,
+)
+
 if TYPE_CHECKING:
-    from instinctlab_foothold.clearance import PenetrationObstacle
+    from instinctlab_foothold.clearance import (
+        PenetrationObstacle as ClearanceObstacle,
+    )
     from .foothold_planner_cfg import FootholdPlannerCfg
 
 
@@ -172,6 +180,14 @@ class FootholdPlanner(SensorBase):
             self._data.touchdown_accepted[reset_env_ids] = False
         if self._data.planner_valid is not None:
             self._data.planner_valid[reset_env_ids] = True
+        if self._data.safe_target_valid is not None:
+            self._data.safe_target_valid[reset_env_ids] = True
+        if self._data.safe_target_used_fallback is not None:
+            self._data.safe_target_used_fallback[reset_env_ids] = False
+        if self._data.safe_target_score is not None:
+            self._data.safe_target_score[reset_env_ids] = 0.0
+        if self._data.raw_unclipped_foothold_f is not None:
+            self._data.raw_unclipped_foothold_f[reset_env_ids] = 0.0
 
     def _initialize_impl(self):
         super()._initialize_impl()
@@ -340,6 +356,25 @@ class FootholdPlanner(SensorBase):
             device=self._device,
         )
         self._data.feasible_velocity_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.safe_target_valid = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_used_fallback = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_score = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.raw_unclipped_foothold_f = torch.zeros(
             self._num_envs,
             3,
             device=self._device,
@@ -629,14 +664,82 @@ class FootholdPlanner(SensorBase):
             self._data.swing_start_pos_w[new_swing_env_ids] = (
                 self._data.actual_swing_foot_pos_w[env_ids][new_swing]
             )
-            self._data.target_foothold_f[new_swing_env_ids] = (
-                flat_result.position_f
-            )
-            self._data.feasible_velocity_f[new_swing_env_ids] = (
-                flat_result.feasible_velocity_f
-            )
+
+            target_foothold_f = flat_result.position_f
+            feasible_velocity_f = flat_result.feasible_velocity_f
+
+            if self._data.raw_unclipped_foothold_f is not None:
+                self._data.raw_unclipped_foothold_f[new_swing_env_ids] = (
+                    target_foothold_f
+                )
+
+            target_search_obstacle = self._virtual_obstacles.get("edges")
+            if (
+                self.cfg.enable_safe_target_search
+                and target_search_obstacle is not None
+            ):
+                support_foot_f = torch.zeros_like(target_foothold_f)
+
+                foot_points_xy = make_sole_perimeter_points_xy(
+                    foot_length=self.cfg.safe_target_foot_length_m,
+                    foot_width=self.cfg.safe_target_foot_width_m,
+                    num_x=self.cfg.safe_target_foot_grid_num_x,
+                    num_y=self.cfg.safe_target_foot_grid_num_y,
+                    device=self._device,
+                    dtype=target_foothold_f.dtype,
+                )
+
+                safe_result = search_safe_foothold_target(
+                    nominal_target_f=target_foothold_f,
+                    raw_target_f=target_foothold_f,
+                    support_foot_f=support_foot_f,
+                    desired_velocity_f=desired_velocity,
+                    obstacle=cast(
+                        "TargetSearchObstacle",
+                        target_search_obstacle,
+                    ),
+                    ellipse_half_length=self._flat_provider_cfg.outer_radius_x,
+                    ellipse_half_width=self._flat_provider_cfg.outer_radius_y,
+                    foot_points_xy=foot_points_xy,
+                    candidate_radii=torch.tensor(
+                        self.cfg.safe_target_search_radii_m,
+                        device=self._device,
+                        dtype=target_foothold_f.dtype,
+                    ),
+                    candidate_directions=torch.tensor(
+                        self.cfg.safe_target_search_directions,
+                        device=self._device,
+                        dtype=target_foothold_f.dtype,
+                    ),
+                    safety_margin=self.cfg.safe_target_search_margin_m,
+                )
+
+                target_foothold_f = safe_result.target_f
+
+                if self._data.safe_target_valid is not None:
+                    self._data.safe_target_valid[new_swing_env_ids] = (
+                        safe_result.valid
+                    )
+                if self._data.safe_target_used_fallback is not None:
+                    self._data.safe_target_used_fallback[new_swing_env_ids] = (
+                        safe_result.used_fallback
+                    )
+                if self._data.safe_target_score is not None:
+                    self._data.safe_target_score[new_swing_env_ids] = (
+                        safe_result.selected_score
+                    )
+            else:
+                if self._data.safe_target_valid is not None:
+                    self._data.safe_target_valid[new_swing_env_ids] = True
+                if self._data.safe_target_used_fallback is not None:
+                    self._data.safe_target_used_fallback[new_swing_env_ids] = False
+                if self._data.safe_target_score is not None:
+                    self._data.safe_target_score[new_swing_env_ids] = 0.0
+
+            self._data.target_foothold_f[new_swing_env_ids] = target_foothold_f
+            self._data.feasible_velocity_f[new_swing_env_ids] = feasible_velocity_f
             self._data.target_foothold_w[new_swing_env_ids] = (
-                new_swing_stance_pos_w + flat_result.position_f
+                new_swing_stance_pos_w + target_foothold_f
             )
             self._data.target_foothold_w[new_swing_env_ids, 2] = (
                 new_swing_stance_pos_w[:, 2]
@@ -670,7 +773,7 @@ class FootholdPlanner(SensorBase):
         if self.cfg.enable_edge_clearance:
             edge_obstacle = self._virtual_obstacles.get("edges")
             if edge_obstacle is not None:
-                edge_obstacle = cast("PenetrationObstacle", edge_obstacle)
+                edge_obstacle = cast("ClearanceObstacle", edge_obstacle)
                 apex_adjustment = adjust_apex_for_edge_clearance(
                     obstacle=edge_obstacle,
                     start=self._data.swing_start_pos_w[env_ids],
