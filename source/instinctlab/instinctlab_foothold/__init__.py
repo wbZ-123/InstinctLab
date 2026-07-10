@@ -34,6 +34,12 @@ from .clearance import (
     check_swing_centerline_penetration,
     sample_swing_centerline,
 )
+from .target_search import (
+    SafeFootholdCandidateDebug,
+    debug_safe_foothold_candidates,
+    make_sole_perimeter_points_xy,
+    search_safe_foothold_target,
+)
 
 __all__ = [
     "FOOTHOLD_OBSERVATION_DIM",
@@ -64,4 +70,8 @@ __all__ = [
     "sample_swing_centerline",
     "ApexAdjustmentResult",
     "adjust_apex_for_edge_clearance",
+    "SafeFootholdCandidateDebug",
+    "debug_safe_foothold_candidates",
+    "make_sole_perimeter_points_xy",
+    "search_safe_foothold_target",
 ]

@@ -43,6 +43,8 @@ parser.add_argument("--edge-z-min", type=float, default=0.0)
 parser.add_argument("--edge-z-max", type=float, default=0.22)
 parser.add_argument("--apex-step", type=float, default=0.03)
 parser.add_argument("--max-apex", type=float, default=0.30)
+parser.add_argument("--safe-target-demo", action="store_true")
+parser.add_argument("--safe-target-radius", type=float, default=0.05)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -59,9 +61,12 @@ from instinctlab_foothold import (  # noqa: E402
     FlatProviderConfig,
     StepTerrainQuery,
     adjust_apex_for_edge_clearance,
+    debug_safe_foothold_candidates,
     lift_flat_targets_to_terrain,
+    make_sole_perimeter_points_xy,
     quintic_swing_reference,
     sample_flat_targets,
+    search_safe_foothold_target,
 )
 
 class FakeVerticalCylinderObstacle:
@@ -161,6 +166,38 @@ def make_visualizer() -> VisualizationMarkers:
                 visual_material=sim_utils.PreviewSurfaceCfg(
                     diffuse_color=(0.0, 0.0, 1.0),
                     opacity=0.35,
+                ),
+            ),
+            "safe_candidate_all": sim_utils.SphereCfg(
+                radius=0.007,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.35, 0.35, 0.35)
+                ),
+            ),
+            "safe_candidate_inside": sim_utils.SphereCfg(
+                radius=0.009,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 0.6, 1.0)
+                ),
+            ),
+            "safe_candidate_obstacle_safe": sim_utils.SphereCfg(
+                radius=0.011,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.85, 0.0)
+                ),
+            ),
+            "safe_candidate_valid": sim_utils.SphereCfg(
+                radius=0.014,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 1.0, 0.25)
+                ),
+            ),
+            "safe_target_obstacle": sim_utils.CylinderCfg(
+                radius=0.05,
+                height=0.22,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.0, 0.0, 1.0),
+                    opacity=0.25,
                 ),
             ),
         },
@@ -267,6 +304,11 @@ def main() -> None:
     default_apex_height = torch.tensor([0.08], device=device)
     current_apex_height = default_apex_height.clone()
     edge_demo_pos = torch.zeros((0, 3), device=device)
+    safe_candidate_all = torch.zeros((0, 3), device=device)
+    safe_candidate_inside = torch.zeros((0, 3), device=device)
+    safe_candidate_obstacle_safe = torch.zeros((0, 3), device=device)
+    safe_candidate_valid = torch.zeros((0, 3), device=device)
+    safe_target_obstacle_pos = torch.zeros((0, 3), device=device)
 
     target = right_foot.clone()
     swing_start = right_foot.clone()
@@ -314,12 +356,118 @@ def main() -> None:
             target = terrain_result.position_f.to(device)
             current_apex_height = default_apex_height.clone()
             edge_demo_pos = torch.zeros((0, 3), device=device)
+            safe_candidate_all = torch.zeros((0, 3), device=device)
+            safe_candidate_inside = torch.zeros((0, 3), device=device)
+            safe_candidate_obstacle_safe = torch.zeros((0, 3), device=device)
+            safe_candidate_valid = torch.zeros((0, 3), device=device)
+            safe_target_obstacle_pos = torch.zeros((0, 3), device=device)
 
             swing_start = (
                 right_foot.clone()
                 if swing_side.item() == 1
                 else left_foot.clone()
             )
+
+            if args.safe_target_demo:
+                target_z = target[0, 2].item()
+                target_obstacle = FakeVerticalCylinderObstacle(
+                    center_xy=target[0, :2],
+                    z_min=target_z - 0.04,
+                    z_max=target_z + 0.12,
+                    radius=args.safe_target_radius,
+                )
+                foot_points_xy = make_sole_perimeter_points_xy(
+                    foot_length=0.20,
+                    foot_width=0.10,
+                    num_x=10,
+                    num_y=5,
+                    device=device,
+                    dtype=target.dtype,
+                )
+                candidate_radii = torch.tensor(
+                    [0.025, 0.05, 0.075, 0.10],
+                    device=device,
+                    dtype=target.dtype,
+                )
+                candidate_directions = torch.tensor(
+                    [
+                        [1.0, 0.0],
+                        [-1.0, 0.0],
+                        [0.0, 1.0],
+                        [0.0, -1.0],
+                        [1.0, 1.0],
+                        [1.0, -1.0],
+                        [-1.0, 1.0],
+                        [-1.0, -1.0],
+                    ],
+                    device=device,
+                    dtype=target.dtype,
+                )
+                target_debug = debug_safe_foothold_candidates(
+                    nominal_target_f=target,
+                    support_foot_f=stance_pos,
+                    obstacle=target_obstacle,
+                    ellipse_half_length=cfg.outer_radius_x,
+                    ellipse_half_width=cfg.outer_radius_y,
+                    foot_points_xy=foot_points_xy,
+                    candidate_radii=candidate_radii,
+                    candidate_directions=candidate_directions,
+                    safety_margin=0.0,
+                )
+                safe_result = search_safe_foothold_target(
+                    nominal_target_f=target,
+                    raw_target_f=target,
+                    support_foot_f=stance_pos,
+                    desired_velocity_f=desired_velocity,
+                    obstacle=target_obstacle,
+                    ellipse_half_length=cfg.outer_radius_x,
+                    ellipse_half_width=cfg.outer_radius_y,
+                    foot_points_xy=foot_points_xy,
+                    candidate_radii=candidate_radii,
+                    candidate_directions=candidate_directions,
+                    safety_margin=0.0,
+                )
+
+                candidates = target_debug.candidates_f[0]
+                safe_candidate_all = candidates.clone()
+                safe_candidate_all[:, 2] += 0.015
+                safe_candidate_inside = candidates[
+                    target_debug.candidate_inside_ellipse[0]
+                ].clone()
+                safe_candidate_inside[:, 2] += 0.025
+                safe_candidate_obstacle_safe = candidates[
+                    target_debug.candidate_obstacle_safe[0]
+                ].clone()
+                safe_candidate_obstacle_safe[:, 2] += 0.035
+                safe_candidate_valid = candidates[
+                    target_debug.candidate_valid[0]
+                ].clone()
+                safe_candidate_valid[:, 2] += 0.05
+                safe_target_obstacle_pos = target.clone()
+                safe_target_obstacle_pos[:, 2] = target[:, 2] + 0.04
+
+                print(
+                    "[VIS] safe_target nominal_inside=",
+                    target_debug.nominal_inside_ellipse.detach().cpu().tolist(),
+                    "nominal_obstacle_safe=",
+                    target_debug.nominal_obstacle_safe.detach().cpu().tolist(),
+                    "nominal_valid=",
+                    target_debug.nominal_valid.detach().cpu().tolist(),
+                    "candidate_count=",
+                    [int(candidates.shape[0])],
+                    "candidate_inside=",
+                    target_debug.candidate_inside_ellipse.sum(dim=1).detach().cpu().tolist(),
+                    "candidate_obstacle_safe=",
+                    target_debug.candidate_obstacle_safe.sum(dim=1).detach().cpu().tolist(),
+                    "candidate_valid=",
+                    target_debug.candidate_valid.sum(dim=1).detach().cpu().tolist(),
+                    "selected=",
+                    safe_result.target_f.detach().cpu().tolist(),
+                    "valid=",
+                    safe_result.valid.detach().cpu().tolist(),
+                    flush=True,
+                )
+                target = safe_result.target_f
 
             if args.edge_demo:
                 default_mid_ref = quintic_swing_reference(
@@ -441,6 +589,11 @@ def main() -> None:
                 raw_to_feasible_line,
                 swing_goal_line,
                 edge_demo_pos,
+                safe_candidate_all,
+                safe_candidate_inside,
+                safe_candidate_obstacle_safe,
+                safe_candidate_valid,
+                safe_target_obstacle_pos,
             ),
             dim=0,
         )
@@ -495,6 +648,46 @@ def main() -> None:
                 torch.full(
                     (edge_demo_pos.shape[0],),
                     9,
+                    device=device,
+                    dtype=torch.long,
+                ),
+
+                # safe-target all candidates 灰色
+                torch.full(
+                    (safe_candidate_all.shape[0],),
+                    10,
+                    device=device,
+                    dtype=torch.long,
+                ),
+
+                # safe-target inside ellipse 蓝色
+                torch.full(
+                    (safe_candidate_inside.shape[0],),
+                    11,
+                    device=device,
+                    dtype=torch.long,
+                ),
+
+                # safe-target obstacle-safe 黄色
+                torch.full(
+                    (safe_candidate_obstacle_safe.shape[0],),
+                    12,
+                    device=device,
+                    dtype=torch.long,
+                ),
+
+                # safe-target valid 绿色
+                torch.full(
+                    (safe_candidate_valid.shape[0],),
+                    13,
+                    device=device,
+                    dtype=torch.long,
+                ),
+
+                # safe target debug obstacle 蓝色柱
+                torch.full(
+                    (safe_target_obstacle_pos.shape[0],),
+                    14,
                     device=device,
                     dtype=torch.long,
                 ),
