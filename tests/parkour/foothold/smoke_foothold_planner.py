@@ -235,6 +235,24 @@ def main() -> None:
             data.swing_clearance_safe[:1].detach().cpu().tolist(),
             "penetration=",
             data.swing_clearance_penetration[:1].detach().cpu().tolist(),
+            "penetration=",
+            data.swing_clearance_penetration[:1].detach().cpu().tolist(),
+            "raw_target_f=",
+            data.raw_unclipped_foothold_f[:1].detach().cpu().tolist()
+                if data.raw_unclipped_foothold_f is not None
+                else None,
+            "safe_valid=",
+            data.safe_target_valid[:1].detach().cpu().tolist()
+                if data.safe_target_valid is not None
+                else None,
+            "safe_fallback=",
+            data.safe_target_used_fallback[:1].detach().cpu().tolist()
+                if data.safe_target_used_fallback is not None
+                else None,
+            "safe_score=",
+            data.safe_target_score[:1].detach().cpu().tolist()
+                if data.safe_target_score is not None
+                else None,
             flush=True,
         )
 
