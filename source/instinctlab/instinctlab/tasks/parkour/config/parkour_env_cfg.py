@@ -1006,7 +1006,15 @@ class CurriculumCfg:
 class MonitorCfg:
     foothold_planner = MonitorTermCfg(
         func=FootholdPlannerMonitorTerm,
-        params={"sensor_name": "foothold_planner"},
+        params={
+            "sensor_name": "foothold_planner",
+            "debug_event_path": os.environ.get(
+                "FOOTHOLD_DEBUG_EVENT_PATH"
+            ),
+            "debug_event_max_count": int(
+                os.environ.get("FOOTHOLD_DEBUG_EVENT_MAX_COUNT", "0")
+            ),
+        },
     )
 
 

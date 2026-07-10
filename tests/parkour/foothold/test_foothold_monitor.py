@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -58,8 +59,10 @@ def _make_env(data):
     )
 
 
-def _make_cfg():
-    return SimpleNamespace(params={"sensor_name": "foothold_planner"})
+def _make_cfg(**params):
+    return SimpleNamespace(
+        params={"sensor_name": "foothold_planner", **params}
+    )
 
 
 def _make_data(num_envs=2):
@@ -71,6 +74,21 @@ def _make_data(num_envs=2):
         default_swing_apex_height=torch.full((num_envs,), 0.08),
         swing_apex_height=torch.full((num_envs,), 0.08),
         planner_valid=torch.ones(num_envs, dtype=torch.bool),
+        safe_target_search_performed=torch.zeros(num_envs, dtype=torch.bool),
+        safe_target_final_valid=torch.ones(num_envs, dtype=torch.bool),
+        safe_target_used_fallback=torch.zeros(num_envs, dtype=torch.bool),
+        safe_target_score=torch.zeros(num_envs),
+        safe_target_nominal_inside_ellipse=torch.ones(
+            num_envs, dtype=torch.bool
+        ),
+        safe_target_nominal_obstacle_safe=torch.ones(
+            num_envs, dtype=torch.bool
+        ),
+        safe_target_nominal_valid=torch.ones(num_envs, dtype=torch.bool),
+        safe_target_candidate_count=torch.zeros(num_envs),
+        safe_target_candidate_inside_ellipse_count=torch.zeros(num_envs),
+        safe_target_candidate_obstacle_safe_count=torch.zeros(num_envs),
+        safe_target_candidate_valid_count=torch.zeros(num_envs),
     )
 
 
@@ -123,6 +141,245 @@ def test_update_counts_states_events_and_clearance_without_double_counting():
     torch.testing.assert_close(
         monitor._invalid_plan_count, torch.tensor([0.0, 2.0])
     )
+
+
+def test_update_counts_safe_target_search_diagnostics():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.safe_target_search_performed[:] = torch.tensor([True, False])
+    data.safe_target_final_valid[:] = torch.tensor([True, False])
+    data.safe_target_used_fallback[:] = torch.tensor([True, False])
+    data.safe_target_score[:] = torch.tensor([0.04, 0.20])
+    data.safe_target_nominal_inside_ellipse[:] = torch.tensor([True, False])
+    data.safe_target_nominal_obstacle_safe[:] = torch.tensor([False, True])
+    data.safe_target_nominal_valid[:] = torch.tensor([False, False])
+    data.safe_target_candidate_count[:] = torch.tensor([32.0, 99.0])
+    data.safe_target_candidate_inside_ellipse_count[:] = torch.tensor([28.0, 99.0])
+    data.safe_target_candidate_obstacle_safe_count[:] = torch.tensor([12.0, 99.0])
+    data.safe_target_candidate_valid_count[:] = torch.tensor([4.0, 99.0])
+    monitor.update(dt=0.02)
+
+    data.safe_target_search_performed[:] = torch.tensor([False, True])
+    data.safe_target_final_valid[:] = torch.tensor([True, True])
+    data.safe_target_used_fallback[:] = torch.tensor([False, True])
+    data.safe_target_score[:] = torch.tensor([0.00, 0.10])
+    data.safe_target_nominal_inside_ellipse[:] = torch.tensor([False, True])
+    data.safe_target_nominal_obstacle_safe[:] = torch.tensor([False, False])
+    data.safe_target_nominal_valid[:] = torch.tensor([False, False])
+    data.safe_target_candidate_count[:] = torch.tensor([99.0, 32.0])
+    data.safe_target_candidate_inside_ellipse_count[:] = torch.tensor([99.0, 20.0])
+    data.safe_target_candidate_obstacle_safe_count[:] = torch.tensor([99.0, 8.0])
+    data.safe_target_candidate_valid_count[:] = torch.tensor([99.0, 2.0])
+    monitor.update(dt=0.02)
+
+    torch.testing.assert_close(
+        monitor._safe_target_search_count, torch.tensor([1.0, 1.0])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_final_valid_count, torch.tensor([1.0, 1.0])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_fallback_count, torch.tensor([1.0, 1.0])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_score_sum, torch.tensor([0.04, 0.10])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_score_max, torch.tensor([0.04, 0.10])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_nominal_inside_ellipse_count,
+        torch.tensor([1.0, 1.0]),
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_nominal_obstacle_safe_count,
+        torch.tensor([0.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_nominal_valid_count, torch.tensor([0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_candidate_count_sum,
+        torch.tensor([32.0, 32.0]),
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_candidate_inside_ellipse_count_sum,
+        torch.tensor([28.0, 20.0]),
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_candidate_obstacle_safe_count_sum,
+        torch.tensor([12.0, 8.0]),
+    )
+    torch.testing.assert_close(
+        monitor._safe_target_candidate_valid_count_sum,
+        torch.tensor([4.0, 2.0]),
+    )
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["safe_target_final_valid_fraction"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_fallback_fraction"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_score_mean"], torch.tensor(0.07)
+    )
+    torch.testing.assert_close(
+        log["safe_target_score_max"], torch.tensor(0.10)
+    )
+    torch.testing.assert_close(
+        log["safe_target_nominal_inside_ellipse_fraction"],
+        torch.tensor(1.0),
+    )
+    torch.testing.assert_close(
+        log["safe_target_nominal_obstacle_safe_fraction"],
+        torch.tensor(0.0),
+    )
+    torch.testing.assert_close(
+        log["safe_target_nominal_valid_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_count_mean"], torch.tensor(32.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_inside_ellipse_count_mean"],
+        torch.tensor(24.0),
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_obstacle_safe_count_mean"],
+        torch.tensor(10.0),
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_valid_count_mean"], torch.tensor(3.0)
+    )
+
+
+def test_safe_target_diagnostics_ignore_non_search_steps():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.safe_target_search_performed[:] = False
+    data.safe_target_final_valid[:] = False
+    data.safe_target_used_fallback[:] = True
+    data.safe_target_score[:] = 0.20
+    data.safe_target_nominal_inside_ellipse[:] = False
+    data.safe_target_nominal_obstacle_safe[:] = False
+    data.safe_target_nominal_valid[:] = False
+    data.safe_target_candidate_count[:] = 32.0
+    data.safe_target_candidate_inside_ellipse_count[:] = 24.0
+    data.safe_target_candidate_obstacle_safe_count[:] = 12.0
+    data.safe_target_candidate_valid_count[:] = 4.0
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["safe_target_search_rate"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_final_valid_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_fallback_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_score_mean"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_nominal_valid_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_valid_count_mean"], torch.tensor(0.0)
+    )
+
+
+def test_safe_target_event_ratios_use_total_search_events_not_env_average():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=3)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.safe_target_search_performed[:] = torch.tensor([True, False, False])
+    data.safe_target_final_valid[:] = torch.tensor([True, False, False])
+    data.safe_target_used_fallback[:] = torch.tensor([True, False, False])
+    data.safe_target_score[:] = torch.tensor([0.05, 99.0, 99.0])
+    data.safe_target_nominal_inside_ellipse[:] = torch.tensor([True, False, False])
+    data.safe_target_nominal_obstacle_safe[:] = torch.tensor([True, False, False])
+    data.safe_target_nominal_valid[:] = torch.tensor([True, False, False])
+    data.safe_target_candidate_count[:] = torch.tensor([32.0, 99.0, 99.0])
+    data.safe_target_candidate_inside_ellipse_count[:] = torch.tensor([24.0, 99.0, 99.0])
+    data.safe_target_candidate_obstacle_safe_count[:] = torch.tensor([16.0, 99.0, 99.0])
+    data.safe_target_candidate_valid_count[:] = torch.tensor([8.0, 99.0, 99.0])
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["safe_target_final_valid_fraction"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_fallback_fraction"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_score_mean"], torch.tensor(0.05)
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_count_mean"], torch.tensor(32.0)
+    )
+    torch.testing.assert_close(
+        log["safe_target_candidate_valid_count_mean"], torch.tensor(8.0)
+    )
+
+
+def test_debug_dump_records_limited_invalid_safe_target_events(tmp_path):
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    data.raw_unclipped_foothold_f = torch.zeros(2, 3)
+    data.target_foothold_f = torch.zeros(2, 3)
+    data.desired_velocity_f = torch.zeros(2, 3)
+    data.feasible_velocity_f = torch.zeros(2, 3)
+    path = tmp_path / "foothold_debug_events.jsonl"
+    monitor = module.FootholdPlannerMonitorTerm(
+        _make_cfg(
+            debug_event_path=str(path),
+            debug_event_max_count=1,
+        ),
+        _make_env(data),
+    )
+
+    data.safe_target_search_performed[:] = torch.tensor([True, True])
+    data.safe_target_final_valid[:] = torch.tensor([False, False])
+    data.planner_valid[:] = torch.tensor([False, False])
+    data.safe_target_nominal_inside_ellipse[:] = torch.tensor([True, False])
+    data.safe_target_nominal_obstacle_safe[:] = torch.tensor([False, True])
+    data.safe_target_nominal_valid[:] = torch.tensor([False, False])
+    data.safe_target_candidate_count[:] = torch.tensor([32.0, 32.0])
+    data.safe_target_candidate_inside_ellipse_count[:] = torch.tensor([30.0, 2.0])
+    data.safe_target_candidate_obstacle_safe_count[:] = torch.tensor([0.0, 30.0])
+    data.safe_target_candidate_valid_count[:] = torch.tensor([0.0, 0.0])
+    data.raw_unclipped_foothold_f[:] = torch.tensor(
+        [[0.10, 0.02, 0.0], [0.20, -0.03, 0.0]]
+    )
+    data.target_foothold_f[:] = torch.tensor(
+        [[0.12, 0.01, 0.0], [0.18, -0.02, 0.0]]
+    )
+    data.desired_velocity_f[:] = torch.tensor(
+        [[0.50, 0.0, 0.0], [0.40, 0.0, 0.0]]
+    )
+    monitor.update(dt=0.02)
+    monitor.update(dt=0.02)
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["event"] == "safe_target_invalid"
+    assert event["env_id"] == 0
+    assert event["reason"] == "candidate_obstacle_blocked"
+    assert event["safe_target_nominal_inside_ellipse"] is True
+    assert event["safe_target_nominal_obstacle_safe"] is False
+    assert event["safe_target_candidate_valid_count"] == 0.0
+    assert event["raw_unclipped_foothold_f"] == [0.1, 0.02, 0.0]
 
 
 def test_touchdown_confirm_counts_only_mode_entry():

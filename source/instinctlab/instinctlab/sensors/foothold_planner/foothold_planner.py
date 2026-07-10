@@ -42,6 +42,41 @@ if TYPE_CHECKING:
     from .foothold_planner_cfg import FootholdPlannerCfg
 
 
+def _clear_safe_target_event_buffers(
+    data: FootholdPlannerData,
+    env_ids: Sequence[int] | torch.Tensor | slice,
+) -> None:
+    """Clear per-step safe-target event buffers for selected environments.
+
+    Safe-target diagnostics are event fields, not persistent state.  They must
+    be reset before each planner update so monitor terms do not repeatedly
+    count a previous swing-planning event.
+    """
+
+    if data.safe_target_search_performed is not None:
+        data.safe_target_search_performed[env_ids] = False
+    if data.safe_target_final_valid is not None:
+        data.safe_target_final_valid[env_ids] = True
+    if data.safe_target_used_fallback is not None:
+        data.safe_target_used_fallback[env_ids] = False
+    if data.safe_target_score is not None:
+        data.safe_target_score[env_ids] = 0.0
+    if data.safe_target_nominal_inside_ellipse is not None:
+        data.safe_target_nominal_inside_ellipse[env_ids] = True
+    if data.safe_target_nominal_obstacle_safe is not None:
+        data.safe_target_nominal_obstacle_safe[env_ids] = True
+    if data.safe_target_nominal_valid is not None:
+        data.safe_target_nominal_valid[env_ids] = True
+    if data.safe_target_candidate_count is not None:
+        data.safe_target_candidate_count[env_ids] = 0.0
+    if data.safe_target_candidate_inside_ellipse_count is not None:
+        data.safe_target_candidate_inside_ellipse_count[env_ids] = 0.0
+    if data.safe_target_candidate_obstacle_safe_count is not None:
+        data.safe_target_candidate_obstacle_safe_count[env_ids] = 0.0
+    if data.safe_target_candidate_valid_count is not None:
+        data.safe_target_candidate_valid_count[env_ids] = 0.0
+
+
 class FootholdPlanner(SensorBase):
     """Foothold planner sensor.
 
@@ -133,6 +168,33 @@ class FootholdPlanner(SensorBase):
 
         self._data.desired_velocity_f[resolved_env_ids] = desired_velocity_f
 
+    def _feasible_velocity_from_target(
+        self,
+        target_foothold_f: torch.Tensor,
+        swing_side: torch.Tensor,
+        yaw_velocity_f: torch.Tensor,
+    ) -> torch.Tensor:
+        """Infer the realized planar velocity from a final relative target."""
+        side_sign = torch.where(
+            swing_side == 0,
+            torch.ones_like(swing_side),
+            -torch.ones_like(swing_side),
+        ).to(dtype=target_foothold_f.dtype)
+        lookahead_s = self._flat_provider_cfg.velocity_lookahead_s
+        realized_velocity_x = target_foothold_f[:, 0] / lookahead_s
+        realized_velocity_y = (
+            target_foothold_f[:, 1]
+            - side_sign * self._flat_provider_cfg.nominal_step_width
+        ) / lookahead_s
+        return torch.stack(
+            (
+                realized_velocity_x,
+                realized_velocity_y,
+                yaw_velocity_f,
+            ),
+            dim=-1,
+        )
+
     def reset(self, env_ids: Sequence[int] | None = None):
         super().reset(env_ids)
 
@@ -180,12 +242,28 @@ class FootholdPlanner(SensorBase):
             self._data.touchdown_accepted[reset_env_ids] = False
         if self._data.planner_valid is not None:
             self._data.planner_valid[reset_env_ids] = True
-        if self._data.safe_target_valid is not None:
-            self._data.safe_target_valid[reset_env_ids] = True
+        if self._data.safe_target_search_performed is not None:
+            self._data.safe_target_search_performed[reset_env_ids] = False
+        if self._data.safe_target_final_valid is not None:
+            self._data.safe_target_final_valid[reset_env_ids] = True
         if self._data.safe_target_used_fallback is not None:
             self._data.safe_target_used_fallback[reset_env_ids] = False
         if self._data.safe_target_score is not None:
             self._data.safe_target_score[reset_env_ids] = 0.0
+        if self._data.safe_target_nominal_inside_ellipse is not None:
+            self._data.safe_target_nominal_inside_ellipse[reset_env_ids] = True
+        if self._data.safe_target_nominal_obstacle_safe is not None:
+            self._data.safe_target_nominal_obstacle_safe[reset_env_ids] = True
+        if self._data.safe_target_nominal_valid is not None:
+            self._data.safe_target_nominal_valid[reset_env_ids] = True
+        if self._data.safe_target_candidate_count is not None:
+            self._data.safe_target_candidate_count[reset_env_ids] = 0.0
+        if self._data.safe_target_candidate_inside_ellipse_count is not None:
+            self._data.safe_target_candidate_inside_ellipse_count[reset_env_ids] = 0.0
+        if self._data.safe_target_candidate_obstacle_safe_count is not None:
+            self._data.safe_target_candidate_obstacle_safe_count[reset_env_ids] = 0.0
+        if self._data.safe_target_candidate_valid_count is not None:
+            self._data.safe_target_candidate_valid_count[reset_env_ids] = 0.0
         if self._data.raw_unclipped_foothold_f is not None:
             self._data.raw_unclipped_foothold_f[reset_env_ids] = 0.0
 
@@ -360,7 +438,12 @@ class FootholdPlanner(SensorBase):
             3,
             device=self._device,
         )
-        self._data.safe_target_valid = torch.ones(
+        self._data.safe_target_search_performed = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_final_valid = torch.ones(
             self._num_envs,
             device=self._device,
             dtype=torch.bool,
@@ -371,6 +454,37 @@ class FootholdPlanner(SensorBase):
             dtype=torch.bool,
         )
         self._data.safe_target_score = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.safe_target_nominal_inside_ellipse = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_nominal_obstacle_safe = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_nominal_valid = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.safe_target_candidate_count = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.safe_target_candidate_inside_ellipse_count = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.safe_target_candidate_obstacle_safe_count = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.safe_target_candidate_valid_count = torch.zeros(
             self._num_envs,
             device=self._device,
         )
@@ -508,6 +622,7 @@ class FootholdPlanner(SensorBase):
         assert self._data.foot_contact is not None
 
         self._data.planner_valid[env_ids] = True
+        _clear_safe_target_event_buffers(self._data, env_ids)
 
         foot_target_error = torch.linalg.norm(
             (
@@ -693,6 +808,7 @@ class FootholdPlanner(SensorBase):
                     nominal_target_f=target_foothold_f,
                     raw_target_f=target_foothold_f,
                     support_foot_f=support_foot_f,
+                    target_origin_w=new_swing_stance_pos_w,
                     desired_velocity_f=desired_velocity,
                     obstacle=cast(
                         "TargetSearchObstacle",
@@ -715,9 +831,21 @@ class FootholdPlanner(SensorBase):
                 )
 
                 target_foothold_f = safe_result.target_f
+                feasible_velocity_f = self._feasible_velocity_from_target(
+                    target_foothold_f=target_foothold_f,
+                    swing_side=new_swing_side,
+                    yaw_velocity_f=feasible_velocity_f[:, 2],
+                )
+                self._data.planner_valid[new_swing_env_ids] = (
+                    safe_result.valid
+                )
 
-                if self._data.safe_target_valid is not None:
-                    self._data.safe_target_valid[new_swing_env_ids] = (
+                if self._data.safe_target_search_performed is not None:
+                    self._data.safe_target_search_performed[
+                        new_swing_env_ids
+                    ] = True
+                if self._data.safe_target_final_valid is not None:
+                    self._data.safe_target_final_valid[new_swing_env_ids] = (
                         safe_result.valid
                     )
                 if self._data.safe_target_used_fallback is not None:
@@ -728,9 +856,41 @@ class FootholdPlanner(SensorBase):
                     self._data.safe_target_score[new_swing_env_ids] = (
                         safe_result.selected_score
                     )
+                if self._data.safe_target_nominal_inside_ellipse is not None:
+                    self._data.safe_target_nominal_inside_ellipse[
+                        new_swing_env_ids
+                    ] = safe_result.nominal_inside_ellipse
+                if self._data.safe_target_nominal_obstacle_safe is not None:
+                    self._data.safe_target_nominal_obstacle_safe[
+                        new_swing_env_ids
+                    ] = safe_result.nominal_obstacle_safe
+                if self._data.safe_target_nominal_valid is not None:
+                    self._data.safe_target_nominal_valid[
+                        new_swing_env_ids
+                    ] = safe_result.nominal_valid
+                if self._data.safe_target_candidate_count is not None:
+                    self._data.safe_target_candidate_count[
+                        new_swing_env_ids
+                    ] = safe_result.candidate_count
+                if self._data.safe_target_candidate_inside_ellipse_count is not None:
+                    self._data.safe_target_candidate_inside_ellipse_count[
+                        new_swing_env_ids
+                    ] = safe_result.candidate_inside_ellipse_count
+                if self._data.safe_target_candidate_obstacle_safe_count is not None:
+                    self._data.safe_target_candidate_obstacle_safe_count[
+                        new_swing_env_ids
+                    ] = safe_result.candidate_obstacle_safe_count
+                if self._data.safe_target_candidate_valid_count is not None:
+                    self._data.safe_target_candidate_valid_count[
+                        new_swing_env_ids
+                    ] = safe_result.candidate_valid_count
             else:
-                if self._data.safe_target_valid is not None:
-                    self._data.safe_target_valid[new_swing_env_ids] = True
+                if self._data.safe_target_search_performed is not None:
+                    self._data.safe_target_search_performed[
+                        new_swing_env_ids
+                    ] = False
+                if self._data.safe_target_final_valid is not None:
+                    self._data.safe_target_final_valid[new_swing_env_ids] = True
                 if self._data.safe_target_used_fallback is not None:
                     self._data.safe_target_used_fallback[new_swing_env_ids] = False
                 if self._data.safe_target_score is not None:

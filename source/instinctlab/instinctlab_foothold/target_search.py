@@ -17,32 +17,52 @@ class SafeFootholdSearchResult:
     valid: torch.Tensor
     used_fallback: torch.Tensor
     selected_score: torch.Tensor
+    nominal_inside_ellipse: torch.Tensor
+    nominal_obstacle_safe: torch.Tensor
+    nominal_valid: torch.Tensor
+    candidate_count: torch.Tensor
+    candidate_inside_ellipse_count: torch.Tensor
+    candidate_obstacle_safe_count: torch.Tensor
+    candidate_valid_count: torch.Tensor
+
+
+@dataclass
+class SafeFootholdCandidateDebug:
+    candidates_f: torch.Tensor
+    nominal_inside_ellipse: torch.Tensor
+    nominal_obstacle_safe: torch.Tensor
+    nominal_valid: torch.Tensor
+    candidate_inside_ellipse: torch.Tensor
+    candidate_obstacle_safe: torch.Tensor
+    candidate_valid: torch.Tensor
 
 
 def _expand_foot_points(
-    center_f: torch.Tensor,
+    center: torch.Tensor,
     foot_points_xy: torch.Tensor,
 ) -> torch.Tensor:
-    num_envs = center_f.shape[0]
+    num_envs = center.shape[0]
     num_points = foot_points_xy.shape[0]
 
-    points = center_f[:, None, :].expand(num_envs, num_points, 3).clone()
+    points = center[:, None, :].expand(num_envs, num_points, 3).clone()
     points[:, :, 0:2] += foot_points_xy[None, :, :]
     return points
 
 
 def _is_target_safe(
     target_f: torch.Tensor,
+    target_origin_w: torch.Tensor,
     foot_points_xy: torch.Tensor,
     obstacle: PenetrationObstacle,
     safety_margin: float,
 ) -> torch.Tensor:
-    foot_points_f = _expand_foot_points(target_f, foot_points_xy)
-    num_targets = foot_points_f.shape[0]
-    num_foot_points = foot_points_f.shape[1]
+    target_w = target_origin_w + target_f
+    foot_points_w = _expand_foot_points(target_w, foot_points_xy)
+    num_targets = foot_points_w.shape[0]
+    num_foot_points = foot_points_w.shape[1]
 
-    flat_foot_points_f = foot_points_f.reshape(num_targets * num_foot_points, 3)
-    penetration_offset = obstacle.get_points_penetration_offset(flat_foot_points_f)
+    flat_foot_points_w = foot_points_w.reshape(num_targets * num_foot_points, 3)
+    penetration_offset = obstacle.get_points_penetration_offset(flat_foot_points_w)
     if penetration_offset.ndim == 2:
         penetration = torch.linalg.norm(penetration_offset, dim=-1)
     else:
@@ -93,6 +113,7 @@ def search_safe_foothold_target(
     nominal_target_f: torch.Tensor,
     raw_target_f: torch.Tensor,
     support_foot_f: torch.Tensor,
+    target_origin_w: torch.Tensor | None = None,
     desired_velocity_f: torch.Tensor,
     obstacle: PenetrationObstacle,
     ellipse_half_length: float,
@@ -117,24 +138,41 @@ def search_safe_foothold_target(
         device=nominal_target_f.device,
         dtype=nominal_target_f.dtype,
     )
+    if target_origin_w is None:
+        target_origin_w = torch.zeros_like(nominal_target_f)
+    else:
+        target_origin_w = target_origin_w.to(
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
 
-    safe = _is_target_safe(
-        target_f=nominal_target_f,
-        foot_points_xy=foot_points_xy,
-        obstacle=obstacle,
-        safety_margin=safety_margin,
-    )
-    inside_ellipse = _is_inside_reachable_ellipse(
-        target_f=nominal_target_f,
+    debug = debug_safe_foothold_candidates(
+        nominal_target_f=nominal_target_f,
         support_foot_f=support_foot_f,
+        target_origin_w=target_origin_w,
+        obstacle=obstacle,
         ellipse_half_length=ellipse_half_length,
         ellipse_half_width=ellipse_half_width,
+        foot_points_xy=foot_points_xy,
+        candidate_radii=candidate_radii,
+        candidate_directions=candidate_directions,
+        safety_margin=safety_margin,
     )
-    nominal_valid = safe & inside_ellipse
+    nominal_inside_ellipse = debug.nominal_inside_ellipse
+    nominal_obstacle_safe = debug.nominal_obstacle_safe
+    nominal_valid = debug.nominal_valid
 
     target_f = nominal_target_f.clone()
     valid = nominal_valid.clone()
     used_fallback = torch.zeros_like(valid, dtype=torch.bool)
+    candidate_count = torch.zeros(
+        nominal_target_f.shape[0],
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    candidate_inside_ellipse_count = torch.zeros_like(candidate_count)
+    candidate_obstacle_safe_count = torch.zeros_like(candidate_count)
+    candidate_valid_count = torch.zeros_like(candidate_count)
     selected_score = torch.zeros(
         nominal_target_f.shape[0],
         device=nominal_target_f.device,
@@ -142,35 +180,29 @@ def search_safe_foothold_target(
     )
 
     if torch.any(~nominal_valid):
-        candidates = _build_candidate_targets(
-            nominal_target_f=nominal_target_f,
-            candidate_radii=candidate_radii,
-            candidate_directions=candidate_directions,
-        )
-
+        candidates = debug.candidates_f
+        candidate_inside = debug.candidate_inside_ellipse
+        candidate_safe = debug.candidate_obstacle_safe
         num_envs = candidates.shape[0]
         num_candidates = candidates.shape[1]
-
-        flat_candidates = candidates.reshape(num_envs * num_candidates, 3)
-        flat_support = support_foot_f[:, None, :].expand_as(candidates).reshape(
-            num_envs * num_candidates, 3
-        )
-
-        candidate_inside = _is_inside_reachable_ellipse(
-            target_f=flat_candidates,
-            support_foot_f=flat_support,
-            ellipse_half_length=ellipse_half_length,
-            ellipse_half_width=ellipse_half_width,
-        ).reshape(num_envs, num_candidates)
-
-        candidate_safe = _is_target_safe(
-            target_f=flat_candidates,
-            foot_points_xy=foot_points_xy,
-            obstacle=obstacle,
-            safety_margin=safety_margin,
-        ).reshape(num_envs, num_candidates)
-
         candidate_valid = candidate_inside & candidate_safe
+        fallback_needed = ~nominal_valid
+        candidate_count[fallback_needed] = float(num_candidates)
+        candidate_inside_ellipse_count[fallback_needed] = (
+            candidate_inside.sum(dim=1).to(dtype=nominal_target_f.dtype)[
+                fallback_needed
+            ]
+        )
+        candidate_obstacle_safe_count[fallback_needed] = (
+            candidate_safe.sum(dim=1).to(dtype=nominal_target_f.dtype)[
+                fallback_needed
+            ]
+        )
+        candidate_valid_count[fallback_needed] = (
+            candidate_valid.sum(dim=1).to(dtype=nominal_target_f.dtype)[
+                fallback_needed
+            ]
+        )
         has_candidate = torch.any(candidate_valid, dim=1)
 
         candidate_distance = torch.linalg.norm(
@@ -208,6 +240,103 @@ def search_safe_foothold_target(
         valid=valid,
         used_fallback=used_fallback,
         selected_score=selected_score,
+        nominal_inside_ellipse=nominal_inside_ellipse,
+        nominal_obstacle_safe=nominal_obstacle_safe,
+        nominal_valid=nominal_valid,
+        candidate_count=candidate_count,
+        candidate_inside_ellipse_count=candidate_inside_ellipse_count,
+        candidate_obstacle_safe_count=candidate_obstacle_safe_count,
+        candidate_valid_count=candidate_valid_count,
+    )
+
+
+def debug_safe_foothold_candidates(
+    *,
+    nominal_target_f: torch.Tensor,
+    support_foot_f: torch.Tensor,
+    target_origin_w: torch.Tensor | None = None,
+    obstacle: PenetrationObstacle,
+    ellipse_half_length: float,
+    ellipse_half_width: float,
+    foot_points_xy: torch.Tensor,
+    candidate_radii: torch.Tensor,
+    candidate_directions: torch.Tensor,
+    safety_margin: float,
+) -> SafeFootholdCandidateDebug:
+    foot_points_xy = foot_points_xy.to(
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    candidate_radii = candidate_radii.to(
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    candidate_directions = candidate_directions.to(
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    if target_origin_w is None:
+        target_origin_w = torch.zeros_like(nominal_target_f)
+    else:
+        target_origin_w = target_origin_w.to(
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
+
+    nominal_obstacle_safe = _is_target_safe(
+        target_f=nominal_target_f,
+        target_origin_w=target_origin_w,
+        foot_points_xy=foot_points_xy,
+        obstacle=obstacle,
+        safety_margin=safety_margin,
+    )
+    nominal_inside_ellipse = _is_inside_reachable_ellipse(
+        target_f=nominal_target_f,
+        support_foot_f=support_foot_f,
+        ellipse_half_length=ellipse_half_length,
+        ellipse_half_width=ellipse_half_width,
+    )
+    nominal_valid = nominal_obstacle_safe & nominal_inside_ellipse
+
+    candidates = _build_candidate_targets(
+        nominal_target_f=nominal_target_f,
+        candidate_radii=candidate_radii,
+        candidate_directions=candidate_directions,
+    )
+    num_envs = candidates.shape[0]
+    num_candidates = candidates.shape[1]
+
+    flat_candidates = candidates.reshape(num_envs * num_candidates, 3)
+    flat_support = support_foot_f[:, None, :].expand_as(candidates).reshape(
+        num_envs * num_candidates, 3
+    )
+    flat_target_origin_w = target_origin_w[:, None, :].expand_as(candidates).reshape(
+        num_envs * num_candidates, 3
+    )
+
+    candidate_inside = _is_inside_reachable_ellipse(
+        target_f=flat_candidates,
+        support_foot_f=flat_support,
+        ellipse_half_length=ellipse_half_length,
+        ellipse_half_width=ellipse_half_width,
+    ).reshape(num_envs, num_candidates)
+
+    candidate_safe = _is_target_safe(
+        target_f=flat_candidates,
+        target_origin_w=flat_target_origin_w,
+        foot_points_xy=foot_points_xy,
+        obstacle=obstacle,
+        safety_margin=safety_margin,
+    ).reshape(num_envs, num_candidates)
+
+    return SafeFootholdCandidateDebug(
+        candidates_f=candidates,
+        nominal_inside_ellipse=nominal_inside_ellipse,
+        nominal_obstacle_safe=nominal_obstacle_safe,
+        nominal_valid=nominal_valid,
+        candidate_inside_ellipse=candidate_inside,
+        candidate_obstacle_safe=candidate_safe,
+        candidate_valid=candidate_inside & candidate_safe,
     )
 
 

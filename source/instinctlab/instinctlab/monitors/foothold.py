@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,7 +18,14 @@ if TYPE_CHECKING:
 
 
 class FootholdPlannerMonitorTerm(MonitorTerm):
-    """Accumulate finite raw diagnostics from a foothold planner sensor."""
+    """Accumulate finite raw diagnostics from a foothold planner sensor.
+
+    Most gait/clearance fractions use simulation steps as their denominator.
+    Safe-target search metrics are different: target search only happens when
+    a new swing target is planned, so valid/fallback/score metrics are divided
+    by ``safe_target_search_count``.  ``safe_target_search_rate`` is the bridge
+    back to step time: search events divided by total steps.
+    """
 
     _SUM_BUFFER_NAMES = (
         "_step_count",
@@ -32,12 +41,35 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_apex_delta_sum",
         "_invalid_plan_count",
         "_nonfinite_count",
+        "_safe_target_search_count",
+        "_safe_target_final_valid_count",
+        "_safe_target_fallback_count",
+        "_safe_target_score_sum",
+        "_safe_target_nominal_inside_ellipse_count",
+        "_safe_target_nominal_obstacle_safe_count",
+        "_safe_target_nominal_valid_count",
+        "_safe_target_candidate_count_sum",
+        "_safe_target_candidate_inside_ellipse_count_sum",
+        "_safe_target_candidate_obstacle_safe_count_sum",
+        "_safe_target_candidate_valid_count_sum",
     )
-    _MAX_BUFFER_NAMES = ("_penetration_max", "_apex_delta_max")
+    _MAX_BUFFER_NAMES = (
+        "_penetration_max",
+        "_apex_delta_max",
+        "_safe_target_score_max",
+    )
 
     def __init__(self, cfg: MonitorTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         sensor_name = cfg.params.get("sensor_name", "foothold_planner")
+        debug_event_path = cfg.params.get("debug_event_path")
+        self._debug_event_path = (
+            Path(debug_event_path) if debug_event_path is not None else None
+        )
+        self._debug_event_max_count = int(
+            cfg.params.get("debug_event_max_count", 0)
+        )
+        self._debug_event_count = 0
         try:
             self._planner = env.scene.sensors[sensor_name]
         except (AttributeError, KeyError) as exc:
@@ -84,6 +116,37 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         default_apex = self._require(data, "default_swing_apex_height")
         adjusted_apex = self._require(data, "swing_apex_height")
         planner_valid = self._require(data, "planner_valid").bool()
+        safe_target_search_performed = self._require(
+            data, "safe_target_search_performed"
+        ).bool()
+        safe_target_final_valid = self._require(
+            data, "safe_target_final_valid"
+        ).bool()
+        safe_target_used_fallback = self._require(
+            data, "safe_target_used_fallback"
+        ).bool()
+        safe_target_score_raw = self._require(data, "safe_target_score")
+        safe_target_nominal_inside_ellipse = self._require(
+            data, "safe_target_nominal_inside_ellipse"
+        ).bool()
+        safe_target_nominal_obstacle_safe = self._require(
+            data, "safe_target_nominal_obstacle_safe"
+        ).bool()
+        safe_target_nominal_valid = self._require(
+            data, "safe_target_nominal_valid"
+        ).bool()
+        safe_target_candidate_count_raw = self._require(
+            data, "safe_target_candidate_count"
+        )
+        safe_target_candidate_inside_ellipse_count_raw = self._require(
+            data, "safe_target_candidate_inside_ellipse_count"
+        )
+        safe_target_candidate_obstacle_safe_count_raw = self._require(
+            data, "safe_target_candidate_obstacle_safe_count"
+        )
+        safe_target_candidate_valid_count_raw = self._require(
+            data, "safe_target_candidate_valid_count"
+        )
 
         swing = (gait_mode == GaitState.LEFT_SWING) | (
             gait_mode == GaitState.RIGHT_SWING
@@ -102,6 +165,30 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         ).clamp_min(0.0)
         apex_delta = torch.nan_to_num(
             apex_delta_raw, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min(0.0)
+        safe_target_score = torch.nan_to_num(
+            safe_target_score_raw, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min(0.0)
+        safe_target_candidate_count = torch.nan_to_num(
+            safe_target_candidate_count_raw, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min(0.0)
+        safe_target_candidate_inside_ellipse_count = torch.nan_to_num(
+            safe_target_candidate_inside_ellipse_count_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        safe_target_candidate_obstacle_safe_count = torch.nan_to_num(
+            safe_target_candidate_obstacle_safe_count_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        safe_target_candidate_valid_count = torch.nan_to_num(
+            safe_target_candidate_valid_count_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         ).clamp_min(0.0)
 
         self._step_count += 1.0
@@ -131,9 +218,217 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         )
         self._invalid_plan_count += (~planner_valid).float()
         self._nonfinite_count += (~sample_finite).float()
+        # Safe-target search is an event, not a per-step state.  Only count the
+        # valid/fallback/score fields when a new search actually happened.
+        search_sample = safe_target_search_performed.float()
+        self._safe_target_search_count += search_sample
+        self._safe_target_final_valid_count += (
+            safe_target_search_performed & safe_target_final_valid
+        ).float()
+        self._safe_target_fallback_count += (
+            safe_target_search_performed & safe_target_used_fallback
+        ).float()
+        self._safe_target_score_sum += safe_target_score * search_sample
+        self._safe_target_score_max = torch.maximum(
+            self._safe_target_score_max,
+            safe_target_score * search_sample,
+        )
+        self._safe_target_nominal_inside_ellipse_count += (
+            safe_target_search_performed & safe_target_nominal_inside_ellipse
+        ).float()
+        self._safe_target_nominal_obstacle_safe_count += (
+            safe_target_search_performed & safe_target_nominal_obstacle_safe
+        ).float()
+        self._safe_target_nominal_valid_count += (
+            safe_target_search_performed & safe_target_nominal_valid
+        ).float()
+        self._safe_target_candidate_count_sum += (
+            safe_target_candidate_count * search_sample
+        )
+        self._safe_target_candidate_inside_ellipse_count_sum += (
+            safe_target_candidate_inside_ellipse_count * search_sample
+        )
+        self._safe_target_candidate_obstacle_safe_count_sum += (
+            safe_target_candidate_obstacle_safe_count * search_sample
+        )
+        self._safe_target_candidate_valid_count_sum += (
+            safe_target_candidate_valid_count * search_sample
+        )
 
         self._previous_touchdown_accepted.copy_(touchdown_accepted)
         self._previous_touchdown_confirm.copy_(touchdown_confirm)
+        self._maybe_dump_debug_events(
+            safe_target_search_performed=safe_target_search_performed,
+            safe_target_final_valid=safe_target_final_valid,
+            planner_valid=planner_valid,
+        )
+
+    @staticmethod
+    def _round_float(value: float) -> float:
+        return round(float(value), 6)
+
+    @classmethod
+    def _tensor_row_to_list(
+        cls,
+        value: torch.Tensor | None,
+        env_id: int,
+    ) -> list[float] | None:
+        if value is None:
+            return None
+        row = value[env_id].detach().cpu().reshape(-1).tolist()
+        return [cls._round_float(item) for item in row]
+
+    @classmethod
+    def _tensor_scalar(
+        cls,
+        value: torch.Tensor | None,
+        env_id: int,
+    ) -> float | bool | int | None:
+        if value is None:
+            return None
+        item = value[env_id].detach().cpu().item()
+        if isinstance(item, bool):
+            return item
+        if isinstance(item, int):
+            return item
+        return cls._round_float(float(item))
+
+    @staticmethod
+    def _classify_invalid_safe_target(
+        *,
+        nominal_valid: bool,
+        candidate_count: float,
+        candidate_inside_ellipse_count: float,
+        candidate_obstacle_safe_count: float,
+        candidate_valid_count: float,
+    ) -> str:
+        if nominal_valid:
+            return "inconsistent_final_invalid"
+        if candidate_count <= 0.0:
+            return "nominal_invalid_no_candidates"
+        if candidate_inside_ellipse_count <= 0.0:
+            return "candidate_outside_ellipse"
+        if candidate_obstacle_safe_count <= 0.0:
+            return "candidate_obstacle_blocked"
+        if candidate_valid_count <= 0.0:
+            return "candidate_constraints_intersection_empty"
+        return "unknown_invalid"
+
+    def _maybe_dump_debug_events(
+        self,
+        *,
+        safe_target_search_performed: torch.Tensor,
+        safe_target_final_valid: torch.Tensor,
+        planner_valid: torch.Tensor,
+    ) -> None:
+        if self._debug_event_path is None or self._debug_event_max_count <= 0:
+            return
+        if self._debug_event_count >= self._debug_event_max_count:
+            return
+
+        data = self._planner.data
+        invalid_event = safe_target_search_performed & ~safe_target_final_valid
+        if not torch.any(invalid_event).item():
+            return
+
+        env_ids = torch.nonzero(invalid_event, as_tuple=False).flatten()
+        self._debug_event_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._debug_event_path.open("a", encoding="utf-8") as file:
+            for env_id_tensor in env_ids:
+                if self._debug_event_count >= self._debug_event_max_count:
+                    break
+                env_id = int(env_id_tensor.item())
+                nominal_valid = bool(
+                    data.safe_target_nominal_valid[env_id].detach().cpu().item()
+                )
+                candidate_count = float(
+                    data.safe_target_candidate_count[env_id].detach().cpu().item()
+                )
+                candidate_inside_count = float(
+                    data.safe_target_candidate_inside_ellipse_count[env_id]
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+                candidate_obstacle_safe_count = float(
+                    data.safe_target_candidate_obstacle_safe_count[env_id]
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+                candidate_valid_count = float(
+                    data.safe_target_candidate_valid_count[env_id]
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+                event = {
+                    "event": "safe_target_invalid",
+                    "reason": self._classify_invalid_safe_target(
+                        nominal_valid=nominal_valid,
+                        candidate_count=candidate_count,
+                        candidate_inside_ellipse_count=candidate_inside_count,
+                        candidate_obstacle_safe_count=candidate_obstacle_safe_count,
+                        candidate_valid_count=candidate_valid_count,
+                    ),
+                    "env_id": env_id,
+                    "step_count": self._tensor_scalar(self._step_count, env_id),
+                    "planner_valid": bool(
+                        planner_valid[env_id].detach().cpu().item()
+                    ),
+                    "safe_target_final_valid": False,
+                    "safe_target_used_fallback": self._tensor_scalar(
+                        data.safe_target_used_fallback, env_id
+                    ),
+                    "safe_target_score": self._tensor_scalar(
+                        data.safe_target_score, env_id
+                    ),
+                    "safe_target_nominal_inside_ellipse": self._tensor_scalar(
+                        data.safe_target_nominal_inside_ellipse, env_id
+                    ),
+                    "safe_target_nominal_obstacle_safe": self._tensor_scalar(
+                        data.safe_target_nominal_obstacle_safe, env_id
+                    ),
+                    "safe_target_nominal_valid": nominal_valid,
+                    "safe_target_candidate_count": self._round_float(
+                        candidate_count
+                    ),
+                    "safe_target_candidate_inside_ellipse_count": self._round_float(
+                        candidate_inside_count
+                    ),
+                    "safe_target_candidate_obstacle_safe_count": self._round_float(
+                        candidate_obstacle_safe_count
+                    ),
+                    "safe_target_candidate_valid_count": self._round_float(
+                        candidate_valid_count
+                    ),
+                    "raw_unclipped_foothold_f": self._tensor_row_to_list(
+                        getattr(data, "raw_unclipped_foothold_f", None), env_id
+                    ),
+                    "target_foothold_f": self._tensor_row_to_list(
+                        getattr(data, "target_foothold_f", None), env_id
+                    ),
+                    "desired_velocity_f": self._tensor_row_to_list(
+                        getattr(data, "desired_velocity_f", None), env_id
+                    ),
+                    "feasible_velocity_f": self._tensor_row_to_list(
+                        getattr(data, "feasible_velocity_f", None), env_id
+                    ),
+                    "swing_clearance_safe": self._tensor_scalar(
+                        getattr(data, "swing_clearance_safe", None), env_id
+                    ),
+                    "swing_clearance_penetration": self._tensor_scalar(
+                        getattr(data, "swing_clearance_penetration", None), env_id
+                    ),
+                    "default_swing_apex_height": self._tensor_scalar(
+                        getattr(data, "default_swing_apex_height", None), env_id
+                    ),
+                    "swing_apex_height": self._tensor_scalar(
+                        getattr(data, "swing_apex_height", None), env_id
+                    ),
+                }
+                file.write(json.dumps(event, sort_keys=True) + "\n")
+                self._debug_event_count += 1
 
     @staticmethod
     def _safe_ratio(
@@ -165,11 +460,25 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                     "apex_delta_max",
                     "plan_invalid_fraction",
                     "nonfinite_fraction",
+                    "safe_target_search_rate",
+                    "safe_target_final_valid_fraction",
+                    "safe_target_fallback_fraction",
+                    "safe_target_score_mean",
+                    "safe_target_score_max",
+                    "safe_target_nominal_inside_ellipse_fraction",
+                    "safe_target_nominal_obstacle_safe_fraction",
+                    "safe_target_nominal_valid_fraction",
+                    "safe_target_candidate_count_mean",
+                    "safe_target_candidate_inside_ellipse_count_mean",
+                    "safe_target_candidate_obstacle_safe_count_mean",
+                    "safe_target_candidate_valid_count_mean",
                 )
             }
 
         step_count = selected_step_count
         clearance_count = self._clearance_sample_count[env_ids]
+        safe_target_search_count = self._safe_target_search_count[env_ids]
+        total_safe_target_search_count = safe_target_search_count.sum()
         values = {
             "swing_fraction": self._safe_ratio(
                 self._swing_step_count[env_ids], step_count
@@ -206,6 +515,57 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "nonfinite_fraction": self._safe_ratio(
                 self._nonfinite_count[env_ids], step_count
             ).mean(),
+            # Fraction of all simulation steps where a new safe-target search
+            # was performed.
+            "safe_target_search_rate": self._safe_ratio(
+                safe_target_search_count, step_count
+            ).mean(),
+            # Fraction of search events that ended with an executable target.
+            "safe_target_final_valid_fraction": self._safe_ratio(
+                self._safe_target_final_valid_count[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            # Fraction of search events that replaced the nominal target.
+            "safe_target_fallback_fraction": self._safe_ratio(
+                self._safe_target_fallback_count[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            # Mean XY correction distance over search events.
+            "safe_target_score_mean": self._safe_ratio(
+                self._safe_target_score_sum[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_score_max": self._safe_target_score_max[
+                env_ids
+            ].max(),
+            "safe_target_nominal_inside_ellipse_fraction": self._safe_ratio(
+                self._safe_target_nominal_inside_ellipse_count[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_nominal_obstacle_safe_fraction": self._safe_ratio(
+                self._safe_target_nominal_obstacle_safe_count[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_nominal_valid_fraction": self._safe_ratio(
+                self._safe_target_nominal_valid_count[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_candidate_count_mean": self._safe_ratio(
+                self._safe_target_candidate_count_sum[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_candidate_inside_ellipse_count_mean": self._safe_ratio(
+                self._safe_target_candidate_inside_ellipse_count_sum[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_candidate_obstacle_safe_count_mean": self._safe_ratio(
+                self._safe_target_candidate_obstacle_safe_count_sum[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
+            "safe_target_candidate_valid_count_mean": self._safe_ratio(
+                self._safe_target_candidate_valid_count_sum[env_ids].sum(),
+                total_safe_target_search_count,
+            ),
         }
         return {
             key: torch.nan_to_num(
