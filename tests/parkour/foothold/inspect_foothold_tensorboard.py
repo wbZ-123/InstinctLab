@@ -44,10 +44,44 @@ CORE_TAGS = (
     "Step_Monitor/foothold_planner_safe_target_candidate_obstacle_safe_count_mean",
     "Step_Monitor/foothold_planner_safe_target_candidate_valid_count_mean",
     "Step_Monitor/foothold_planner_swing_fraction",
+    "Step_Monitor/foothold_planner_hold_fraction",
+    "Step_Monitor/foothold_planner_left_swing_fraction",
+    "Step_Monitor/foothold_planner_right_swing_fraction",
+    "Step_Monitor/foothold_planner_touchdown_confirm_fraction",
+    "Step_Monitor/foothold_planner_plan_invalid_mode_fraction",
+    "Step_Monitor/foothold_planner_recovery_fraction",
+    "Step_Monitor/foothold_planner_recovery_step_fraction",
+    "Step_Monitor/foothold_planner_swing_entry_step_rate",
+    "Step_Monitor/foothold_planner_left_swing_entry_step_rate",
+    "Step_Monitor/foothold_planner_right_swing_entry_step_rate",
+    "Step_Monitor/foothold_planner_mean_swing_duration_steps",
+    "Step_Monitor/foothold_planner_touchdown_accepted_step_rate",
+    "Step_Monitor/foothold_planner_left_touchdown_accepted_step_rate",
+    "Step_Monitor/foothold_planner_right_touchdown_accepted_step_rate",
     "Step_Monitor/foothold_planner_overdue_fraction",
+    "Step_Monitor/foothold_planner_overdue_entry_step_rate",
     "Step_Monitor/foothold_planner_early_contact_fraction",
+    "Step_Monitor/foothold_planner_early_contact_entry_step_rate",
     "Step_Monitor/foothold_planner_stance_lost_fraction",
+    "Step_Monitor/foothold_planner_stance_lost_entry_step_rate",
+    "Step_Monitor/foothold_planner_plan_invalid_entry_step_rate",
+    "Step_Monitor/foothold_planner_recovery_entry_step_rate",
+    "Step_Monitor/foothold_planner_recovery_step_entry_step_rate",
+    "Step_Monitor/foothold_planner_early_contact_per_swing_entry",
+    "Step_Monitor/foothold_planner_overdue_per_swing_entry",
+    "Step_Monitor/foothold_planner_stance_lost_per_swing_entry",
+    "Step_Monitor/foothold_planner_recovery_per_swing_entry",
+    "Step_Monitor/foothold_planner_left_swing_early_contact_per_swing_entry",
+    "Step_Monitor/foothold_planner_right_swing_early_contact_per_swing_entry",
+    "Step_Monitor/foothold_planner_left_swing_overdue_per_swing_entry",
+    "Step_Monitor/foothold_planner_right_swing_overdue_per_swing_entry",
+    "Step_Monitor/foothold_planner_left_swing_stance_lost_per_swing_entry",
+    "Step_Monitor/foothold_planner_right_swing_stance_lost_per_swing_entry",
+    "Step_Monitor/foothold_planner_left_swing_recovery_per_swing_entry",
+    "Step_Monitor/foothold_planner_right_swing_recovery_per_swing_entry",
     "Step_Monitor/foothold_planner_touchdown_confirm_step_rate",
+    "Step_Monitor/foothold_planner_left_touchdown_confirm_step_rate",
+    "Step_Monitor/foothold_planner_right_touchdown_confirm_step_rate",
     "Train/time/mean_reward_0",
     "Train/time/mean_episode_length",
 )
@@ -105,8 +139,16 @@ def _status_for(
     if name in {
         "foothold_planner_nonfinite_fraction",
         "foothold_planner_plan_invalid_fraction",
+        "foothold_planner_plan_invalid_mode_fraction",
     }:
         return "OK" if summary.max <= 0.0 else "BAD"
+    if name == "foothold_planner_recovery_fraction":
+        return "OK" if summary.last < 0.05 else "WATCH"
+    if name in {
+        "foothold_planner_recovery_step_fraction",
+        "foothold_planner_recovery_step_entry_step_rate",
+    }:
+        return "INFO"
     if name in {
         "foothold_planner_safe_target_final_valid_fraction",
         "foothold_planner_safe_target_valid_fraction",
@@ -164,6 +206,25 @@ def _status_for(
         "foothold_planner_stance_lost_fraction",
     }:
         return "OK" if summary.last < 0.05 else "WATCH"
+    if name in {
+        "foothold_planner_early_contact_per_swing_entry",
+        "foothold_planner_overdue_per_swing_entry",
+        "foothold_planner_stance_lost_per_swing_entry",
+        "foothold_planner_recovery_per_swing_entry",
+        "foothold_planner_left_swing_early_contact_per_swing_entry",
+        "foothold_planner_right_swing_early_contact_per_swing_entry",
+        "foothold_planner_left_swing_overdue_per_swing_entry",
+        "foothold_planner_right_swing_overdue_per_swing_entry",
+        "foothold_planner_left_swing_stance_lost_per_swing_entry",
+        "foothold_planner_right_swing_stance_lost_per_swing_entry",
+        "foothold_planner_left_swing_recovery_per_swing_entry",
+        "foothold_planner_right_swing_recovery_per_swing_entry",
+    }:
+        if summary.last < 0.1:
+            return "OK"
+        if summary.last < 0.3:
+            return "WATCH"
+        return "BAD"
     if name in {
         "mean_reward_0",
         "mean_episode_length",

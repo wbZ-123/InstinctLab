@@ -38,6 +38,24 @@ parser.add_argument(
     default=False,
     help="Whether to assign auxiliary rewards to each of the env's reward term.",
 )
+parser.add_argument(
+    "--print_foothold_debug",
+    action="store_true",
+    default=False,
+    help="Print command and foothold planner debug values while playing.",
+)
+parser.add_argument(
+    "--print_foothold_debug_interval",
+    type=int,
+    default=50,
+    help="Print foothold debug values every N play steps.",
+)
+parser.add_argument(
+    "--print_foothold_debug_env_id",
+    type=int,
+    default=0,
+    help="Environment id to print when --print_foothold_debug is enabled.",
+)
 # append Instinct-RL cli arguments
 cli_args.add_instinct_rl_args(parser)
 # append AppLauncher cli args
@@ -72,6 +90,7 @@ import instinctlab.tasks  # noqa: F401
 from instinctlab.managers.reward_manager import MultiRewardManager
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
 from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
+from play_debug import build_foothold_debug_payload, format_foothold_debug_line
 
 # wait for attach if in debug mode
 if args_cli.debug:
@@ -192,6 +211,21 @@ def main():
             # env stepping
             obs, rewards, dones, infos = env.step(actions)
         timestep += 1
+
+        if args_cli.print_foothold_debug and (
+            timestep % max(args_cli.print_foothold_debug_interval, 1) == 0
+        ):
+            try:
+                payload = build_foothold_debug_payload(
+                    env.unwrapped,
+                    env_id=args_cli.print_foothold_debug_env_id,
+                )
+                print(format_foothold_debug_line(timestep, payload), flush=True)
+            except Exception as exc:
+                print(
+                    f"[PLAY_DEBUG] step={timestep} failed to read foothold debug: {exc}",
+                    flush=True,
+                )
 
         # override reward terms if auxiliary reward is enabled
         if args_cli.aux_reward:

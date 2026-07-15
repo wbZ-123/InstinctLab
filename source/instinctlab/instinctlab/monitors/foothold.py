@@ -29,9 +29,38 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
 
     _SUM_BUFFER_NAMES = (
         "_step_count",
+        "_hold_step_count",
+        "_left_swing_step_count",
+        "_right_swing_step_count",
+        "_touchdown_confirm_step_count",
+        "_plan_invalid_step_count",
+        "_recovery_step_count",
+        "_recovery_step_active_count",
         "_swing_step_count",
+        "_swing_entry_count",
+        "_left_swing_entry_count",
+        "_right_swing_entry_count",
+        "_swing_duration_step_sum",
         "_touchdown_accepted_count",
+        "_left_touchdown_accepted_count",
+        "_right_touchdown_accepted_count",
         "_touchdown_confirm_count",
+        "_left_touchdown_confirm_count",
+        "_right_touchdown_confirm_count",
+        "_early_contact_entry_count",
+        "_overdue_entry_count",
+        "_stance_lost_entry_count",
+        "_plan_invalid_entry_count",
+        "_recovery_entry_count",
+        "_recovery_step_entry_count",
+        "_left_swing_early_contact_entry_count",
+        "_right_swing_early_contact_entry_count",
+        "_left_swing_overdue_entry_count",
+        "_right_swing_overdue_entry_count",
+        "_left_swing_stance_lost_entry_count",
+        "_right_swing_stance_lost_entry_count",
+        "_left_swing_recovery_entry_count",
+        "_right_swing_recovery_entry_count",
         "_early_contact_count",
         "_overdue_count",
         "_stance_lost_count",
@@ -90,6 +119,18 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         self._previous_touchdown_confirm = torch.zeros(
             shape, dtype=torch.bool, device=self.device
         )
+        self._previous_swing = torch.zeros(
+            shape, dtype=torch.bool, device=self.device
+        )
+        self._previous_recovery_step_active = torch.zeros(
+            shape, dtype=torch.bool, device=self.device
+        )
+        self._previous_gait_mode = torch.full(
+            shape,
+            GaitState.HOLD,
+            dtype=torch.long,
+            device=self.device,
+        )
         self._last_episode_log: dict[str, torch.Tensor] = {}
 
     @staticmethod
@@ -106,6 +147,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         del dt
         data = self._planner.data
         gait_mode = self._require(data, "gait_mode")
+        swing_side = self._require(data, "swing_side")
         touchdown_accepted = self._require(
             data, "touchdown_accepted"
         ).bool()
@@ -147,11 +189,32 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         safe_target_candidate_valid_count_raw = self._require(
             data, "safe_target_candidate_valid_count"
         )
+        recovery_step_active = self._require(
+            data, "recovery_step_active"
+        ).bool()
 
-        swing = (gait_mode == GaitState.LEFT_SWING) | (
-            gait_mode == GaitState.RIGHT_SWING
-        )
+        hold = gait_mode == GaitState.HOLD
+        left_swing = gait_mode == GaitState.LEFT_SWING
+        right_swing = gait_mode == GaitState.RIGHT_SWING
+        swing = left_swing | right_swing
         touchdown_confirm = gait_mode == GaitState.TOUCHDOWN_CONFIRM
+        plan_invalid = gait_mode == GaitState.PLAN_INVALID
+        recovery = gait_mode == GaitState.RECOVERY
+        recovery_step_entry = (
+            recovery_step_active & ~self._previous_recovery_step_active
+        )
+        swing_entry = swing & ~self._previous_swing
+        mode_changed = gait_mode != self._previous_gait_mode
+        left_side = swing_side == 0
+        right_side = swing_side == 1
+        early_contact_entry = (
+            gait_mode == GaitState.EARLY_CONTACT
+        ) & mode_changed
+        overdue_entry = (gait_mode == GaitState.OVERDUE) & mode_changed
+        stance_lost_entry = (
+            gait_mode == GaitState.STANCE_LOST
+        ) & mode_changed
+        recovery_entry = (gait_mode == GaitState.RECOVERY) & mode_changed
         accepted_edge = touchdown_accepted & ~self._previous_touchdown_accepted
         confirm_edge = touchdown_confirm & ~self._previous_touchdown_confirm
 
@@ -192,9 +255,68 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         ).clamp_min(0.0)
 
         self._step_count += 1.0
+        self._hold_step_count += hold.float()
+        self._left_swing_step_count += left_swing.float()
+        self._right_swing_step_count += right_swing.float()
+        self._touchdown_confirm_step_count += touchdown_confirm.float()
+        self._plan_invalid_step_count += plan_invalid.float()
+        self._recovery_step_count += recovery.float()
+        self._recovery_step_active_count += recovery_step_active.float()
         self._swing_step_count += swing.float()
+        self._swing_entry_count += swing_entry.float()
+        self._left_swing_entry_count += (
+            left_swing & ~self._previous_swing
+        ).float()
+        self._right_swing_entry_count += (
+            right_swing & ~self._previous_swing
+        ).float()
+        self._swing_duration_step_sum += swing.float()
         self._touchdown_accepted_count += accepted_edge.float()
+        self._left_touchdown_accepted_count += (
+            accepted_edge & left_side
+        ).float()
+        self._right_touchdown_accepted_count += (
+            accepted_edge & right_side
+        ).float()
         self._touchdown_confirm_count += confirm_edge.float()
+        self._left_touchdown_confirm_count += (
+            confirm_edge & left_side
+        ).float()
+        self._right_touchdown_confirm_count += (
+            confirm_edge & right_side
+        ).float()
+        self._early_contact_entry_count += early_contact_entry.float()
+        self._overdue_entry_count += overdue_entry.float()
+        self._stance_lost_entry_count += stance_lost_entry.float()
+        self._plan_invalid_entry_count += (
+            (gait_mode == GaitState.PLAN_INVALID) & mode_changed
+        ).float()
+        self._recovery_entry_count += recovery_entry.float()
+        self._recovery_step_entry_count += recovery_step_entry.float()
+        self._left_swing_early_contact_entry_count += (
+            early_contact_entry & left_side
+        ).float()
+        self._right_swing_early_contact_entry_count += (
+            early_contact_entry & right_side
+        ).float()
+        self._left_swing_overdue_entry_count += (
+            overdue_entry & left_side
+        ).float()
+        self._right_swing_overdue_entry_count += (
+            overdue_entry & right_side
+        ).float()
+        self._left_swing_stance_lost_entry_count += (
+            stance_lost_entry & left_side
+        ).float()
+        self._right_swing_stance_lost_entry_count += (
+            stance_lost_entry & right_side
+        ).float()
+        self._left_swing_recovery_entry_count += (
+            recovery_entry & left_side
+        ).float()
+        self._right_swing_recovery_entry_count += (
+            recovery_entry & right_side
+        ).float()
         self._early_contact_count += (
             gait_mode == GaitState.EARLY_CONTACT
         ).float()
@@ -257,6 +379,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
 
         self._previous_touchdown_accepted.copy_(touchdown_accepted)
         self._previous_touchdown_confirm.copy_(touchdown_confirm)
+        self._previous_swing.copy_(swing)
+        self._previous_recovery_step_active.copy_(recovery_step_active)
+        self._previous_gait_mode.copy_(gait_mode)
         self._maybe_dump_debug_events(
             safe_target_search_performed=safe_target_search_performed,
             safe_target_final_valid=safe_target_final_valid,
@@ -448,8 +573,41 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                 key: zero
                 for key in (
                     "swing_fraction",
+                    "hold_fraction",
+                    "left_swing_fraction",
+                    "right_swing_fraction",
+                    "touchdown_confirm_fraction",
+                    "plan_invalid_mode_fraction",
+                    "recovery_fraction",
+                    "recovery_step_fraction",
+                    "swing_entry_step_rate",
+                    "left_swing_entry_step_rate",
+                    "right_swing_entry_step_rate",
+                    "mean_swing_duration_steps",
                     "touchdown_accepted_step_rate",
+                    "left_touchdown_accepted_step_rate",
+                    "right_touchdown_accepted_step_rate",
                     "touchdown_confirm_step_rate",
+                    "left_touchdown_confirm_step_rate",
+                    "right_touchdown_confirm_step_rate",
+                    "early_contact_entry_step_rate",
+                    "overdue_entry_step_rate",
+                    "stance_lost_entry_step_rate",
+                    "plan_invalid_entry_step_rate",
+                    "recovery_entry_step_rate",
+                    "recovery_step_entry_step_rate",
+                    "early_contact_per_swing_entry",
+                    "overdue_per_swing_entry",
+                    "stance_lost_per_swing_entry",
+                    "recovery_per_swing_entry",
+                    "left_swing_early_contact_per_swing_entry",
+                    "right_swing_early_contact_per_swing_entry",
+                    "left_swing_overdue_per_swing_entry",
+                    "right_swing_overdue_per_swing_entry",
+                    "left_swing_stance_lost_per_swing_entry",
+                    "right_swing_stance_lost_per_swing_entry",
+                    "left_swing_recovery_per_swing_entry",
+                    "right_swing_recovery_per_swing_entry",
                     "early_contact_fraction",
                     "overdue_fraction",
                     "stance_lost_fraction",
@@ -477,18 +635,136 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
 
         step_count = selected_step_count
         clearance_count = self._clearance_sample_count[env_ids]
+        swing_entry_count = self._swing_entry_count[env_ids]
+        total_swing_entry_count = swing_entry_count.sum()
+        left_swing_entry_count = self._left_swing_entry_count[env_ids]
+        right_swing_entry_count = self._right_swing_entry_count[env_ids]
+        total_left_swing_entry_count = left_swing_entry_count.sum()
+        total_right_swing_entry_count = right_swing_entry_count.sum()
         safe_target_search_count = self._safe_target_search_count[env_ids]
         total_safe_target_search_count = safe_target_search_count.sum()
         values = {
             "swing_fraction": self._safe_ratio(
                 self._swing_step_count[env_ids], step_count
             ).mean(),
+            "hold_fraction": self._safe_ratio(
+                self._hold_step_count[env_ids], step_count
+            ).mean(),
+            "left_swing_fraction": self._safe_ratio(
+                self._left_swing_step_count[env_ids], step_count
+            ).mean(),
+            "right_swing_fraction": self._safe_ratio(
+                self._right_swing_step_count[env_ids], step_count
+            ).mean(),
+            "touchdown_confirm_fraction": self._safe_ratio(
+                self._touchdown_confirm_step_count[env_ids], step_count
+            ).mean(),
+            "plan_invalid_mode_fraction": self._safe_ratio(
+                self._plan_invalid_step_count[env_ids], step_count
+            ).mean(),
+            "recovery_fraction": self._safe_ratio(
+                self._recovery_step_count[env_ids], step_count
+            ).mean(),
+            "recovery_step_fraction": self._safe_ratio(
+                self._recovery_step_active_count[env_ids], step_count
+            ).mean(),
+            "swing_entry_step_rate": self._safe_ratio(
+                swing_entry_count, step_count
+            ).mean(),
+            "left_swing_entry_step_rate": self._safe_ratio(
+                left_swing_entry_count, step_count
+            ).mean(),
+            "right_swing_entry_step_rate": self._safe_ratio(
+                right_swing_entry_count, step_count
+            ).mean(),
+            "mean_swing_duration_steps": self._safe_ratio(
+                self._swing_duration_step_sum[env_ids].sum(),
+                total_swing_entry_count,
+            ),
             "touchdown_accepted_step_rate": self._safe_ratio(
                 self._touchdown_accepted_count[env_ids], step_count
+            ).mean(),
+            "left_touchdown_accepted_step_rate": self._safe_ratio(
+                self._left_touchdown_accepted_count[env_ids], step_count
+            ).mean(),
+            "right_touchdown_accepted_step_rate": self._safe_ratio(
+                self._right_touchdown_accepted_count[env_ids], step_count
             ).mean(),
             "touchdown_confirm_step_rate": self._safe_ratio(
                 self._touchdown_confirm_count[env_ids], step_count
             ).mean(),
+            "left_touchdown_confirm_step_rate": self._safe_ratio(
+                self._left_touchdown_confirm_count[env_ids], step_count
+            ).mean(),
+            "right_touchdown_confirm_step_rate": self._safe_ratio(
+                self._right_touchdown_confirm_count[env_ids], step_count
+            ).mean(),
+            "early_contact_entry_step_rate": self._safe_ratio(
+                self._early_contact_entry_count[env_ids], step_count
+            ).mean(),
+            "overdue_entry_step_rate": self._safe_ratio(
+                self._overdue_entry_count[env_ids], step_count
+            ).mean(),
+            "stance_lost_entry_step_rate": self._safe_ratio(
+                self._stance_lost_entry_count[env_ids], step_count
+            ).mean(),
+            "plan_invalid_entry_step_rate": self._safe_ratio(
+                self._plan_invalid_entry_count[env_ids], step_count
+            ).mean(),
+            "recovery_entry_step_rate": self._safe_ratio(
+                self._recovery_entry_count[env_ids], step_count
+            ).mean(),
+            "recovery_step_entry_step_rate": self._safe_ratio(
+                self._recovery_step_entry_count[env_ids], step_count
+            ).mean(),
+            "early_contact_per_swing_entry": self._safe_ratio(
+                self._early_contact_entry_count[env_ids].sum(),
+                total_swing_entry_count,
+            ),
+            "overdue_per_swing_entry": self._safe_ratio(
+                self._overdue_entry_count[env_ids].sum(),
+                total_swing_entry_count,
+            ),
+            "stance_lost_per_swing_entry": self._safe_ratio(
+                self._stance_lost_entry_count[env_ids].sum(),
+                total_swing_entry_count,
+            ),
+            "recovery_per_swing_entry": self._safe_ratio(
+                self._recovery_entry_count[env_ids].sum(),
+                total_swing_entry_count,
+            ),
+            "left_swing_early_contact_per_swing_entry": self._safe_ratio(
+                self._left_swing_early_contact_entry_count[env_ids].sum(),
+                total_left_swing_entry_count,
+            ),
+            "right_swing_early_contact_per_swing_entry": self._safe_ratio(
+                self._right_swing_early_contact_entry_count[env_ids].sum(),
+                total_right_swing_entry_count,
+            ),
+            "left_swing_overdue_per_swing_entry": self._safe_ratio(
+                self._left_swing_overdue_entry_count[env_ids].sum(),
+                total_left_swing_entry_count,
+            ),
+            "right_swing_overdue_per_swing_entry": self._safe_ratio(
+                self._right_swing_overdue_entry_count[env_ids].sum(),
+                total_right_swing_entry_count,
+            ),
+            "left_swing_stance_lost_per_swing_entry": self._safe_ratio(
+                self._left_swing_stance_lost_entry_count[env_ids].sum(),
+                total_left_swing_entry_count,
+            ),
+            "right_swing_stance_lost_per_swing_entry": self._safe_ratio(
+                self._right_swing_stance_lost_entry_count[env_ids].sum(),
+                total_right_swing_entry_count,
+            ),
+            "left_swing_recovery_per_swing_entry": self._safe_ratio(
+                self._left_swing_recovery_entry_count[env_ids].sum(),
+                total_left_swing_entry_count,
+            ),
+            "right_swing_recovery_per_swing_entry": self._safe_ratio(
+                self._right_swing_recovery_entry_count[env_ids].sum(),
+                total_right_swing_entry_count,
+            ),
             "early_contact_fraction": self._safe_ratio(
                 self._early_contact_count[env_ids], step_count
             ).mean(),
@@ -581,6 +857,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             getattr(self, name)[env_ids] = 0.0
         self._previous_touchdown_accepted[env_ids] = False
         self._previous_touchdown_confirm[env_ids] = False
+        self._previous_swing[env_ids] = False
+        self._previous_recovery_step_active[env_ids] = False
+        self._previous_gait_mode[env_ids] = GaitState.HOLD
 
     def get_log(
         self, is_episode: bool = False

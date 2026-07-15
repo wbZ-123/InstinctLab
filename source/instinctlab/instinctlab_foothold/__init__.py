@@ -8,6 +8,7 @@ from .flat_provider import (
     TerrainCorridor,
     sample_flat_targets,
 )
+from .recovery_target import make_recovery_foothold_target
 
 from .state_machine import (
     GaitMachineConfig,
@@ -54,6 +55,7 @@ __all__ = [
     "FlatTargetBatch",
     "TerrainCorridor",
     "sample_flat_targets",
+    "make_recovery_foothold_target",
     "GaitMachineConfig",
     "GaitMachineState",
     "SwingReference",

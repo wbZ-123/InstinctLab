@@ -37,6 +37,14 @@ class FootholdPlannerData:
     foot_contact: torch.Tensor | None = None
 
     touchdown_accepted: torch.Tensor | None = None
+    touchdown_xy_error: torch.Tensor | None = None
+    touchdown_z_error: torch.Tensor | None = None
+    touchdown_xy_ok: torch.Tensor | None = None
+    touchdown_z_ok: torch.Tensor | None = None
+    touchdown_swing_contact: torch.Tensor | None = None
+    touchdown_within_tolerance: torch.Tensor | None = None
+    swing_has_lifted: torch.Tensor | None = None
+    recovery_step_active: torch.Tensor | None = None
     # True when the currently exposed planner output can be executed by the
     # gait state machine. Safe-target search failure must propagate here.
     planner_valid: torch.Tensor | None = None

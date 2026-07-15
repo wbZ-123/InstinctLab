@@ -68,6 +68,7 @@ def _make_cfg(**params):
 def _make_data(num_envs=2):
     return SimpleNamespace(
         gait_mode=torch.zeros(num_envs, dtype=torch.long),
+        swing_side=torch.zeros(num_envs, dtype=torch.long),
         touchdown_accepted=torch.zeros(num_envs, dtype=torch.bool),
         swing_clearance_safe=torch.ones(num_envs, dtype=torch.bool),
         swing_clearance_penetration=torch.zeros(num_envs),
@@ -89,6 +90,7 @@ def _make_data(num_envs=2):
         safe_target_candidate_inside_ellipse_count=torch.zeros(num_envs),
         safe_target_candidate_obstacle_safe_count=torch.zeros(num_envs),
         safe_target_candidate_valid_count=torch.zeros(num_envs),
+        recovery_step_active=torch.zeros(num_envs, dtype=torch.bool),
     )
 
 
@@ -398,6 +400,189 @@ def test_touchdown_confirm_counts_only_mode_entry():
     torch.testing.assert_close(
         monitor._touchdown_confirm_count, torch.tensor([2.0])
     )
+
+
+def test_monitor_reports_full_gait_mode_distribution_and_swing_entries():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    for mode in [0, 1, 1, 3, 2, 2, 6]:
+        data.gait_mode[:] = mode
+        monitor.update(dt=0.02)
+
+    torch.testing.assert_close(monitor._hold_step_count, torch.tensor([1.0]))
+    torch.testing.assert_close(monitor._left_swing_step_count, torch.tensor([2.0]))
+    torch.testing.assert_close(monitor._right_swing_step_count, torch.tensor([2.0]))
+    torch.testing.assert_close(
+        monitor._touchdown_confirm_step_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(monitor._stance_lost_count, torch.tensor([1.0]))
+    torch.testing.assert_close(monitor._swing_entry_count, torch.tensor([2.0]))
+    torch.testing.assert_close(monitor._left_swing_entry_count, torch.tensor([1.0]))
+    torch.testing.assert_close(monitor._right_swing_entry_count, torch.tensor([1.0]))
+    torch.testing.assert_close(monitor._swing_duration_step_sum, torch.tensor([4.0]))
+
+    log = monitor.get_log()
+    torch.testing.assert_close(log["hold_fraction"], torch.tensor(1.0 / 7.0))
+    torch.testing.assert_close(log["left_swing_fraction"], torch.tensor(2.0 / 7.0))
+    torch.testing.assert_close(log["right_swing_fraction"], torch.tensor(2.0 / 7.0))
+    torch.testing.assert_close(
+        log["touchdown_confirm_fraction"], torch.tensor(1.0 / 7.0)
+    )
+    torch.testing.assert_close(log["swing_entry_step_rate"], torch.tensor(2.0 / 7.0))
+    torch.testing.assert_close(log["left_swing_entry_step_rate"], torch.tensor(1.0 / 7.0))
+    torch.testing.assert_close(log["right_swing_entry_step_rate"], torch.tensor(1.0 / 7.0))
+    torch.testing.assert_close(log["mean_swing_duration_steps"], torch.tensor(2.0))
+
+
+def test_monitor_reports_recovery_step_active_fraction_and_entries():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    for recovery_step_active in [False, True, True, False, True]:
+        data.recovery_step_active[:] = recovery_step_active
+        monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        monitor._recovery_step_active_count, torch.tensor([3.0])
+    )
+    torch.testing.assert_close(
+        monitor._recovery_step_entry_count, torch.tensor([2.0])
+    )
+    torch.testing.assert_close(
+        log["recovery_step_fraction"], torch.tensor(3.0 / 5.0)
+    )
+    torch.testing.assert_close(
+        log["recovery_step_entry_step_rate"], torch.tensor(2.0 / 5.0)
+    )
+
+
+def test_monitor_reports_side_specific_touchdown_and_failure_entries():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.gait_mode[:] = 1
+    data.swing_side[:] = 0
+    data.touchdown_accepted[:] = False
+    monitor.update(dt=0.02)
+
+    data.touchdown_accepted[:] = True
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = 3
+    monitor.update(dt=0.02)
+
+    data.touchdown_accepted[:] = False
+    data.gait_mode[:] = 2
+    data.swing_side[:] = 1
+    monitor.update(dt=0.02)
+
+    data.touchdown_accepted[:] = True
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = 6
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = 8
+    monitor.update(dt=0.02)
+
+    torch.testing.assert_close(
+        monitor._left_touchdown_accepted_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(
+        monitor._right_touchdown_accepted_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(
+        monitor._left_touchdown_confirm_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(
+        monitor._right_touchdown_confirm_count, torch.tensor([0.0])
+    )
+    torch.testing.assert_close(
+        monitor._stance_lost_entry_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(
+        monitor._recovery_entry_count, torch.tensor([1.0])
+    )
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["left_touchdown_accepted_step_rate"], torch.tensor(1.0 / 7.0)
+    )
+    torch.testing.assert_close(
+        log["right_touchdown_accepted_step_rate"], torch.tensor(1.0 / 7.0)
+    )
+    torch.testing.assert_close(
+        log["left_touchdown_confirm_step_rate"], torch.tensor(1.0 / 7.0)
+    )
+    torch.testing.assert_close(
+        log["right_touchdown_confirm_step_rate"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["stance_lost_entry_step_rate"], torch.tensor(1.0 / 7.0)
+    )
+    torch.testing.assert_close(
+        log["recovery_entry_step_rate"], torch.tensor(1.0 / 7.0)
+    )
+
+
+def test_monitor_reports_failure_entries_per_swing_entry_by_side():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=4)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.gait_mode[:] = torch.tensor([1, 2, 1, 2])
+    data.swing_side[:] = torch.tensor([0, 1, 0, 1])
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = torch.tensor([6, 6, 4, 5])
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = torch.tensor([8, 8, 8, 8])
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["stance_lost_per_swing_entry"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["early_contact_per_swing_entry"], torch.tensor(0.25)
+    )
+    torch.testing.assert_close(
+        log["overdue_per_swing_entry"], torch.tensor(0.25)
+    )
+    torch.testing.assert_close(
+        log["recovery_per_swing_entry"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["left_swing_stance_lost_per_swing_entry"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["right_swing_stance_lost_per_swing_entry"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["left_swing_early_contact_per_swing_entry"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["right_swing_early_contact_per_swing_entry"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["left_swing_overdue_per_swing_entry"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["right_swing_overdue_per_swing_entry"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["left_swing_recovery_per_swing_entry"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["right_swing_recovery_per_swing_entry"], torch.tensor(1.0)
+    )
+
 
 def test_partial_reset_reports_completed_env_and_preserves_other_env():
     module = _load_monitor_module()

@@ -62,6 +62,23 @@ def test_build_report_marks_core_foothold_metrics():
             1.0,
             3.0,
         ],
+        "Step_Monitor/foothold_planner_left_swing_fraction": [0.05, 0.08],
+        "Step_Monitor/foothold_planner_right_swing_fraction": [0.04, 0.07],
+        "Step_Monitor/foothold_planner_swing_entry_step_rate": [0.02, 0.03],
+        "Step_Monitor/foothold_planner_mean_swing_duration_steps": [3.0, 2.5],
+        "Step_Monitor/foothold_planner_left_touchdown_accepted_step_rate": [0.01, 0.02],
+        "Step_Monitor/foothold_planner_right_touchdown_accepted_step_rate": [0.01, 0.015],
+        "Step_Monitor/foothold_planner_left_touchdown_confirm_step_rate": [0.005, 0.01],
+        "Step_Monitor/foothold_planner_right_touchdown_confirm_step_rate": [0.005, 0.008],
+        "Step_Monitor/foothold_planner_recovery_entry_step_rate": [0.001, 0.002],
+        "Step_Monitor/foothold_planner_stance_lost_per_swing_entry": [0.05, 0.12],
+        "Step_Monitor/foothold_planner_recovery_per_swing_entry": [0.02, 0.08],
+        "Step_Monitor/foothold_planner_left_swing_stance_lost_per_swing_entry": [0.01, 0.04],
+        "Step_Monitor/foothold_planner_right_swing_stance_lost_per_swing_entry": [0.2, 0.35],
+        "Step_Monitor/foothold_planner_plan_invalid_mode_fraction": [0.0, 0.0],
+        "Step_Monitor/foothold_planner_recovery_fraction": [0.01, 0.02],
+        "Step_Monitor/foothold_planner_recovery_step_fraction": [0.0, 0.01],
+        "Step_Monitor/foothold_planner_recovery_step_entry_step_rate": [0.0, 0.005],
         "Train/time/mean_reward_0": [0.1, 0.3, 0.6],
     }
 
@@ -73,6 +90,26 @@ def test_build_report_marks_core_foothold_metrics():
     assert by_name["foothold_planner_safe_target_final_valid_fraction"].status == "OK"
     assert by_name["foothold_planner_safe_target_nominal_valid_fraction"].status == "BAD"
     assert by_name["foothold_planner_safe_target_candidate_valid_count_mean"].status == "WATCH"
+    assert by_name["foothold_planner_left_swing_fraction"].status == "INFO"
+    assert by_name["foothold_planner_right_swing_fraction"].status == "INFO"
+    assert by_name["foothold_planner_swing_entry_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_mean_swing_duration_steps"].status == "INFO"
+    assert by_name["foothold_planner_left_touchdown_accepted_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_right_touchdown_accepted_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_left_touchdown_confirm_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_right_touchdown_confirm_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_recovery_entry_step_rate"].status == "INFO"
+    assert by_name["foothold_planner_stance_lost_per_swing_entry"].status == "WATCH"
+    assert by_name["foothold_planner_recovery_per_swing_entry"].status == "OK"
+    assert by_name["foothold_planner_left_swing_stance_lost_per_swing_entry"].status == "OK"
+    assert by_name["foothold_planner_right_swing_stance_lost_per_swing_entry"].status == "BAD"
+    assert by_name["foothold_planner_plan_invalid_mode_fraction"].status == "OK"
+    assert by_name["foothold_planner_recovery_fraction"].status == "OK"
+    assert by_name["foothold_planner_recovery_step_fraction"].status == "INFO"
+    assert (
+        by_name["foothold_planner_recovery_step_entry_step_rate"].status
+        == "INFO"
+    )
     assert by_name["mean_reward_0"].summary.trend == "up"
 
 

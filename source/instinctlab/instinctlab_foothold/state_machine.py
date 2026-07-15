@@ -12,6 +12,8 @@ class GaitMachineConfig:
     contact_confirm_s: float = 0.04
     early_contact_phase: float = 0.65
     overdue_s: float = 0.12
+    recovery_hold_s: float = 0.20
+    step_hold_s: float = 0.04
 
     def __post_init__(self) -> None:
         timing_values = (
@@ -19,6 +21,8 @@ class GaitMachineConfig:
             self.swing_s,
             self.contact_confirm_s,
             self.overdue_s,
+            self.recovery_hold_s,
+            self.step_hold_s,
         )
 
         if any(
@@ -46,9 +50,12 @@ class GaitMachineState:
     swing_side: torch.Tensor
     elapsed_s: torch.Tensor
     hold_elapsed_s: torch.Tensor
+    hold_required_s: torch.Tensor
     contact_elapsed_s: torch.Tensor
     no_contact_elapsed_s: torch.Tensor
     swing_has_lifted: torch.Tensor
+    recovery_step_pending: torch.Tensor
+    recovery_step_active: torch.Tensor
 
 
 def initial_gait_state(
@@ -62,13 +69,14 @@ def initial_gait_state(
             device=device,
             dtype=torch.long,
         ),
-        swing_side=torch.zeros(
+        swing_side=torch.arange(
             num_envs,
             device=device,
             dtype=torch.long,
-        ),
+        ).remainder(2),
         elapsed_s=torch.zeros(num_envs, device=device),
         hold_elapsed_s=torch.zeros(num_envs, device=device),
+        hold_required_s=torch.full((num_envs,), -1.0, device=device),
         contact_elapsed_s=torch.zeros(
             (num_envs, 2),
             device=device,
@@ -78,6 +86,16 @@ def initial_gait_state(
             device=device,
         ),
         swing_has_lifted=torch.zeros(
+            num_envs,
+            device=device,
+            dtype=torch.bool,
+        ),
+        recovery_step_pending=torch.zeros(
+            num_envs,
+            device=device,
+            dtype=torch.bool,
+        ),
+        recovery_step_active=torch.zeros(
             num_envs,
             device=device,
             dtype=torch.bool,
@@ -103,14 +121,35 @@ def advance_gait(
     planner_valid: torch.Tensor,
     dt: float,
     cfg: GaitMachineConfig,
+    step_hold_s: torch.Tensor | None = None,
 ) -> GaitMachineState:
     if dt <= 0.0:
         raise ValueError(
             "dt must be positive."
         )
+    if step_hold_s is None:
+        step_hold_s = torch.full_like(
+            state.hold_required_s,
+            cfg.step_hold_s,
+        )
+    else:
+        step_hold_s = step_hold_s.to(
+            device=state.hold_required_s.device,
+            dtype=state.hold_required_s.dtype,
+        )
+        if step_hold_s.shape != state.hold_required_s.shape:
+            raise ValueError(
+                "step_hold_s must match the number of environments."
+            )
+        if torch.any(step_hold_s < 0.0):
+            raise ValueError(
+                "step_hold_s must be non-negative."
+            )
+
     mode = state.mode.clone()
     swing_side = state.swing_side.clone()
     elapsed_s = state.elapsed_s.clone()
+    hold_required_s = state.hold_required_s.clone()
     contact_elapsed_s = torch.where(
         contact,
         state.contact_elapsed_s + dt,
@@ -122,6 +161,8 @@ def advance_gait(
         state.no_contact_elapsed_s + dt,
     )
     swing_has_lifted = state.swing_has_lifted.clone()
+    recovery_step_pending = state.recovery_step_pending.clone()
+    recovery_step_active = state.recovery_step_active.clone()
 
     was_touchdown_confirm = (
         (state.mode == GaitState.TOUCHDOWN_CONFIRM)
@@ -130,22 +171,17 @@ def advance_gait(
     next_swing_side = 1 - swing_side[was_touchdown_confirm]
 
     swing_side[was_touchdown_confirm] = next_swing_side
-    mode[was_touchdown_confirm] = torch.where(
-        next_swing_side == 0,
-        torch.full_like(
-            next_swing_side,
-            GaitState.LEFT_SWING,
-        ),
-        torch.full_like(
-            next_swing_side,
-            GaitState.RIGHT_SWING,
-        ),
-    )
+    mode[was_touchdown_confirm] = GaitState.HOLD
 
     elapsed_s[was_touchdown_confirm] = 0.0
+    hold_required_s[was_touchdown_confirm] = step_hold_s[
+        was_touchdown_confirm
+    ]
     contact_elapsed_s[was_touchdown_confirm] = 0.0
     no_contact_elapsed_s[was_touchdown_confirm] = 0.0
     swing_has_lifted[was_touchdown_confirm] = False
+    recovery_step_pending[was_touchdown_confirm] = False
+    recovery_step_active[was_touchdown_confirm] = False
 
     was_failure_reason = (
         (state.mode == GaitState.PLAN_INVALID)
@@ -156,7 +192,20 @@ def advance_gait(
     mode[was_failure_reason] = GaitState.RECOVERY
 
     was_recovery = state.mode == GaitState.RECOVERY
+    recovery_counting = (
+        was_recovery
+        & planner_valid
+    )
+    recovery_ready = recovery_counting & (
+        state.hold_elapsed_s + dt >= cfg.recovery_hold_s - 1.0e-6
+    )
     mode[was_recovery] = GaitState.RECOVERY
+    mode[recovery_ready] = GaitState.HOLD
+    elapsed_s[recovery_ready] = 0.0
+    hold_required_s[recovery_ready] = cfg.reset_hold_s
+    swing_has_lifted[recovery_ready] = False
+    recovery_step_pending[recovery_ready] = True
+    recovery_step_active[recovery_ready] = False
 
     invalid_during_hold = (state.mode == GaitState.HOLD) & ~planner_valid
     mode[invalid_during_hold] = GaitState.PLAN_INVALID
@@ -167,25 +216,46 @@ def advance_gait(
     )
 
     hold_elapsed_s = torch.where(
-        valid_hold,
+        valid_hold | recovery_counting,
         state.hold_elapsed_s + dt,
         torch.zeros_like(state.hold_elapsed_s),
     )
+    hold_elapsed_s[recovery_ready] = 0.0
+    hold_required_s = torch.where(
+        valid_hold & (state.hold_required_s >= 0.0),
+        hold_required_s,
+        torch.full_like(hold_required_s, cfg.reset_hold_s),
+    )
+    hold_required_s[was_touchdown_confirm] = step_hold_s[
+        was_touchdown_confirm
+    ]
+    hold_required_s[recovery_ready] = cfg.reset_hold_s
 
     confirmed_hold_contact = torch.all(
         contact_elapsed_s >= cfg.contact_confirm_s - 1.0e-6,
         dim=-1,
     )
 
-    start_left_swing = (
+    start_swing = (
         valid_hold
         & confirmed_hold_contact
-        & (hold_elapsed_s >= cfg.reset_hold_s - 1.0e-6)
+        & (hold_elapsed_s >= hold_required_s - 1.0e-6)
     )
 
-    mode[start_left_swing] = GaitState.LEFT_SWING
-    swing_side[start_left_swing] = 0
-    elapsed_s[start_left_swing] = 0.0
+    mode[start_swing] = torch.where(
+        swing_side[start_swing] == 0,
+        torch.full_like(
+            swing_side[start_swing],
+            GaitState.LEFT_SWING,
+        ),
+        torch.full_like(
+            swing_side[start_swing],
+            GaitState.RIGHT_SWING,
+        ),
+    )
+    elapsed_s[start_swing] = 0.0
+    hold_required_s[start_swing] = cfg.reset_hold_s
+    recovery_step_active[start_swing] = recovery_step_pending[start_swing]
 
     active_swing = (
         (state.mode == GaitState.LEFT_SWING)
@@ -246,7 +316,6 @@ def advance_gait(
         & swing_has_lifted
         & confirmed_swing_contact
         & (phase >= cfg.early_contact_phase)
-        & touchdown_accepted
     )
 
     mode[accepted_late_touchdown] = GaitState.TOUCHDOWN_CONFIRM
@@ -257,7 +326,7 @@ def advance_gait(
         stance_side,
     ]
 
-    stance_lost = active_swing & (
+    stance_lost = active_swing & ~accepted_late_touchdown & (
         stance_no_contact_s
         >= cfg.contact_confirm_s - 1.0e-6
     )
@@ -275,7 +344,10 @@ def advance_gait(
         swing_side=swing_side,
         elapsed_s=elapsed_s,
         hold_elapsed_s=hold_elapsed_s,
+        hold_required_s=hold_required_s,
         contact_elapsed_s=contact_elapsed_s,
         no_contact_elapsed_s=no_contact_elapsed_s,
         swing_has_lifted=swing_has_lifted,
+        recovery_step_pending=recovery_step_pending,
+        recovery_step_active=recovery_step_active,
     )

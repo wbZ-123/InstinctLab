@@ -29,6 +29,25 @@ def _is_touchdown_confirm_mode(gait_mode: torch.Tensor) -> torch.Tensor:
     return gait_mode == 3
 
 
+def _is_late_touchdown_tracking_mode(
+    gait_mode: torch.Tensor,
+    phase: torch.Tensor,
+    min_phase: float,
+) -> torch.Tensor:
+    late_swing = _is_swing_mode(gait_mode) & (phase >= min_phase)
+    overdue = gait_mode == 5
+    return late_swing | overdue
+
+
+def _swing_foot_contact(data) -> torch.Tensor:
+    env_ids = torch.arange(
+        data.foot_contact.shape[0],
+        device=data.foot_contact.device,
+    )
+    swing_side = data.swing_side.long().clamp(0, 1)
+    return data.foot_contact[env_ids, swing_side].bool()
+
+
 def _is_mode(
     gait_mode: torch.Tensor,
     mode: int,
@@ -59,7 +78,7 @@ def foothold_touchdown_tracking_exp(
     command_name: str | None = "base_velocity",
     std: float = 0.10,
 ):
-    """Reward accepted touchdown close to the planner target foothold."""
+    """Reward touchdown-confirm foot placement near the planner target."""
     _sync_desired_velocity_command(env, sensor_name, command_name)
     data = _foothold_planner_data(env, sensor_name)
 
@@ -69,9 +88,116 @@ def foothold_touchdown_tracking_exp(
 
     return (
         reward
-        * data.touchdown_accepted.float()
         * _is_touchdown_confirm_mode(data.gait_mode).float()
     )
+
+
+def foothold_swing_contact_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+    min_phase: float = 0.20,
+):
+    """Return 1 when the planned swing foot is still in contact too late.
+
+    The small phase grace avoids penalizing the first few frames of a newly
+    planned swing, where the foot may not have lifted yet.
+    """
+    data = _foothold_planner_data(env, sensor_name)
+    swing_contact = _swing_foot_contact(data)
+    after_liftoff_grace = data.phase >= min_phase
+    return (
+        _is_swing_mode(data.gait_mode)
+        & after_liftoff_grace
+        & swing_contact
+    ).float()
+
+
+def foothold_no_liftoff_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+    min_phase: float = 0.35,
+):
+    """Return 1 when swing has progressed but the foot never lifted.
+
+    This is different from swing contact: it uses the planner's confirmed
+    liftoff latch, so brief contact noise after a real liftoff is not counted
+    as "never lifted".
+    """
+    data = _foothold_planner_data(env, sensor_name)
+    after_liftoff_deadline = data.phase >= min_phase
+    return (
+        _is_swing_mode(data.gait_mode)
+        & after_liftoff_deadline
+        & ~data.swing_has_lifted.bool()
+    ).float()
+
+
+def foothold_swing_height_under_error_l1(
+    env,
+    sensor_name: str = "foothold_planner",
+    max_error_m: float = 0.25,
+):
+    """Return positive height deficit below the swing reference.
+
+    Only under-shooting the reference height is penalized.  Overshooting is
+    left to the base tracking/regularization terms, because the current failure
+    mode is dragging the swing foot too low.
+    """
+    data = _foothold_planner_data(env, sensor_name)
+    height_deficit = (
+        data.swing_reference_pos_w[:, 2]
+        - data.actual_swing_foot_pos_w[:, 2]
+    ).clamp(min=0.0, max=max_error_m)
+    return height_deficit * _is_swing_mode(data.gait_mode).float()
+
+
+def foothold_swing_xy_error_l2(
+    env,
+    sensor_name: str = "foothold_planner",
+    max_error_m: float = 0.30,
+):
+    """Return planar distance from swing foot to the reference trajectory."""
+    data = _foothold_planner_data(env, sensor_name)
+    xy_error = torch.linalg.norm(
+        (
+            data.actual_swing_foot_pos_w[:, :2]
+            - data.swing_reference_pos_w[:, :2]
+        ),
+        dim=-1,
+    ).clamp_max(max_error_m)
+    return xy_error * _is_swing_mode(data.gait_mode).float()
+
+
+def foothold_touchdown_xy_error_l2(
+    env,
+    sensor_name: str = "foothold_planner",
+    min_phase: float = 0.65,
+    max_error_m: float = 0.30,
+):
+    """Return touchdown XY error during the landing part of swing."""
+    data = _foothold_planner_data(env, sensor_name)
+    active = _is_late_touchdown_tracking_mode(
+        data.gait_mode,
+        data.phase,
+        min_phase,
+    )
+    return data.touchdown_xy_error.clamp_max(max_error_m) * active.float()
+
+
+def foothold_touchdown_z_error_l1(
+    env,
+    sensor_name: str = "foothold_planner",
+    min_phase: float = 0.65,
+    max_error_m: float = 0.20,
+):
+    """Return touchdown height error during the landing part of swing."""
+    data = _foothold_planner_data(env, sensor_name)
+    active = _is_late_touchdown_tracking_mode(
+        data.gait_mode,
+        data.phase,
+        min_phase,
+    )
+    return data.touchdown_z_error.clamp_max(max_error_m) * active.float()
 
 
 def foothold_swing_mode_indicator(
@@ -145,6 +271,33 @@ def foothold_stance_lost_indicator(
     data = _foothold_planner_data(env, sensor_name)
     return _is_mode(data.gait_mode, 6)
 
+
+def foothold_gait_anomaly_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 for any planner gait anomaly, max-pooled across reasons."""
+    data = _foothold_planner_data(env, sensor_name)
+    failure_mode = (
+        (data.gait_mode == 4)
+        | (data.gait_mode == 5)
+        | (data.gait_mode == 6)
+        | (data.gait_mode == 7)
+        | (data.gait_mode == 8)
+    )
+    planner_invalid = ~data.planner_valid.bool()
+    return (failure_mode | planner_invalid).float()
+
+
+def foothold_recovery_indicator(
+    env,
+    sensor_name: str = "foothold_planner",
+):
+    """Return 1 when the planner is in recovery after a gait failure."""
+    data = _foothold_planner_data(env, sensor_name)
+    return _is_mode(data.gait_mode, 8)
+
+
 def foothold_clearance_safe_indicator(
     env,
     sensor_name: str = "foothold_planner",
@@ -157,16 +310,18 @@ def foothold_clearance_safe_indicator(
 def foothold_clearance_penetration_l1(
     env,
     sensor_name: str = "foothold_planner",
+    max_penetration_m: float = 0.15,
 ):
     """Return swing trajectory penetration depth into edge obstacles."""
     data = _foothold_planner_data(env, sensor_name)
-    return data.swing_clearance_penetration
+    return data.swing_clearance_penetration.clamp_max(max_penetration_m)
+
 
 def foothold_touchdown_accepted_indicator(
     env,
     sensor_name: str = "foothold_planner",
 ):
-    """Return 1 when the current swing touchdown is within planner tolerance."""
+    """Return 1 when the current swing has physically touched down."""
     data = _foothold_planner_data(env, sensor_name)
     return data.touchdown_accepted.float()
 

@@ -14,6 +14,7 @@ class FootholdPlannerCfg(SensorBaseCfg):
 
     left_ankle_body_name: str = "left_ankle_roll_link"
     right_ankle_body_name: str = "right_ankle_roll_link"
+    base_body_name: str = "pelvis"
 
     left_contact_body_name: str = "left_ankle_roll_link"
     right_contact_body_name: str = "right_ankle_roll_link"
@@ -27,7 +28,18 @@ class FootholdPlannerCfg(SensorBaseCfg):
 
     swing_duration_s: float = 0.32
     reset_hold_s: float = 0.40
+    contact_confirm_s: float = 0.04
+    early_contact_phase: float = 0.65
+    overdue_s: float = 0.12
+    recovery_hold_s: float = 0.20
+    step_hold_s: float = 0.04
+    step_hold_min_s: float = 0.0
+    step_hold_velocity_scale_s_per_mps: float = 0.02
     control_dt_s: float = 0.02
+    recovery_step_length_m: float = 0.04
+    recovery_step_velocity_lookahead_s: float = 0.10
+    recovery_step_max_length_m: float = 0.12
+    recovery_step_width_m: float = 0.18
 
     contact_force_threshold_n: float = 1.0
 

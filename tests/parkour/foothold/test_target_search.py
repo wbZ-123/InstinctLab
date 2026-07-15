@@ -196,6 +196,45 @@ def test_queries_obstacle_in_world_frame_while_returning_target_in_foot_frame():
     expected_target_f = torch.tensor([[0.15, 0.00, 0.0]])
     torch.testing.assert_close(result.target_f, expected_target_f)
 
+
+def test_queries_obstacle_after_rotating_target_frame_by_yaw():
+    nominal_target_f = torch.tensor([[0.10, 0.00, 0.0]])
+    raw_target_f = nominal_target_f.clone()
+    support_foot_f = torch.tensor([[0.0, 0.0, 0.0]])
+    target_origin_w = torch.tensor([[10.0, 20.0, 0.0]])
+    target_yaw_w = torch.tensor([torch.pi / 2.0])
+    desired_velocity_f = torch.tensor([[0.5, 0.0, 0.0]])
+    foot_points_xy = torch.tensor([[0.0, 0.0]])
+
+    # The nominal body-frame target is +x.  With yaw=90deg it lands at
+    # world +y, i.e. (10.0, 20.1), and must be considered blocked.
+    obstacle = FakeCylinderObstacle(
+        centers_xy=torch.tensor([10.00, 20.10]),
+        radius=0.03,
+    )
+
+    result = search_safe_foothold_target(
+        nominal_target_f=nominal_target_f,
+        raw_target_f=raw_target_f,
+        support_foot_f=support_foot_f,
+        target_origin_w=target_origin_w,
+        target_yaw_w=target_yaw_w,
+        desired_velocity_f=desired_velocity_f,
+        obstacle=obstacle,
+        ellipse_half_length=0.30,
+        ellipse_half_width=0.16,
+        foot_points_xy=foot_points_xy,
+        candidate_radii=torch.tensor([0.05]),
+        candidate_directions=torch.tensor([[1.0, 0.0]]),
+        safety_margin=0.0,
+    )
+
+    assert result.valid
+    assert result.used_fallback
+    assert not result.nominal_obstacle_safe
+    torch.testing.assert_close(result.target_f, torch.tensor([[0.15, 0.0, 0.0]]))
+
+
 def test_debug_safe_foothold_candidates_returns_candidate_masks():
     nominal_target_f = torch.tensor([[0.10, 0.00, 0.0]])
     support_foot_f = torch.tensor([[0.0, 0.0, 0.0]])
@@ -442,11 +481,11 @@ def test_selects_nearest_valid_candidate_to_nominal_target():
     torch.testing.assert_close(result.selected_score, torch.tensor([0.05]))
 
 
-def test_breaks_equal_distance_ties_by_candidate_direction_order():
+def test_breaks_equal_distance_ties_by_velocity_direction():
     nominal_target_f = torch.tensor([[0.10, 0.00, 0.0]])
     raw_target_f = nominal_target_f.clone()
     support_foot_f = torch.tensor([[0.0, 0.0, 0.0]])
-    desired_velocity_f = torch.tensor([[0.5, 0.0, 0.0]])
+    desired_velocity_f = torch.tensor([[0.0, 0.5, 0.0]])
     foot_points_xy = torch.tensor([[0.0, 0.0]])
 
     obstacle = FakeCylinderObstacle(
@@ -466,8 +505,46 @@ def test_breaks_equal_distance_ties_by_candidate_direction_order():
         candidate_radii=torch.tensor([0.05]),
         candidate_directions=torch.tensor(
             [
-                [1.0, 0.0],  # 前，和左一样近，但顺序更靠前。
-                [0.0, 1.0],  # 左。
+                [1.0, 0.0],  # 前，和左一样近，但和速度方向不一致。
+                [0.0, 1.0],  # 左，和速度方向一致。
+            ]
+        ),
+        safety_margin=0.0,
+    )
+
+    assert result.valid
+    assert result.used_fallback
+    expected = torch.tensor([[0.10, 0.05, 0.0]])
+    torch.testing.assert_close(result.target_f, expected)
+    torch.testing.assert_close(result.selected_score, torch.tensor([0.05]))
+
+
+def test_breaks_equal_distance_ties_by_candidate_direction_order_when_velocity_is_zero():
+    nominal_target_f = torch.tensor([[0.10, 0.00, 0.0]])
+    raw_target_f = nominal_target_f.clone()
+    support_foot_f = torch.tensor([[0.0, 0.0, 0.0]])
+    desired_velocity_f = torch.tensor([[0.0, 0.0, 0.0]])
+    foot_points_xy = torch.tensor([[0.0, 0.0]])
+
+    obstacle = FakeCylinderObstacle(
+        centers_xy=torch.tensor([0.10, 0.00]),
+        radius=0.03,
+    )
+
+    result = search_safe_foothold_target(
+        nominal_target_f=nominal_target_f,
+        raw_target_f=raw_target_f,
+        support_foot_f=support_foot_f,
+        desired_velocity_f=desired_velocity_f,
+        obstacle=obstacle,
+        ellipse_half_length=0.30,
+        ellipse_half_width=0.16,
+        foot_points_xy=foot_points_xy,
+        candidate_radii=torch.tensor([0.05]),
+        candidate_directions=torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
             ]
         ),
         safety_margin=0.0,

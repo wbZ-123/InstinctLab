@@ -700,7 +700,7 @@ class G1Rewards:
     stand_still = RewTerm(func=mdp.stand_still, weight=-0.3, params={"command_name": "base_velocity", "offset": 4.0})
     foothold_swing_tracking = RewTerm(
         func=mdp.foothold_swing_tracking_exp,
-        weight=0.2,
+        weight=0.8,
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
@@ -709,7 +709,7 @@ class G1Rewards:
     )
     foothold_touchdown_tracking = RewTerm(
         func=mdp.foothold_touchdown_tracking_exp,
-        weight=0.05,
+        weight=0.2,
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
@@ -723,56 +723,117 @@ class G1Rewards:
 
     foothold_clearance_penetration_l1 = RewTerm(
         func=instinct_mdp.foothold_clearance_penetration_l1,
-        weight=0.0,
+        weight=-4.0,
+        params={"max_penetration_m": 0.15},
+    )
+    foothold_swing_contact_indicator = RewTerm(
+        func=mdp.foothold_swing_contact_indicator,
+        weight=-0.3,
+        params={
+            "sensor_name": "foothold_planner",
+            "min_phase": 0.20,
+        },
+    )
+    foothold_no_liftoff_indicator = RewTerm(
+        func=mdp.foothold_no_liftoff_indicator,
+        weight=-0.2,
+        params={
+            "sensor_name": "foothold_planner",
+            "min_phase": 0.35,
+        },
+    )
+    foothold_swing_height_under_error_l1 = RewTerm(
+        func=mdp.foothold_swing_height_under_error_l1,
+        weight=-2.0,
+        params={
+            "sensor_name": "foothold_planner",
+            "max_error_m": 0.25,
+        },
+    )
+    foothold_swing_xy_error_l2 = RewTerm(
+        func=mdp.foothold_swing_xy_error_l2,
+        weight=-1.0,
+        params={
+            "sensor_name": "foothold_planner",
+            "max_error_m": 0.30,
+        },
+    )
+    foothold_touchdown_xy_error_l2 = RewTerm(
+        func=mdp.foothold_touchdown_xy_error_l2,
+        weight=-1.0,
+        params={
+            "sensor_name": "foothold_planner",
+            "min_phase": 0.65,
+            "max_error_m": 0.30,
+        },
+    )
+    foothold_touchdown_z_error_l1 = RewTerm(
+        func=mdp.foothold_touchdown_z_error_l1,
+        weight=-1.0,
+        params={
+            "sensor_name": "foothold_planner",
+            "min_phase": 0.65,
+            "max_error_m": 0.20,
+        },
     )
     foothold_swing_mode_indicator = RewTerm(
         func=mdp.foothold_swing_mode_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_reset_mode_indicator = RewTerm(
         func=mdp.foothold_reset_mode_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_left_swing_mode_indicator = RewTerm(
         func=mdp.foothold_left_swing_mode_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_right_swing_mode_indicator = RewTerm(
         func=mdp.foothold_right_swing_mode_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_touchdown_confirm_indicator = RewTerm(
         func=mdp.foothold_touchdown_confirm_indicator,
-        weight=0.01,
+        weight=0.0,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_gait_anomaly_indicator = RewTerm(
+        func=mdp.foothold_gait_anomaly_indicator,
+        weight=-1.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_early_contact_indicator = RewTerm(
         func=mdp.foothold_early_contact_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_overdue_indicator = RewTerm(
         func=mdp.foothold_overdue_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_stance_lost_indicator = RewTerm(
         func=mdp.foothold_stance_lost_indicator,
-        weight=0.01,
+        weight=0.0,
+        params={"sensor_name": "foothold_planner"},
+    )
+    foothold_recovery_indicator = RewTerm(
+        func=mdp.foothold_recovery_indicator,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_touchdown_accepted_indicator = RewTerm(
         func=mdp.foothold_touchdown_accepted_indicator,
-        weight=0.01,
+        weight=0.05,
         params={"sensor_name": "foothold_planner"},
     )
     foothold_plan_invalid_indicator = RewTerm(
         func=mdp.foothold_plan_invalid_indicator,
-        weight=0.01,
+        weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
 

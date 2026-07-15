@@ -49,15 +49,32 @@ def _expand_foot_points(
     return points
 
 
+def _rotate_points_yaw(
+    points: torch.Tensor,
+    yaw_w: torch.Tensor,
+) -> torch.Tensor:
+    cos_yaw = torch.cos(yaw_w)
+    sin_yaw = torch.sin(yaw_w)
+
+    rotated = points.clone()
+    rotated[..., 0] = cos_yaw * points[..., 0] - sin_yaw * points[..., 1]
+    rotated[..., 1] = sin_yaw * points[..., 0] + cos_yaw * points[..., 1]
+    return rotated
+
+
 def _is_target_safe(
     target_f: torch.Tensor,
     target_origin_w: torch.Tensor,
+    target_yaw_w: torch.Tensor,
     foot_points_xy: torch.Tensor,
     obstacle: PenetrationObstacle,
     safety_margin: float,
 ) -> torch.Tensor:
-    target_w = target_origin_w + target_f
-    foot_points_w = _expand_foot_points(target_w, foot_points_xy)
+    foot_points_f = _expand_foot_points(target_f, foot_points_xy)
+    foot_points_w = (
+        target_origin_w[:, None, :]
+        + _rotate_points_yaw(foot_points_f, target_yaw_w[:, None])
+    )
     num_targets = foot_points_w.shape[0]
     num_foot_points = foot_points_w.shape[1]
 
@@ -108,12 +125,70 @@ def _build_candidate_targets(
     return candidates
 
 
+def _score_candidate_targets(
+    *,
+    candidates: torch.Tensor,
+    nominal_target_f: torch.Tensor,
+    desired_velocity_f: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score candidates by distance first, then velocity-direction alignment."""
+    candidate_offsets_xy = candidates[:, :, :2] - nominal_target_f[:, None, :2]
+    candidate_distance = torch.linalg.norm(candidate_offsets_xy, dim=-1)
+    distance_bucket_size = torch.tensor(
+        1.0e-5,
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    candidate_distance_bucket = (
+        torch.round(candidate_distance / distance_bucket_size)
+        * distance_bucket_size
+    )
+
+    desired_velocity_xy = desired_velocity_f[:, :2].to(
+        device=nominal_target_f.device,
+        dtype=nominal_target_f.dtype,
+    )
+    velocity_norm = torch.linalg.norm(desired_velocity_xy, dim=-1)
+    candidate_direction = candidate_offsets_xy / candidate_distance.clamp_min(
+        1.0e-6
+    )[:, :, None]
+    velocity_direction = desired_velocity_xy / velocity_norm.clamp_min(
+        1.0e-6
+    )[:, None]
+    velocity_alignment = torch.sum(
+        candidate_direction * velocity_direction[:, None, :],
+        dim=-1,
+    )
+    velocity_alignment = torch.where(
+        velocity_norm[:, None] > 1.0e-6,
+        velocity_alignment,
+        torch.zeros_like(velocity_alignment),
+    )
+
+    eps = torch.finfo(nominal_target_f.dtype).eps
+    direction_tie_break = (1.0 - velocity_alignment) * eps
+    order_tie_break = (
+        torch.arange(
+            candidates.shape[1],
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
+        * eps
+        * 0.01
+    )
+    return (
+        candidate_distance_bucket + direction_tie_break + order_tie_break,
+        candidate_distance,
+    )
+
+
 def search_safe_foothold_target(
     *,
     nominal_target_f: torch.Tensor,
     raw_target_f: torch.Tensor,
     support_foot_f: torch.Tensor,
     target_origin_w: torch.Tensor | None = None,
+    target_yaw_w: torch.Tensor | None = None,
     desired_velocity_f: torch.Tensor,
     obstacle: PenetrationObstacle,
     ellipse_half_length: float,
@@ -124,7 +199,6 @@ def search_safe_foothold_target(
     safety_margin: float,
 ) -> SafeFootholdSearchResult:
     del raw_target_f
-    del desired_velocity_f
 
     foot_points_xy = foot_points_xy.to(
         device=nominal_target_f.device,
@@ -145,11 +219,23 @@ def search_safe_foothold_target(
             device=nominal_target_f.device,
             dtype=nominal_target_f.dtype,
         )
+    if target_yaw_w is None:
+        target_yaw_w = torch.zeros(
+            nominal_target_f.shape[0],
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
+    else:
+        target_yaw_w = target_yaw_w.to(
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
 
     debug = debug_safe_foothold_candidates(
         nominal_target_f=nominal_target_f,
         support_foot_f=support_foot_f,
         target_origin_w=target_origin_w,
+        target_yaw_w=target_yaw_w,
         obstacle=obstacle,
         ellipse_half_length=ellipse_half_length,
         ellipse_half_width=ellipse_half_width,
@@ -205,21 +291,12 @@ def search_safe_foothold_target(
         )
         has_candidate = torch.any(candidate_valid, dim=1)
 
-        candidate_distance = torch.linalg.norm(
-            candidates[:, :, :2] - nominal_target_f[:, None, :2],
-            dim=-1,
+        candidate_score, candidate_distance = _score_candidate_targets(
+            candidates=candidates,
+            nominal_target_f=nominal_target_f,
+            desired_velocity_f=desired_velocity_f,
         )
-        tie_break = (
-            torch.arange(
-                num_candidates,
-                device=nominal_target_f.device,
-                dtype=nominal_target_f.dtype,
-            )
-            * torch.finfo(nominal_target_f.dtype).eps
-        )
-        candidate_score = (candidate_distance + tie_break).masked_fill(
-            ~candidate_valid, float("inf")
-        )
+        candidate_score = candidate_score.masked_fill(~candidate_valid, float("inf"))
         best_idx = torch.argmin(candidate_score, dim=1)
 
         env_ids = torch.arange(
@@ -255,6 +332,7 @@ def debug_safe_foothold_candidates(
     nominal_target_f: torch.Tensor,
     support_foot_f: torch.Tensor,
     target_origin_w: torch.Tensor | None = None,
+    target_yaw_w: torch.Tensor | None = None,
     obstacle: PenetrationObstacle,
     ellipse_half_length: float,
     ellipse_half_width: float,
@@ -282,10 +360,22 @@ def debug_safe_foothold_candidates(
             device=nominal_target_f.device,
             dtype=nominal_target_f.dtype,
         )
+    if target_yaw_w is None:
+        target_yaw_w = torch.zeros(
+            nominal_target_f.shape[0],
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
+    else:
+        target_yaw_w = target_yaw_w.to(
+            device=nominal_target_f.device,
+            dtype=nominal_target_f.dtype,
+        )
 
     nominal_obstacle_safe = _is_target_safe(
         target_f=nominal_target_f,
         target_origin_w=target_origin_w,
+        target_yaw_w=target_yaw_w,
         foot_points_xy=foot_points_xy,
         obstacle=obstacle,
         safety_margin=safety_margin,
@@ -313,6 +403,10 @@ def debug_safe_foothold_candidates(
     flat_target_origin_w = target_origin_w[:, None, :].expand_as(candidates).reshape(
         num_envs * num_candidates, 3
     )
+    flat_target_yaw_w = target_yaw_w[:, None].expand(
+        num_envs,
+        num_candidates,
+    ).reshape(num_envs * num_candidates)
 
     candidate_inside = _is_inside_reachable_ellipse(
         target_f=flat_candidates,
@@ -324,6 +418,7 @@ def debug_safe_foothold_candidates(
     candidate_safe = _is_target_safe(
         target_f=flat_candidates,
         target_origin_w=flat_target_origin_w,
+        target_yaw_w=flat_target_yaw_w,
         foot_points_xy=foot_points_xy,
         obstacle=obstacle,
         safety_margin=safety_margin,
