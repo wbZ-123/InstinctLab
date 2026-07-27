@@ -41,6 +41,10 @@ from instinctlab.utils.noise import (
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 
+_FOOTHOLD_REWARD_WEIGHT_SCALE = float(
+    os.environ.get("FOOTHOLD_REWARD_WEIGHT_SCALE", "1.0")
+)
+
 ##
 # Scene definition
 ##
@@ -344,6 +348,7 @@ class SceneCfg(InteractiveSceneCfg):
         right_ankle_body_name="right_ankle_roll_link",
         left_contact_body_name="left_ankle_roll_link",
         right_contact_body_name="right_ankle_roll_link",
+        startup_hold_s=0.15,
     )
     leg_volume_points = VolumePointsCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_ankle_roll_link",
@@ -700,20 +705,40 @@ class G1Rewards:
     stand_still = RewTerm(func=mdp.stand_still, weight=-0.3, params={"command_name": "base_velocity", "offset": 4.0})
     foothold_swing_tracking = RewTerm(
         func=mdp.foothold_swing_tracking_exp,
-        weight=0.8,
+        weight=0.8 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
             "std": 0.15,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.0,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_touchdown_tracking = RewTerm(
         func=mdp.foothold_touchdown_tracking_exp,
-        weight=0.2,
+        weight=0.2 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
             "std": 0.10,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.0,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_clearance_safe_indicator = RewTerm(
@@ -723,57 +748,134 @@ class G1Rewards:
 
     foothold_clearance_penetration_l1 = RewTerm(
         func=instinct_mdp.foothold_clearance_penetration_l1,
-        weight=-4.0,
-        params={"max_penetration_m": 0.15},
+        weight=-4.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
+        params={
+            "max_penetration_m": 0.15,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
+        },
     )
     foothold_swing_contact_indicator = RewTerm(
         func=mdp.foothold_swing_contact_indicator,
-        weight=-0.3,
+        weight=-1.2 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "min_phase": 0.20,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_no_liftoff_indicator = RewTerm(
         func=mdp.foothold_no_liftoff_indicator,
-        weight=-0.2,
+        weight=-1.8 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "min_phase": 0.35,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_swing_height_under_error_l1 = RewTerm(
         func=mdp.foothold_swing_height_under_error_l1,
-        weight=-2.0,
+        weight=-3.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "max_error_m": 0.25,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_swing_xy_error_l2 = RewTerm(
         func=mdp.foothold_swing_xy_error_l2,
-        weight=-1.0,
+        weight=-1.5 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "max_error_m": 0.30,
+            "late_phase_start": 0.50,
+            "late_phase_full": 0.80,
+            "late_phase_max_scale": 2.0,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_touchdown_xy_error_l2 = RewTerm(
         func=mdp.foothold_touchdown_xy_error_l2,
-        weight=-1.0,
+        weight=1.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "min_phase": 0.65,
-            "max_error_m": 0.30,
+            "target_tolerance_m": 0.02,
+            "zero_score_m": 0.05,
+            "max_penalty_m": 0.05,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_touchdown_z_error_l1 = RewTerm(
         func=mdp.foothold_touchdown_z_error_l1,
-        weight=-1.0,
+        weight=-1.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
         params={
             "sensor_name": "foothold_planner",
             "min_phase": 0.65,
             "max_error_m": 0.20,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
         },
     )
     foothold_swing_mode_indicator = RewTerm(
@@ -803,8 +905,20 @@ class G1Rewards:
     )
     foothold_gait_anomaly_indicator = RewTerm(
         func=mdp.foothold_gait_anomaly_indicator,
-        weight=-1.0,
-        params={"sensor_name": "foothold_planner"},
+        weight=-2.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
+        params={
+            "sensor_name": "foothold_planner",
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
+        },
     )
     foothold_early_contact_indicator = RewTerm(
         func=mdp.foothold_early_contact_indicator,
@@ -821,15 +935,44 @@ class G1Rewards:
         weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
-    foothold_recovery_indicator = RewTerm(
-        func=mdp.foothold_recovery_indicator,
+    foothold_hold_contact_lost_indicator = RewTerm(
+        func=mdp.foothold_hold_contact_lost_indicator,
         weight=0.0,
         params={"sensor_name": "foothold_planner"},
     )
+    foothold_recovery_indicator = RewTerm(
+        func=mdp.foothold_recovery_indicator,
+        weight=-0.3 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
+        params={
+            "sensor_name": "foothold_planner",
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
+        },
+    )
     foothold_touchdown_accepted_indicator = RewTerm(
         func=mdp.foothold_touchdown_accepted_indicator,
-        weight=0.05,
-        params={"sensor_name": "foothold_planner"},
+        weight=0.05 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
+        params={
+            "sensor_name": "foothold_planner",
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.00,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": 100,
+            "curriculum_full_episode_length": 300,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
+        },
     )
     foothold_plan_invalid_indicator = RewTerm(
         func=mdp.foothold_plan_invalid_indicator,
@@ -1075,6 +1218,16 @@ class MonitorCfg:
             "debug_event_max_count": int(
                 os.environ.get("FOOTHOLD_DEBUG_EVENT_MAX_COUNT", "0")
             ),
+            "reward_curriculum_start_scale": 0.0,
+            "reward_curriculum_end_scale": 1.00,
+            "reward_curriculum_ramp_steps": 0,
+            "reward_curriculum_gate": "locomotion_readiness",
+            "reward_curriculum_min_episode_length": 100,
+            "reward_curriculum_full_episode_length": 300,
+            "reward_curriculum_velocity_command_name": "base_velocity",
+            "reward_curriculum_velocity_std": 0.5,
+            "reward_curriculum_velocity_start_score": 0.4,
+            "reward_curriculum_velocity_full_score": 0.7,
         },
     )
 
@@ -1114,4 +1267,6 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
         if self.scene.contact_forces is not None:
             self.scene.contact_forces.update_period = self.sim.dt
         if self.scene.foothold_planner is not None:
-            self.scene.foothold_planner.update_period = self.sim.dt
+            foothold_control_dt = self.sim.dt * self.decimation
+            self.scene.foothold_planner.update_period = foothold_control_dt
+            self.scene.foothold_planner.control_dt_s = foothold_control_dt

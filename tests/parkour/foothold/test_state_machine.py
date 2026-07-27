@@ -52,6 +52,23 @@ def test_initial_gait_state_alternates_swing_side_across_environments():
     )
 
 
+def test_initial_gait_state_can_alternate_from_absolute_environment_ids():
+    state = initial_gait_state(
+        3,
+        device="cpu",
+        env_ids=torch.tensor([3, 4, 9]),
+    )
+
+    torch.testing.assert_close(
+        state.swing_side,
+        torch.tensor([1, 0, 1]),
+    )
+
+
+def test_default_early_contact_phase_keeps_stable_gait_semantics():
+    assert GaitMachineConfig().early_contact_phase == 0.65
+
+
 def test_hold_state_starts_configured_swing_side_after_confirmed_contact():
     cfg = GaitMachineConfig()
     state = initial_gait_state(1, device="cpu")
@@ -121,7 +138,7 @@ def test_reset_hold_does_not_start_without_confirmed_contact():
     cfg = GaitMachineConfig()
     state = initial_gait_state(1, device="cpu")
 
-    for _ in range(25):
+    for _ in range(20):
         state = advance_gait(
             state=state,
             contact=torch.tensor([[False, False]]),
@@ -132,6 +149,23 @@ def test_reset_hold_does_not_start_without_confirmed_contact():
         )
 
     assert state.mode.item() == GaitState.HOLD
+
+
+def test_hold_reports_contact_lost_after_waiting_for_stable_double_support():
+    cfg = GaitMachineConfig()
+    state = initial_gait_state(1, device="cpu")
+
+    for _ in range(25):
+        state = advance_gait(
+            state=state,
+            contact=torch.tensor([[False, False]]),
+            touchdown_accepted=torch.tensor([False]),
+            planner_valid=torch.tensor([True]),
+            dt=0.02,
+            cfg=cfg,
+        )
+
+    assert state.mode.item() == GaitState.HOLD_CONTACT_LOST
 
 
 def test_invalid_plan_is_visible_then_enters_recovery():
@@ -281,7 +315,7 @@ def test_confirmed_contact_before_phase_threshold_is_early_contact():
     assert state.mode.item() == GaitState.EARLY_CONTACT
 
 
-def test_confirmed_stance_loss_is_reported():
+def test_short_support_contact_dropout_does_not_report_stance_loss():
     cfg = GaitMachineConfig()
     state = initial_gait_state(1, device="cpu")
 
@@ -299,7 +333,8 @@ def test_confirmed_stance_loss_is_reported():
     assert state.mode.item() == GaitState.LEFT_SWING
     assert state.swing_side.item() == 0
 
-    # 左脚摆动期间，右支撑脚连续失去接触 0.04 秒。
+    # 左脚摆动期间，右支撑脚短暂失去接触 0.04 秒。
+    # 这足够确认左脚已经离地，但不应该立刻判定支撑脚丢失。
     for _ in range(2):
         state = advance_gait(
             state=state,
@@ -313,6 +348,42 @@ def test_confirmed_stance_loss_is_reported():
     torch.testing.assert_close(
         state.no_contact_elapsed_s,
         torch.tensor([[0.04, 0.04]]),
+    )
+    assert state.mode.item() == GaitState.LEFT_SWING
+
+
+def test_confirmed_stance_loss_is_reported_after_stance_loss_window():
+    cfg = GaitMachineConfig()
+    state = initial_gait_state(1, device="cpu")
+
+    # 进入左脚摆动。
+    for _ in range(20):
+        state = advance_gait(
+            state=state,
+            contact=torch.tensor([[True, True]]),
+            touchdown_accepted=torch.tensor([False]),
+            planner_valid=torch.tensor([True]),
+            dt=0.02,
+            cfg=cfg,
+        )
+
+    assert state.mode.item() == GaitState.LEFT_SWING
+    assert state.swing_side.item() == 0
+
+    # 左脚摆动期间，右支撑脚连续失去接触 0.10 秒。
+    for _ in range(5):
+        state = advance_gait(
+            state=state,
+            contact=torch.tensor([[False, False]]),
+            touchdown_accepted=torch.tensor([False]),
+            planner_valid=torch.tensor([True]),
+            dt=0.02,
+            cfg=cfg,
+        )
+
+    torch.testing.assert_close(
+        state.no_contact_elapsed_s,
+        torch.tensor([[0.10, 0.10]]),
     )
     assert state.mode.item() == GaitState.STANCE_LOST
 
@@ -637,7 +708,9 @@ def test_recovery_waits_for_valid_plan_then_hold_waits_for_contact():
     assert state.mode.item() == GaitState.HOLD
 
     # HOLD owns the "wait for stable double contact" gate, so it should not
-    # start a new swing while contact is still unstable.
+    # start a new swing while contact is still unstable. If it remains
+    # unstable after the extra contact-lost window, the state machine reports
+    # the failed hold instead of waiting forever.
     for _ in range(25):
         state = advance_gait(
             state=state,
@@ -648,7 +721,7 @@ def test_recovery_waits_for_valid_plan_then_hold_waits_for_contact():
             cfg=cfg,
         )
 
-    assert state.mode.item() == GaitState.HOLD
+    assert state.mode.item() == GaitState.HOLD_CONTACT_LOST
 
 
 def test_invalid_plan_during_swing_has_highest_priority():
@@ -673,6 +746,7 @@ def test_recovery_marks_next_swing_as_recovery_step_until_touchdown():
     cfg = GaitMachineConfig(recovery_hold_s=0.04, reset_hold_s=0.04)
     state = initial_gait_state(1, device="cpu")
     state.mode[:] = GaitState.RECOVERY
+    state.swing_side[:] = 0
 
     for _ in range(2):
         state = advance_gait(
@@ -685,6 +759,7 @@ def test_recovery_marks_next_swing_as_recovery_step_until_touchdown():
         )
 
     assert state.mode.item() == GaitState.HOLD
+    assert state.swing_side.item() == 1
     assert state.recovery_step_pending.item()
 
     for _ in range(2):
@@ -697,7 +772,8 @@ def test_recovery_marks_next_swing_as_recovery_step_until_touchdown():
             cfg=cfg,
         )
 
-    assert state.mode.item() == GaitState.LEFT_SWING
+    assert state.mode.item() == GaitState.RIGHT_SWING
+    assert state.swing_side.item() == 1
     assert state.recovery_step_pending.item()
     assert state.recovery_step_active.item()
 
@@ -787,6 +863,8 @@ def test_gait_phase_is_normalized_and_clamped():
         "overdue_s",
         "recovery_hold_s",
         "step_hold_s",
+        "stance_lost_confirm_s",
+        "hold_contact_lost_confirm_s",
     ],
 )
 def test_non_positive_timing_configuration_is_rejected(

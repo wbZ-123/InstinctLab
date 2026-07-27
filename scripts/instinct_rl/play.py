@@ -56,6 +56,45 @@ parser.add_argument(
     default=0,
     help="Environment id to print when --print_foothold_debug is enabled.",
 )
+parser.add_argument(
+    "--print_foothold_marker_debug",
+    action="store_true",
+    default=False,
+    help="Print extra foothold marker and reference-tracking debug values while playing.",
+)
+parser.add_argument(
+    "--print_foothold_debug_on_anomaly",
+    action="store_true",
+    default=False,
+    help="Print foothold debug only when an anomaly or large tracking error is detected.",
+)
+parser.add_argument(
+    "--print_reset_debug",
+    action="store_true",
+    default=False,
+    help="Print termination/reset reason for --print_foothold_debug_env_id when that environment resets.",
+)
+parser.add_argument(
+    "--show_foothold_debug_markers",
+    action="store_true",
+    default=False,
+    help="Show foothold target, swing reference, actual swing foot, and reference trajectory markers in play.",
+)
+parser.add_argument(
+    "--foothold_debug_trajectory_samples",
+    type=int,
+    default=12,
+    help="Number of marker samples used for the displayed foothold swing reference trajectory.",
+)
+parser.add_argument(
+    "--foothold_curriculum_scale_override",
+    type=float,
+    default=None,
+    help=(
+        "Override foothold reward/planner curriculum scale during play. "
+        "Use 1.0 to evaluate a checkpoint with the full foothold planner curriculum."
+    ),
+)
 # append Instinct-RL cli arguments
 cli_args.add_instinct_rl_args(parser)
 # append AppLauncher cli args
@@ -90,7 +129,64 @@ import instinctlab.tasks  # noqa: F401
 from instinctlab.managers.reward_manager import MultiRewardManager
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
 from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
-from play_debug import build_foothold_debug_payload, format_foothold_debug_line
+from play_debug import (
+    build_foothold_debug_payload,
+    build_reset_debug_payload,
+    capture_reset_debug_snapshot,
+    format_foothold_debug_line,
+    format_reset_debug_line,
+    is_foothold_debug_anomaly,
+)
+from play_curriculum import load_recorded_foothold_curriculum_scale
+from play_foothold_viz import make_foothold_visualizer, update_foothold_visualizer
+
+
+def _read_nested_config_value(obj, path):
+    """Read a nested value from configclass objects or loaded yaml dictionaries."""
+    value = obj
+    for name in path:
+        if isinstance(value, dict):
+            value = value.get(name, None)
+        else:
+            value = getattr(value, name, None)
+        if value is None:
+            return None
+    return value
+
+
+def _print_foothold_config_debug(prefix: str, cfg_or_env) -> None:
+    """Print planner config values that are easy to confuse during play debugging."""
+    if hasattr(cfg_or_env, "unwrapped"):
+        try:
+            foothold_cfg = cfg_or_env.unwrapped.scene.sensors["foothold_planner"].cfg
+            startup_hold_s = getattr(foothold_cfg, "startup_hold_s", None)
+            control_dt_s = getattr(foothold_cfg, "control_dt_s", None)
+            print(
+                f"[PLAY_CONFIG] {prefix} source=runtime_sensor "
+                f"startup_hold_s={startup_hold_s} control_dt_s={control_dt_s}",
+                flush=True,
+            )
+            return
+        except Exception as exc:
+            print(
+                f"[PLAY_CONFIG] {prefix} failed to read runtime foothold config: {exc}",
+                flush=True,
+            )
+            return
+
+    startup_hold_s = _read_nested_config_value(
+        cfg_or_env,
+        ("scene", "foothold_planner", "startup_hold_s"),
+    )
+    control_dt_s = _read_nested_config_value(
+        cfg_or_env,
+        ("scene", "foothold_planner", "control_dt_s"),
+    )
+    print(
+        f"[PLAY_CONFIG] {prefix} source=env_cfg "
+        f"startup_hold_s={startup_hold_s} control_dt_s={control_dt_s}",
+        flush=True,
+    )
 
 # wait for attach if in debug mode
 if args_cli.debug:
@@ -143,8 +239,14 @@ def main():
     else:
         agent_cfg_dict = agent_cfg.to_dict()
 
+    if args_cli.print_foothold_debug or args_cli.print_reset_debug:
+        _print_foothold_config_debug("before_gym_make", env_cfg)
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.print_foothold_debug or args_cli.print_reset_debug:
+        _print_foothold_config_debug("after_gym_make", env)
+
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
@@ -161,6 +263,31 @@ def main():
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    foothold_curriculum_scale_override = args_cli.foothold_curriculum_scale_override
+    if foothold_curriculum_scale_override is None and agent_cfg.load_run is not None:
+        foothold_curriculum_scale_override = load_recorded_foothold_curriculum_scale(
+            log_dir,
+        )
+        if foothold_curriculum_scale_override is not None:
+            print(
+                "[INFO] Loaded recorded foothold reward/planner curriculum scale "
+                f"for play: {foothold_curriculum_scale_override:.3f}"
+            )
+        else:
+            print(
+                "[INFO] No recorded foothold curriculum scale report found for play; "
+                "using the environment's runtime curriculum state."
+            )
+
+    if foothold_curriculum_scale_override is not None:
+        env.unwrapped.foothold_reward_curriculum_override_scale = float(
+            foothold_curriculum_scale_override
+        )
+        print(
+            "[INFO] Overriding foothold reward/planner curriculum scale during play: "
+            f"{foothold_curriculum_scale_override:.3f}"
+        )
 
     # react to custom play arguments
     if args_cli.no_terminate:
@@ -200,32 +327,100 @@ def main():
     # reset environment
     obs, _ = env.get_observations()
     timestep = 0
+    foothold_visualizer = make_foothold_visualizer() if args_cli.show_foothold_debug_markers else None
+    foothold_visualizer_warned = False
+
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
-            if timestep < args_cli.zero_act_until:
+            zero_act_active = timestep < args_cli.zero_act_until
+            reset_debug_snapshot = None
+            if args_cli.print_reset_debug:
+                reset_debug_snapshot = capture_reset_debug_snapshot(
+                    env.unwrapped,
+                    env_id=args_cli.print_foothold_debug_env_id,
+                )
+            if zero_act_active:
                 actions[:] = 0.0
             # env stepping
             obs, rewards, dones, infos = env.step(actions)
         timestep += 1
 
-        if args_cli.print_foothold_debug and (
+        if args_cli.print_reset_debug:
+            env_id = args_cli.print_foothold_debug_env_id
+            try:
+                done = bool(dones[env_id].detach().cpu().item())
+            except Exception:
+                done = False
+            if done:
+                try:
+                    payload = build_reset_debug_payload(
+                        env.unwrapped,
+                        env_id=env_id,
+                        done=done,
+                        pre_step_snapshot=reset_debug_snapshot,
+                    )
+                    print(format_reset_debug_line(timestep, payload), flush=True)
+                except Exception as exc:
+                    print(
+                        f"[RESET_DEBUG] step={timestep} failed to read reset debug: {exc}",
+                        flush=True,
+                    )
+
+        print_foothold_debug = (
+            args_cli.print_foothold_debug or args_cli.print_foothold_marker_debug
+        )
+        if print_foothold_debug and (
             timestep % max(args_cli.print_foothold_debug_interval, 1) == 0
         ):
             try:
                 payload = build_foothold_debug_payload(
                     env.unwrapped,
                     env_id=args_cli.print_foothold_debug_env_id,
+                    actions=actions,
                 )
-                print(format_foothold_debug_line(timestep, payload), flush=True)
+                if (
+                    not args_cli.print_foothold_debug_on_anomaly
+                    or is_foothold_debug_anomaly(payload)
+                ):
+                    print(
+                        format_foothold_debug_line(
+                            timestep,
+                            payload,
+                            zero_act_active=zero_act_active,
+                        ),
+                        flush=True,
+                    )
             except Exception as exc:
                 print(
                     f"[PLAY_DEBUG] step={timestep} failed to read foothold debug: {exc}",
                     flush=True,
                 )
+
+        if foothold_visualizer is not None:
+            try:
+                foothold_sensor = env.unwrapped.scene.sensors["foothold_planner"]
+                foothold_cfg = getattr(foothold_sensor, "cfg", None)
+                swing_duration_s = float(
+                    getattr(foothold_cfg, "swing_duration_s", 0.8)
+                )
+                update_foothold_visualizer(
+                    foothold_visualizer,
+                    foothold_sensor.data,
+                    env_id=args_cli.print_foothold_debug_env_id,
+                    trajectory_samples=args_cli.foothold_debug_trajectory_samples,
+                    swing_duration_s=swing_duration_s,
+                )
+            except Exception as exc:
+                if not foothold_visualizer_warned:
+                    print(
+                        f"[PLAY_DEBUG] step={timestep} failed to update foothold markers: {exc}",
+                        flush=True,
+                    )
+                    foothold_visualizer_warned = True
 
         # override reward terms if auxiliary reward is enabled
         if args_cli.aux_reward:

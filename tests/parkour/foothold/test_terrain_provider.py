@@ -29,6 +29,21 @@ def _make_flat_targets() -> FlatTargetBatch:
             ],
             dtype=torch.float32,
         ),
+        curriculum_residual_f=torch.tensor(
+            [
+                [0.01, -0.02],
+                [0.03, 0.04],
+            ],
+            dtype=torch.float32,
+        ),
+        curriculum_radius_f=torch.tensor(
+            [
+                [0.04, 0.02],
+                [0.08, 0.04],
+            ],
+            dtype=torch.float32,
+        ),
+        curriculum_usage=torch.tensor([0.5, 0.75], dtype=torch.float32),
         valid=torch.tensor([True, True]),
         terrain=TerrainCorridor(
             heights=torch.zeros((2, 8), dtype=torch.float32),
@@ -55,6 +70,18 @@ def test_lift_flat_targets_sets_z_from_terrain_without_changing_xy():
     torch.testing.assert_close(result.yaw_f, flat_targets.yaw_f)
     torch.testing.assert_close(result.normal_f, flat_targets.normal_f)
     torch.testing.assert_close(result.feasible_velocity_f, flat_targets.feasible_velocity_f)
+    torch.testing.assert_close(
+        result.curriculum_residual_f,
+        flat_targets.curriculum_residual_f,
+    )
+    torch.testing.assert_close(
+        result.curriculum_radius_f,
+        flat_targets.curriculum_radius_f,
+    )
+    torch.testing.assert_close(
+        result.curriculum_usage,
+        flat_targets.curriculum_usage,
+    )
     torch.testing.assert_close(result.valid, flat_targets.valid)
 
 

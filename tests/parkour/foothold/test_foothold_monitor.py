@@ -50,12 +50,55 @@ def _load_monitor_module():
     return module
 
 
-def _make_env(data):
+class _FakeCommandManager:
+    def __init__(self, command: torch.Tensor):
+        self.command = command
+
+    def get_command(self, command_name: str) -> torch.Tensor:
+        assert command_name == "base_velocity"
+        return self.command
+
+
+class _FakeScene:
+    def __init__(self, sensors=None, robot=None):
+        self.sensors = sensors or {}
+        self._items = {}
+        if robot is not None:
+            self._items["robot"] = robot
+
+    def __getitem__(self, name: str):
+        return self._items[name]
+
+
+def _make_env(
+    data,
+    *,
+    common_step_counter: int = 0,
+    episode_length_buf: torch.Tensor | None = None,
+    command: torch.Tensor | None = None,
+    root_lin_vel_b: torch.Tensor | None = None,
+):
     planner = SimpleNamespace(data=data)
+    num_envs = data.gait_mode.shape[0]
+    if episode_length_buf is None:
+        episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
+    if command is None:
+        command = torch.zeros(num_envs, 3)
+    if root_lin_vel_b is None:
+        root_lin_vel_b = torch.zeros(num_envs, 3)
+    robot = SimpleNamespace(
+        data=SimpleNamespace(root_lin_vel_b=root_lin_vel_b)
+    )
     return SimpleNamespace(
-        num_envs=data.gait_mode.shape[0],
+        num_envs=num_envs,
         device=torch.device("cpu"),
-        scene=SimpleNamespace(sensors={"foothold_planner": planner}),
+        common_step_counter=common_step_counter,
+        episode_length_buf=episode_length_buf,
+        command_manager=_FakeCommandManager(command),
+        scene=_FakeScene(
+            sensors={"foothold_planner": planner},
+            robot=robot,
+        ),
     )
 
 
@@ -102,6 +145,7 @@ def test_monitor_constructs_compact_per_environment_buffers():
     assert monitor._step_count.shape == (3,)
     assert monitor._step_count.device.type == "cpu"
     assert monitor._step_count.dtype == torch.float32
+
 
 def test_update_counts_states_events_and_clearance_without_double_counting():
     module = _load_monitor_module()
@@ -407,7 +451,7 @@ def test_monitor_reports_full_gait_mode_distribution_and_swing_entries():
     data = _make_data(num_envs=1)
     monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
 
-    for mode in [0, 1, 1, 3, 2, 2, 6]:
+    for mode in [0, 1, 1, 3, 2, 2, 6, 9]:
         data.gait_mode[:] = mode
         monitor.update(dt=0.02)
 
@@ -418,21 +462,33 @@ def test_monitor_reports_full_gait_mode_distribution_and_swing_entries():
         monitor._touchdown_confirm_step_count, torch.tensor([1.0])
     )
     torch.testing.assert_close(monitor._stance_lost_count, torch.tensor([1.0]))
+    torch.testing.assert_close(
+        monitor._hold_contact_lost_step_count, torch.tensor([1.0])
+    )
+    torch.testing.assert_close(
+        monitor._hold_contact_lost_entry_count, torch.tensor([1.0])
+    )
     torch.testing.assert_close(monitor._swing_entry_count, torch.tensor([2.0]))
     torch.testing.assert_close(monitor._left_swing_entry_count, torch.tensor([1.0]))
     torch.testing.assert_close(monitor._right_swing_entry_count, torch.tensor([1.0]))
     torch.testing.assert_close(monitor._swing_duration_step_sum, torch.tensor([4.0]))
 
     log = monitor.get_log()
-    torch.testing.assert_close(log["hold_fraction"], torch.tensor(1.0 / 7.0))
-    torch.testing.assert_close(log["left_swing_fraction"], torch.tensor(2.0 / 7.0))
-    torch.testing.assert_close(log["right_swing_fraction"], torch.tensor(2.0 / 7.0))
+    torch.testing.assert_close(log["hold_fraction"], torch.tensor(1.0 / 8.0))
+    torch.testing.assert_close(log["left_swing_fraction"], torch.tensor(2.0 / 8.0))
+    torch.testing.assert_close(log["right_swing_fraction"], torch.tensor(2.0 / 8.0))
     torch.testing.assert_close(
-        log["touchdown_confirm_fraction"], torch.tensor(1.0 / 7.0)
+        log["touchdown_confirm_fraction"], torch.tensor(1.0 / 8.0)
     )
-    torch.testing.assert_close(log["swing_entry_step_rate"], torch.tensor(2.0 / 7.0))
-    torch.testing.assert_close(log["left_swing_entry_step_rate"], torch.tensor(1.0 / 7.0))
-    torch.testing.assert_close(log["right_swing_entry_step_rate"], torch.tensor(1.0 / 7.0))
+    torch.testing.assert_close(
+        log["hold_contact_lost_fraction"], torch.tensor(1.0 / 8.0)
+    )
+    torch.testing.assert_close(
+        log["hold_contact_lost_entry_step_rate"], torch.tensor(1.0 / 8.0)
+    )
+    torch.testing.assert_close(log["swing_entry_step_rate"], torch.tensor(2.0 / 8.0))
+    torch.testing.assert_close(log["left_swing_entry_step_rate"], torch.tensor(1.0 / 8.0))
+    torch.testing.assert_close(log["right_swing_entry_step_rate"], torch.tensor(1.0 / 8.0))
     torch.testing.assert_close(log["mean_swing_duration_steps"], torch.tensor(2.0))
 
 
@@ -581,6 +637,114 @@ def test_monitor_reports_failure_entries_per_swing_entry_by_side():
     )
     torch.testing.assert_close(
         log["right_swing_recovery_per_swing_entry"], torch.tensor(1.0)
+    )
+
+
+def test_monitor_reports_hold_contact_lost_per_swing_entry():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.gait_mode[:] = torch.tensor([1, 2])
+    data.swing_side[:] = torch.tensor([0, 1])
+    monitor.update(dt=0.02)
+
+    data.gait_mode[:] = torch.tensor([9, 0])
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["hold_contact_lost_per_swing_entry"], torch.tensor(0.5)
+    )
+
+
+def test_monitor_logs_reward_curriculum_scale_from_readiness_gate():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(
+        _make_cfg(
+            reward_curriculum_start_scale=0.0,
+            reward_curriculum_end_scale=1.0,
+            reward_curriculum_ramp_steps=72_000,
+            reward_curriculum_gate="locomotion_readiness",
+            reward_curriculum_min_episode_length=100,
+            reward_curriculum_full_episode_length=300,
+            reward_curriculum_velocity_command_name="base_velocity",
+            reward_curriculum_velocity_std=0.5,
+            reward_curriculum_velocity_start_score=0.4,
+            reward_curriculum_velocity_full_score=0.7,
+        ),
+        _make_env(
+            data,
+            common_step_counter=100_000,
+            episode_length_buf=torch.tensor([320, 360]),
+            command=torch.tensor([[0.6, 0.0, 0.0], [0.6, 0.0, 0.0]]),
+            root_lin_vel_b=torch.tensor(
+                [[0.58, 0.0, 0.0], [0.60, 0.0, 0.0]]
+            ),
+        ),
+    )
+
+    monitor.update(dt=0.02)
+
+    torch.testing.assert_close(
+        monitor.get_log()["reward_curriculum_scale"], torch.tensor(1.0)
+    )
+
+
+def test_monitor_reward_curriculum_scale_is_not_blocked_by_step_ramp():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(
+        _make_cfg(
+            reward_curriculum_start_scale=0.0,
+            reward_curriculum_end_scale=1.0,
+            reward_curriculum_ramp_steps=240_000,
+            reward_curriculum_gate="locomotion_readiness",
+            reward_curriculum_min_episode_length=200,
+            reward_curriculum_full_episode_length=900,
+        ),
+        _make_env(
+            data,
+            common_step_counter=0,
+            episode_length_buf=torch.tensor([50, 950]),
+        ),
+    )
+
+    monitor.update(dt=0.02)
+
+    torch.testing.assert_close(
+        monitor.get_log()["reward_curriculum_scale"], torch.tensor(0.5)
+    )
+
+
+def test_monitor_reward_curriculum_scale_remembers_recent_completed_episode_after_reset():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    env = _make_env(
+        data,
+        common_step_counter=1,
+        episode_length_buf=torch.tensor([950]),
+    )
+    monitor = module.FootholdPlannerMonitorTerm(
+        _make_cfg(
+            reward_curriculum_start_scale=0.0,
+            reward_curriculum_end_scale=1.0,
+            reward_curriculum_ramp_steps=240_000,
+            reward_curriculum_gate="locomotion_readiness",
+            reward_curriculum_min_episode_length=200,
+            reward_curriculum_full_episode_length=900,
+        ),
+        env,
+    )
+
+    monitor.update(dt=0.02)
+    env.common_step_counter = 2
+    env.episode_length_buf = torch.tensor([3])
+    monitor.update(dt=0.02)
+
+    torch.testing.assert_close(
+        monitor.get_log()["reward_curriculum_scale"], torch.tensor(1.0)
     )
 
 

@@ -49,6 +49,7 @@ CORE_TAGS = (
     "Step_Monitor/foothold_planner_right_swing_fraction",
     "Step_Monitor/foothold_planner_touchdown_confirm_fraction",
     "Step_Monitor/foothold_planner_plan_invalid_mode_fraction",
+    "Step_Monitor/foothold_planner_hold_contact_lost_fraction",
     "Step_Monitor/foothold_planner_recovery_fraction",
     "Step_Monitor/foothold_planner_recovery_step_fraction",
     "Step_Monitor/foothold_planner_swing_entry_step_rate",
@@ -65,11 +66,13 @@ CORE_TAGS = (
     "Step_Monitor/foothold_planner_stance_lost_fraction",
     "Step_Monitor/foothold_planner_stance_lost_entry_step_rate",
     "Step_Monitor/foothold_planner_plan_invalid_entry_step_rate",
+    "Step_Monitor/foothold_planner_hold_contact_lost_entry_step_rate",
     "Step_Monitor/foothold_planner_recovery_entry_step_rate",
     "Step_Monitor/foothold_planner_recovery_step_entry_step_rate",
     "Step_Monitor/foothold_planner_early_contact_per_swing_entry",
     "Step_Monitor/foothold_planner_overdue_per_swing_entry",
     "Step_Monitor/foothold_planner_stance_lost_per_swing_entry",
+    "Step_Monitor/foothold_planner_hold_contact_lost_per_swing_entry",
     "Step_Monitor/foothold_planner_recovery_per_swing_entry",
     "Step_Monitor/foothold_planner_left_swing_early_contact_per_swing_entry",
     "Step_Monitor/foothold_planner_right_swing_early_contact_per_swing_entry",
@@ -82,6 +85,7 @@ CORE_TAGS = (
     "Step_Monitor/foothold_planner_touchdown_confirm_step_rate",
     "Step_Monitor/foothold_planner_left_touchdown_confirm_step_rate",
     "Step_Monitor/foothold_planner_right_touchdown_confirm_step_rate",
+    "Step_Monitor/foothold_planner_reward_curriculum_scale",
     "Train/time/mean_reward_0",
     "Train/time/mean_episode_length",
 )
@@ -127,6 +131,8 @@ def summarize_series(values: list[float]) -> SeriesSummary:
 
 
 def _short_name(tag: str) -> str:
+    if tag.startswith("Episode_Reward/rewards_") and tag.endswith("/timestep"):
+        return tag.split("/", maxsplit=2)[1].removeprefix("rewards_")
     return tag.rsplit("/", maxsplit=1)[-1]
 
 
@@ -140,8 +146,11 @@ def _status_for(
         "foothold_planner_nonfinite_fraction",
         "foothold_planner_plan_invalid_fraction",
         "foothold_planner_plan_invalid_mode_fraction",
+        "foothold_planner_hold_contact_lost_fraction",
     }:
         return "OK" if summary.max <= 0.0 else "BAD"
+    if name == "foothold_planner_hold_contact_lost_entry_step_rate":
+        return "INFO"
     if name == "foothold_planner_recovery_fraction":
         return "OK" if summary.last < 0.05 else "WATCH"
     if name in {
@@ -210,6 +219,7 @@ def _status_for(
         "foothold_planner_early_contact_per_swing_entry",
         "foothold_planner_overdue_per_swing_entry",
         "foothold_planner_stance_lost_per_swing_entry",
+        "foothold_planner_hold_contact_lost_per_swing_entry",
         "foothold_planner_recovery_per_swing_entry",
         "foothold_planner_left_swing_early_contact_per_swing_entry",
         "foothold_planner_right_swing_early_contact_per_swing_entry",

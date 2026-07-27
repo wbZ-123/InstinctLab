@@ -11,7 +11,7 @@ class FlatProviderConfig:
     min_lateral_separation: float = 0.06
 
     nominal_step_width: float = 0.18
-    velocity_lookahead_s: float = 0.16
+    velocity_lookahead_s: float = 0.10
     curriculum_radius_x: tuple[float, ...] = (0.04, 0.08, 0.12)
     curriculum_radius_y: tuple[float, ...] = (0.02, 0.04, 0.06)
 
@@ -37,6 +37,9 @@ class FlatTargetBatch:
     yaw_f: torch.Tensor
     normal_f: torch.Tensor
     feasible_velocity_f: torch.Tensor
+    curriculum_residual_f: torch.Tensor
+    curriculum_radius_f: torch.Tensor
+    curriculum_usage: torch.Tensor
     valid: torch.Tensor
     terrain: TerrainCorridor
 
@@ -82,6 +85,26 @@ def sample_flat_targets(
 
     residual_x = unit_x * radius_x_by_level[level_index]
     residual_y = unit_y * radius_y_by_level[level_index]
+    curriculum_radius_f = torch.stack(
+        (
+            radius_x_by_level[level_index],
+            radius_y_by_level[level_index],
+        ),
+        dim=-1,
+    )
+    curriculum_residual_f = torch.stack(
+        (residual_x, residual_y),
+        dim=-1,
+    )
+    normalized_curriculum_residual = torch.where(
+        curriculum_radius_f > 1.0e-6,
+        torch.abs(curriculum_residual_f) / curriculum_radius_f,
+        torch.zeros_like(curriculum_residual_f),
+    )
+    curriculum_usage = torch.linalg.norm(
+        normalized_curriculum_residual,
+        dim=-1,
+    )
 
     side_sign = torch.where(
         swing_side == 0,
@@ -223,6 +246,9 @@ def sample_flat_targets(
         yaw_f=yaw_f,
         normal_f=normal_f,
         feasible_velocity_f=feasible_velocity_f,
+        curriculum_residual_f=curriculum_residual_f,
+        curriculum_radius_f=curriculum_radius_f,
+        curriculum_usage=curriculum_usage,
         valid=valid,
         terrain=terrain,
     )

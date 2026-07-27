@@ -30,6 +30,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
     _SUM_BUFFER_NAMES = (
         "_step_count",
         "_hold_step_count",
+        "_hold_contact_lost_step_count",
         "_left_swing_step_count",
         "_right_swing_step_count",
         "_touchdown_confirm_step_count",
@@ -51,6 +52,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_overdue_entry_count",
         "_stance_lost_entry_count",
         "_plan_invalid_entry_count",
+        "_hold_contact_lost_entry_count",
         "_recovery_entry_count",
         "_recovery_step_entry_count",
         "_left_swing_early_contact_entry_count",
@@ -70,6 +72,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_apex_delta_sum",
         "_invalid_plan_count",
         "_nonfinite_count",
+        "_reward_curriculum_scale_sum",
         "_safe_target_search_count",
         "_safe_target_final_valid_count",
         "_safe_target_fallback_count",
@@ -97,6 +100,39 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         )
         self._debug_event_max_count = int(
             cfg.params.get("debug_event_max_count", 0)
+        )
+        self._reward_curriculum_start_scale = float(
+            cfg.params.get("reward_curriculum_start_scale", 0.0)
+        )
+        self._reward_curriculum_end_scale = float(
+            cfg.params.get("reward_curriculum_end_scale", 1.0)
+        )
+        self._reward_curriculum_ramp_steps = int(
+            cfg.params.get("reward_curriculum_ramp_steps", 1)
+        )
+        self._reward_curriculum_gate = cfg.params.get(
+            "reward_curriculum_gate", "none"
+        )
+        self._reward_curriculum_min_episode_length = float(
+            cfg.params.get("reward_curriculum_min_episode_length", 0.0)
+        )
+        self._reward_curriculum_full_episode_length = float(
+            cfg.params.get("reward_curriculum_full_episode_length", 1.0)
+        )
+        self._reward_curriculum_velocity_command_name = cfg.params.get(
+            "reward_curriculum_velocity_command_name", "base_velocity"
+        )
+        self._reward_curriculum_velocity_std = float(
+            cfg.params.get("reward_curriculum_velocity_std", 0.5)
+        )
+        self._reward_curriculum_velocity_start_score = float(
+            cfg.params.get("reward_curriculum_velocity_start_score", 0.0)
+        )
+        self._reward_curriculum_velocity_full_score = float(
+            cfg.params.get("reward_curriculum_velocity_full_score", 1.0)
+        )
+        self._reward_curriculum_asset_name = cfg.params.get(
+            "reward_curriculum_asset_name", "robot"
         )
         self._debug_event_count = 0
         try:
@@ -131,6 +167,22 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             dtype=torch.long,
             device=self.device,
         )
+        self._curriculum_previous_episode_length = torch.zeros(
+            shape,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._curriculum_completed_episode_length_ema = torch.zeros(
+            shape,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._curriculum_has_completed_episode_length_ema = torch.zeros(
+            shape,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self._curriculum_episode_length_initialized = False
         self._last_episode_log: dict[str, torch.Tensor] = {}
 
     @staticmethod
@@ -141,6 +193,84 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                 f"Foothold planner monitor requires data field '{field}'."
             )
         return value
+
+    def _zero_reward_curriculum_scale(self) -> torch.Tensor:
+        return torch.zeros(
+            (self._env.num_envs,),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _compute_reward_curriculum_scale(self) -> torch.Tensor:
+        if self._reward_curriculum_gate != "locomotion_readiness":
+            if self._reward_curriculum_ramp_steps <= 0:
+                step_scale = self._reward_curriculum_end_scale
+            else:
+                ramp_steps = max(self._reward_curriculum_ramp_steps, 1)
+                step_fraction = min(
+                    max(float(getattr(self._env, "common_step_counter", 0)) / ramp_steps, 0.0),
+                    1.0,
+                )
+                step_scale = (
+                    self._reward_curriculum_start_scale
+                    + (
+                        self._reward_curriculum_end_scale
+                        - self._reward_curriculum_start_scale
+                    )
+                    * step_fraction
+                )
+            return torch.full(
+                (self._env.num_envs,),
+                float(step_scale),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        episode_length = getattr(self._env, "episode_length_buf", None)
+        if episode_length is None:
+            return self._zero_reward_curriculum_scale()
+
+        episode_length = episode_length.to(device=self.device, dtype=torch.float32)
+        if not self._curriculum_episode_length_initialized:
+            self._curriculum_previous_episode_length[:] = episode_length
+            self._curriculum_episode_length_initialized = True
+
+        reset_mask = episode_length < self._curriculum_previous_episode_length
+        if torch.any(reset_mask):
+            completed_length = self._curriculum_previous_episode_length
+            updated_ema = torch.where(
+                self._curriculum_has_completed_episode_length_ema,
+                0.80 * self._curriculum_completed_episode_length_ema
+                + 0.20 * completed_length,
+                completed_length,
+            )
+            self._curriculum_completed_episode_length_ema = torch.where(
+                reset_mask,
+                updated_ema,
+                self._curriculum_completed_episode_length_ema,
+            )
+            self._curriculum_has_completed_episode_length_ema |= reset_mask
+
+        self._curriculum_previous_episode_length[:] = episode_length
+
+        ema_or_current = torch.where(
+            self._curriculum_has_completed_episode_length_ema,
+            self._curriculum_completed_episode_length_ema,
+            episode_length,
+        )
+        readiness_length = torch.maximum(episode_length, ema_or_current)
+
+        episode_denominator = max(
+            self._reward_curriculum_full_episode_length
+            - self._reward_curriculum_min_episode_length,
+            1.0,
+        )
+        episode_score = (
+            (readiness_length - self._reward_curriculum_min_episode_length)
+            / episode_denominator
+        ).clamp(0.0, 1.0)
+
+        return episode_score * float(self._reward_curriculum_end_scale)
 
     @torch.no_grad()
     def update(self, dt: float):
@@ -199,6 +329,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         swing = left_swing | right_swing
         touchdown_confirm = gait_mode == GaitState.TOUCHDOWN_CONFIRM
         plan_invalid = gait_mode == GaitState.PLAN_INVALID
+        hold_contact_lost = gait_mode == GaitState.HOLD_CONTACT_LOST
         recovery = gait_mode == GaitState.RECOVERY
         recovery_step_entry = (
             recovery_step_active & ~self._previous_recovery_step_active
@@ -215,6 +346,10 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             gait_mode == GaitState.STANCE_LOST
         ) & mode_changed
         recovery_entry = (gait_mode == GaitState.RECOVERY) & mode_changed
+        hold_contact_lost_entry = (
+            (gait_mode == GaitState.HOLD_CONTACT_LOST)
+            & mode_changed
+        )
         accepted_edge = touchdown_accepted & ~self._previous_touchdown_accepted
         confirm_edge = touchdown_confirm & ~self._previous_touchdown_confirm
 
@@ -256,6 +391,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
 
         self._step_count += 1.0
         self._hold_step_count += hold.float()
+        self._hold_contact_lost_step_count += hold_contact_lost.float()
         self._left_swing_step_count += left_swing.float()
         self._right_swing_step_count += right_swing.float()
         self._touchdown_confirm_step_count += touchdown_confirm.float()
@@ -291,6 +427,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         self._plan_invalid_entry_count += (
             (gait_mode == GaitState.PLAN_INVALID) & mode_changed
         ).float()
+        self._hold_contact_lost_entry_count += hold_contact_lost_entry.float()
         self._recovery_entry_count += recovery_entry.float()
         self._recovery_step_entry_count += recovery_step_entry.float()
         self._left_swing_early_contact_entry_count += (
@@ -340,6 +477,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         )
         self._invalid_plan_count += (~planner_valid).float()
         self._nonfinite_count += (~sample_finite).float()
+        self._reward_curriculum_scale_sum += (
+            self._compute_reward_curriculum_scale()
+        )
         # Safe-target search is an event, not a per-step state.  Only count the
         # valid/fallback/score fields when a new search actually happened.
         search_sample = safe_target_search_performed.float()
@@ -574,6 +714,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                 for key in (
                     "swing_fraction",
                     "hold_fraction",
+                    "hold_contact_lost_fraction",
                     "left_swing_fraction",
                     "right_swing_fraction",
                     "touchdown_confirm_fraction",
@@ -594,11 +735,13 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                     "overdue_entry_step_rate",
                     "stance_lost_entry_step_rate",
                     "plan_invalid_entry_step_rate",
+                    "hold_contact_lost_entry_step_rate",
                     "recovery_entry_step_rate",
                     "recovery_step_entry_step_rate",
                     "early_contact_per_swing_entry",
                     "overdue_per_swing_entry",
                     "stance_lost_per_swing_entry",
+                    "hold_contact_lost_per_swing_entry",
                     "recovery_per_swing_entry",
                     "left_swing_early_contact_per_swing_entry",
                     "right_swing_early_contact_per_swing_entry",
@@ -618,6 +761,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                     "apex_delta_max",
                     "plan_invalid_fraction",
                     "nonfinite_fraction",
+                    "reward_curriculum_scale",
                     "safe_target_search_rate",
                     "safe_target_final_valid_fraction",
                     "safe_target_fallback_fraction",
@@ -649,6 +793,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             ).mean(),
             "hold_fraction": self._safe_ratio(
                 self._hold_step_count[env_ids], step_count
+            ).mean(),
+            "hold_contact_lost_fraction": self._safe_ratio(
+                self._hold_contact_lost_step_count[env_ids], step_count
             ).mean(),
             "left_swing_fraction": self._safe_ratio(
                 self._left_swing_step_count[env_ids], step_count
@@ -711,6 +858,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "plan_invalid_entry_step_rate": self._safe_ratio(
                 self._plan_invalid_entry_count[env_ids], step_count
             ).mean(),
+            "hold_contact_lost_entry_step_rate": self._safe_ratio(
+                self._hold_contact_lost_entry_count[env_ids], step_count
+            ).mean(),
             "recovery_entry_step_rate": self._safe_ratio(
                 self._recovery_entry_count[env_ids], step_count
             ).mean(),
@@ -727,6 +877,10 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             ),
             "stance_lost_per_swing_entry": self._safe_ratio(
                 self._stance_lost_entry_count[env_ids].sum(),
+                total_swing_entry_count,
+            ),
+            "hold_contact_lost_per_swing_entry": self._safe_ratio(
+                self._hold_contact_lost_entry_count[env_ids].sum(),
                 total_swing_entry_count,
             ),
             "recovery_per_swing_entry": self._safe_ratio(
@@ -790,6 +944,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             ).mean(),
             "nonfinite_fraction": self._safe_ratio(
                 self._nonfinite_count[env_ids], step_count
+            ).mean(),
+            "reward_curriculum_scale": self._safe_ratio(
+                self._reward_curriculum_scale_sum[env_ids], step_count
             ).mean(),
             # Fraction of all simulation steps where a new safe-target search
             # was performed.

@@ -75,3 +75,15 @@ class FootholdPlannerData:
     # this currently records the flat-provider nominal target after flat
     # reachability constraints, not the raw velocity-only point.
     raw_unclipped_foothold_f: torch.Tensor | None = None
+
+    # Flat-target curriculum and geometry diagnostics. These fields expose how
+    # much of the configured support-foot ellipse is used by the current target
+    # without changing the planner target itself.
+    flat_target_level: torch.Tensor | None = None
+    velocity_lookahead_s: torch.Tensor | None = None
+    target_delta_f: torch.Tensor | None = None
+    curriculum_residual_f: torch.Tensor | None = None
+    curriculum_radius_f: torch.Tensor | None = None
+    curriculum_usage: torch.Tensor | None = None
+    target_ellipse_max_x: torch.Tensor | None = None
+    target_ellipse_usage: torch.Tensor | None = None

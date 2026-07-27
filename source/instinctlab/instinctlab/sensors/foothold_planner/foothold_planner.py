@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -75,6 +76,24 @@ def _compose_world_from_frame(
     return origin_w + _rotate_vector_yaw(vector_f, yaw_w)
 
 
+def _make_required_body_paths_glob(
+    robot_prim_path: str,
+    body_names: Sequence[str],
+) -> str:
+    """Build a PhysX rigid-body glob for only the planner-required bodies."""
+    unique_body_names = sorted(set(body_names))
+    if not unique_body_names:
+        raise ValueError("body_names must not be empty.")
+
+    body_names_regex = (
+        r"("
+        + "|".join(re.escape(name) for name in unique_body_names)
+        + r")"
+    )
+    body_paths_regex = f"{robot_prim_path}/{body_names_regex}"
+    return body_paths_regex.replace(".*", "*")
+
+
 def _adaptive_step_hold_s(
     desired_velocity_f: torch.Tensor,
     *,
@@ -96,6 +115,48 @@ def _adaptive_step_hold_s(
         hold_s,
         min=min_hold_s,
         max=base_hold_s,
+    )
+
+
+def _flat_target_level_from_curriculum_scale(
+    scale: torch.Tensor,
+    *,
+    num_levels: int,
+) -> torch.Tensor:
+    """Map a [0, 1] curriculum scale to a flat-provider target level."""
+    if num_levels <= 0:
+        raise ValueError("num_levels must be positive.")
+
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=1.0, neginf=0.0)
+    scale = scale.clamp(0.0, 1.0)
+    if num_levels == 1:
+        return torch.zeros_like(scale, dtype=torch.long)
+
+    return torch.floor(scale * num_levels).clamp(
+        min=0,
+        max=num_levels - 1,
+    ).to(dtype=torch.long)
+
+
+flat_target_level_from_curriculum_scale = (
+    _flat_target_level_from_curriculum_scale
+)
+
+
+def _derive_flat_provider_config(cfg: object) -> FlatProviderConfig:
+    """Derive flat-target sampler timing from planner gait timing.
+
+    ``flat_target_lookahead_phase`` is a temporary calibration parameter: it
+    means "the expected touchdown phase inside the nominal swing interval".
+    """
+    if cfg.swing_duration_s <= 0.0:
+        raise ValueError("swing_duration_s must be positive.")
+    if not 0.0 < cfg.flat_target_lookahead_phase <= 1.0:
+        raise ValueError("flat_target_lookahead_phase must be in (0, 1].")
+
+    return replace(
+        FlatProviderConfig(),
+        velocity_lookahead_s=cfg.swing_duration_s * cfg.flat_target_lookahead_phase,
     )
 
 
@@ -134,6 +195,86 @@ def _clear_safe_target_event_buffers(
         data.safe_target_candidate_valid_count[env_ids] = 0.0
 
 
+def _clear_foothold_plan_buffers(
+    data: FootholdPlannerData,
+    env_ids: Sequence[int] | torch.Tensor | slice,
+) -> None:
+    """Clear persistent foothold plan buffers for selected environments.
+
+    These fields describe the currently active swing plan.  After an
+    environment reset there is no active plan yet, so leaving the previous
+    target around makes debug markers, observations, and reward terms see a
+    stale foothold while the gait state is already back in HOLD.
+    """
+
+    if getattr(data, "target_foothold_w", None) is not None:
+        data.target_foothold_w[env_ids] = 0.0
+    if getattr(data, "target_foothold_f", None) is not None:
+        data.target_foothold_f[env_ids] = 0.0
+    if getattr(data, "swing_start_pos_w", None) is not None:
+        data.swing_start_pos_w[env_ids] = 0.0
+    if getattr(data, "raw_unclipped_foothold_f", None) is not None:
+        data.raw_unclipped_foothold_f[env_ids] = 0.0
+    if getattr(data, "feasible_velocity_f", None) is not None:
+        data.feasible_velocity_f[env_ids] = 0.0
+    if getattr(data, "target_delta_f", None) is not None:
+        data.target_delta_f[env_ids] = 0.0
+    if getattr(data, "curriculum_residual_f", None) is not None:
+        data.curriculum_residual_f[env_ids] = 0.0
+    if getattr(data, "curriculum_radius_f", None) is not None:
+        data.curriculum_radius_f[env_ids] = 0.0
+    if getattr(data, "curriculum_usage", None) is not None:
+        data.curriculum_usage[env_ids] = 0.0
+    if getattr(data, "target_ellipse_max_x", None) is not None:
+        data.target_ellipse_max_x[env_ids] = 0.0
+    if getattr(data, "target_ellipse_usage", None) is not None:
+        data.target_ellipse_usage[env_ids] = 0.0
+    if getattr(data, "default_swing_apex_height", None) is not None:
+        data.default_swing_apex_height[env_ids] = 0.0
+    if getattr(data, "swing_apex_height", None) is not None:
+        data.swing_apex_height[env_ids] = 0.0
+    if getattr(data, "swing_clearance_safe", None) is not None:
+        data.swing_clearance_safe[env_ids] = True
+    if getattr(data, "swing_clearance_penetration", None) is not None:
+        data.swing_clearance_penetration[env_ids] = 0.0
+
+
+def _apply_startup_hold_gate(
+    *,
+    data: FootholdPlannerData,
+    gait_state: GaitMachineState,
+    selected_env_ids: torch.Tensor,
+    startup_hold_mask: torch.Tensor,
+    reset_hold_s: float,
+) -> None:
+    """Keep selected environments in HOLD during episode-start stabilisation."""
+
+    if not torch.any(startup_hold_mask).item():
+        return
+
+    startup_env_ids = selected_env_ids[startup_hold_mask]
+    gait_state.mode[startup_hold_mask] = GaitState.HOLD
+    gait_state.elapsed_s[startup_hold_mask] = 0.0
+    gait_state.hold_elapsed_s[startup_hold_mask] = 0.0
+    gait_state.hold_required_s[startup_hold_mask] = reset_hold_s
+    gait_state.swing_has_lifted[startup_hold_mask] = False
+    gait_state.recovery_step_pending[startup_hold_mask] = False
+    gait_state.recovery_step_active[startup_hold_mask] = False
+
+    if data.gait_mode is not None:
+        data.gait_mode[startup_env_ids] = GaitState.HOLD
+    if data.phase is not None:
+        data.phase[startup_env_ids] = 0.0
+    if data.touchdown_accepted is not None:
+        data.touchdown_accepted[startup_env_ids] = False
+    if data.swing_has_lifted is not None:
+        data.swing_has_lifted[startup_env_ids] = False
+    if data.recovery_step_active is not None:
+        data.recovery_step_active[startup_env_ids] = False
+
+    _clear_foothold_plan_buffers(data, startup_env_ids)
+
+
 class FootholdPlanner(SensorBase):
     """Foothold planner sensor.
 
@@ -146,18 +287,23 @@ class FootholdPlanner(SensorBase):
 
     def __init__(self, cfg: FootholdPlannerCfg):
         super().__init__(cfg)
+        if cfg.startup_hold_s < 0.0:
+            raise ValueError("startup_hold_s must be non-negative.")
         self._data = FootholdPlannerData()
+        self._flat_target_curriculum_scale: torch.Tensor | None = None
         self._virtual_obstacles: dict[str, object] = {}
         self._sole_geometry = SoleGeometry(
             center_offset_b=torch.tensor(cfg.sole_center_offset_b),
             half_length=cfg.sole_half_length,
             half_width=cfg.sole_half_width,
         )
-        self._flat_provider_cfg = FlatProviderConfig()
+        self._flat_provider_cfg = _derive_flat_provider_config(cfg)
         self._gait_cfg = GaitMachineConfig(
             reset_hold_s=cfg.reset_hold_s,
             swing_s=cfg.swing_duration_s,
             contact_confirm_s=cfg.contact_confirm_s,
+            stance_lost_confirm_s=cfg.stance_lost_confirm_s,
+            hold_contact_lost_confirm_s=cfg.hold_contact_lost_confirm_s,
             early_contact_phase=cfg.early_contact_phase,
             overdue_s=cfg.overdue_s,
             recovery_hold_s=cfg.recovery_hold_s,
@@ -230,6 +376,45 @@ class FootholdPlanner(SensorBase):
 
         self._data.desired_velocity_f[resolved_env_ids] = desired_velocity_f
 
+    def set_flat_target_curriculum_scale(
+        self,
+        scale: float | torch.Tensor,
+        env_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Set the curriculum scale used to choose flat-target sampling level."""
+        if self._flat_target_curriculum_scale is None:
+            return
+
+        if env_ids is None:
+            resolved_env_ids = slice(None)
+            num_selected_envs = self._num_envs
+        elif isinstance(env_ids, slice):
+            resolved_env_ids = env_ids
+            num_selected_envs = torch.arange(
+                self._num_envs,
+                device=self._device,
+            )[env_ids].shape[0]
+        else:
+            resolved_env_ids = env_ids
+            num_selected_envs = len(env_ids)
+
+        scale_tensor = torch.as_tensor(
+            scale,
+            device=self._device,
+            dtype=self._flat_target_curriculum_scale.dtype,
+        )
+        if scale_tensor.ndim == 0:
+            scale_tensor = scale_tensor.expand(num_selected_envs)
+        if scale_tensor.shape != (num_selected_envs,):
+            raise ValueError(
+                "scale must be scalar or match the number of selected environments."
+            )
+
+        self._flat_target_curriculum_scale[resolved_env_ids] = (
+            torch.nan_to_num(scale_tensor, nan=0.0, posinf=1.0, neginf=0.0)
+            .clamp(0.0, 1.0)
+        )
+
     def _feasible_velocity_from_target(
         self,
         target_foothold_f: torch.Tensor,
@@ -265,20 +450,30 @@ class FootholdPlanner(SensorBase):
 
         if env_ids is None:
             reset_env_ids = slice(None)
-            num_reset_envs = self._num_envs
-        elif isinstance(env_ids, slice):
-            reset_env_ids = env_ids
-            num_reset_envs = torch.arange(
+            reset_env_id_tensor = torch.arange(
                 self._num_envs,
                 device=self._device,
-            )[env_ids].shape[0]
+                dtype=torch.long,
+            )
+        elif isinstance(env_ids, slice):
+            reset_env_ids = env_ids
+            reset_env_id_tensor = torch.arange(
+                self._num_envs,
+                device=self._device,
+                dtype=torch.long,
+            )[env_ids]
         else:
             reset_env_ids = env_ids
-            num_reset_envs = len(env_ids)
+            reset_env_id_tensor = torch.as_tensor(
+                env_ids,
+                device=self._device,
+                dtype=torch.long,
+            )
 
         reset_state = initial_gait_state(
-            num_envs=num_reset_envs,
+            num_envs=reset_env_id_tensor.shape[0],
             device=self._device,
+            env_ids=reset_env_id_tensor,
         )
         self._write_gait_state(reset_env_ids, reset_state)
 
@@ -344,6 +539,13 @@ class FootholdPlanner(SensorBase):
             self._data.safe_target_candidate_valid_count[reset_env_ids] = 0.0
         if self._data.raw_unclipped_foothold_f is not None:
             self._data.raw_unclipped_foothold_f[reset_env_ids] = 0.0
+        if self._data.flat_target_level is not None:
+            self._data.flat_target_level[reset_env_ids] = 0
+        if self._data.velocity_lookahead_s is not None:
+            self._data.velocity_lookahead_s[reset_env_ids] = (
+                self._flat_provider_cfg.velocity_lookahead_s
+            )
+        _clear_foothold_plan_buffers(self._data, reset_env_ids)
 
     def _initialize_impl(self):
         super()._initialize_impl()
@@ -370,9 +572,50 @@ class FootholdPlanner(SensorBase):
                 f"'{template_robot_prim_path}'."
             )
 
-        body_names_regex = r"(" + "|".join(re.escape(name) for name in body_names) + r")"
-        body_paths_regex = f"{robot_prim_path}/{body_names_regex}"
-        body_paths_glob = body_paths_regex.replace(".*", "*")
+        left_ids, left_names = string_utils.resolve_matching_names(
+            self.cfg.left_ankle_body_name,
+            body_names,
+            preserve_order=True,
+        )
+        right_ids, right_names = string_utils.resolve_matching_names(
+            self.cfg.right_ankle_body_name,
+            body_names,
+            preserve_order=True,
+        )
+        base_ids, base_names = string_utils.resolve_matching_names(
+            self.cfg.base_body_name,
+            body_names,
+            preserve_order=True,
+        )
+
+        if len(left_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one left ankle body, "
+                f"but found {left_names} for pattern "
+                f"{self.cfg.left_ankle_body_name!r}."
+            )
+        if len(right_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one right ankle body, "
+                f"but found {right_names} for pattern "
+                f"{self.cfg.right_ankle_body_name!r}."
+            )
+        if len(base_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one base body, "
+                f"but found {base_names} for pattern "
+                f"{self.cfg.base_body_name!r}."
+            )
+
+        required_body_names = (
+            body_names[left_ids[0]],
+            body_names[right_ids[0]],
+            body_names[base_ids[0]],
+        )
+        body_paths_glob = _make_required_body_paths_glob(
+            robot_prim_path,
+            required_body_names,
+        )
 
         self._robot_body_physx_view = (
             self._physics_sim_view.create_rigid_body_view(body_paths_glob)
@@ -405,19 +648,22 @@ class FootholdPlanner(SensorBase):
 
         if len(left_ids) != 1:
             raise RuntimeError(
-                "FootholdPlanner expected exactly one left ankle body, "
+                "FootholdPlanner expected exactly one left ankle body in "
+                "the reduced rigid-body PhysX view, "
                 f"but found {left_names} for pattern "
                 f"{self.cfg.left_ankle_body_name!r}."
             )
         if len(right_ids) != 1:
             raise RuntimeError(
-                "FootholdPlanner expected exactly one right ankle body, "
+                "FootholdPlanner expected exactly one right ankle body in "
+                "the reduced rigid-body PhysX view, "
                 f"but found {right_names} for pattern "
                 f"{self.cfg.right_ankle_body_name!r}."
             )
         if len(base_ids) != 1:
             raise RuntimeError(
-                "FootholdPlanner expected exactly one base body, "
+                "FootholdPlanner expected exactly one base body in "
+                "the reduced rigid-body PhysX view, "
                 f"but found {base_names} for pattern "
                 f"{self.cfg.base_body_name!r}."
             )
@@ -440,27 +686,54 @@ class FootholdPlanner(SensorBase):
                 f"bodies under '{template_robot_prim_path}'."
             )
 
-        contact_body_names_regex = (
-            r"("
-            + "|".join(re.escape(name) for name in contact_body_names)
-            + r")"
+        left_contact_ids, left_contact_names = (
+            string_utils.resolve_matching_names(
+                self.cfg.left_contact_body_name,
+                contact_body_names,
+                preserve_order=True,
+            )
         )
-        contact_body_paths_regex = (
-            f"{robot_prim_path}/{contact_body_names_regex}"
+        right_contact_ids, right_contact_names = (
+            string_utils.resolve_matching_names(
+                self.cfg.right_contact_body_name,
+                contact_body_names,
+                preserve_order=True,
+            )
         )
-        contact_body_paths_glob = contact_body_paths_regex.replace(".*", "*")
+
+        if len(left_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one left contact body, "
+                f"but found {left_contact_names} for pattern "
+                f"{self.cfg.left_contact_body_name!r}."
+            )
+        if len(right_contact_ids) != 1:
+            raise RuntimeError(
+                "FootholdPlanner expected exactly one right contact body, "
+                f"but found {right_contact_names} for pattern "
+                f"{self.cfg.right_contact_body_name!r}."
+            )
+
+        required_contact_body_names = (
+            contact_body_names[left_contact_ids[0]],
+            contact_body_names[right_contact_ids[0]],
+        )
+        contact_body_paths_glob = _make_required_body_paths_glob(
+            robot_prim_path,
+            required_contact_body_names,
+        )
 
         self._contact_physx_view = (
             self._physics_sim_view.create_rigid_contact_view(
                 contact_body_paths_glob,
-                max_contact_data_count=len(contact_body_names)
+                max_contact_data_count=len(required_contact_body_names)
                 * self._num_envs,
             )
         )
         self._num_contact_bodies = (
             self._contact_physx_view.sensor_count // self._num_envs
         )
-        self._contact_body_names = contact_body_names
+        self._contact_body_names = sorted(set(required_contact_body_names))
 
         left_contact_ids, left_contact_names = (
             string_utils.resolve_matching_names(
@@ -479,13 +752,15 @@ class FootholdPlanner(SensorBase):
 
         if len(left_contact_ids) != 1:
             raise RuntimeError(
-                "FootholdPlanner expected exactly one left contact body, "
+                "FootholdPlanner expected exactly one left contact body in "
+                "the reduced contact PhysX view, "
                 f"but found {left_contact_names} for pattern "
                 f"{self.cfg.left_contact_body_name!r}."
             )
         if len(right_contact_ids) != 1:
             raise RuntimeError(
-                "FootholdPlanner expected exactly one right contact body, "
+                "FootholdPlanner expected exactly one right contact body in "
+                "the reduced contact PhysX view, "
                 f"but found {right_contact_names} for pattern "
                 f"{self.cfg.right_contact_body_name!r}."
             )
@@ -581,6 +856,43 @@ class FootholdPlanner(SensorBase):
         self._data.raw_unclipped_foothold_f = torch.zeros(
             self._num_envs,
             3,
+            device=self._device,
+        )
+        self._data.flat_target_level = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.long,
+        )
+        self._data.velocity_lookahead_s = torch.full(
+            (self._num_envs,),
+            self._flat_provider_cfg.velocity_lookahead_s,
+            device=self._device,
+        )
+        self._data.target_delta_f = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.curriculum_residual_f = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.curriculum_radius_f = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.curriculum_usage = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.target_ellipse_max_x = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.target_ellipse_usage = torch.zeros(
+            self._num_envs,
             device=self._device,
         )
         self._data.default_swing_reference_pos_w = torch.zeros(
@@ -680,6 +992,10 @@ class FootholdPlanner(SensorBase):
             device=self._device,
             dtype=torch.bool,
         )
+        self._flat_target_curriculum_scale = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
         self._gait_state = initial_gait_state(
             num_envs=self._num_envs,
             device=self._device,
@@ -731,6 +1047,15 @@ class FootholdPlanner(SensorBase):
         self._gait_state.recovery_step_active[env_ids] = (
             state.recovery_step_active
         )
+
+    def _startup_hold_mask(self, selected_env_ids: torch.Tensor) -> torch.Tensor:
+        if self.cfg.startup_hold_s <= 0.0:
+            return torch.zeros(
+                selected_env_ids.shape[0],
+                device=self._device,
+                dtype=torch.bool,
+            )
+        return self._timestamp[selected_env_ids] < self.cfg.startup_hold_s - 1.0e-6
 
     def _update_buffers_impl(self, env_ids: Sequence[int]):
         if env_ids is None:
@@ -908,6 +1233,13 @@ class FootholdPlanner(SensorBase):
             cfg=self._gait_cfg,
             step_hold_s=step_hold_s,
         )
+        _apply_startup_hold_gate(
+            data=self._data,
+            gait_state=gait_state,
+            selected_env_ids=selected_env_ids,
+            startup_hold_mask=self._startup_hold_mask(selected_env_ids),
+            reset_hold_s=self.cfg.reset_hold_s,
+        )
         self._write_gait_state(env_ids, gait_state)
         self._data.swing_has_lifted[env_ids] = gait_state.swing_has_lifted
         self._data.recovery_step_active[env_ids] = (
@@ -938,10 +1270,9 @@ class FootholdPlanner(SensorBase):
             desired_velocity = self._data.desired_velocity_f[
                 new_swing_env_ids
             ]
-            level = torch.zeros(
-                new_swing_count,
-                device=self._device,
-                dtype=torch.long,
+            level = _flat_target_level_from_curriculum_scale(
+                self._flat_target_curriculum_scale[new_swing_env_ids],
+                num_levels=len(self._flat_provider_cfg.curriculum_radius_x),
             )
             stance_xy_f = torch.zeros(
                 new_swing_count,
@@ -965,6 +1296,9 @@ class FootholdPlanner(SensorBase):
 
             target_foothold_f = flat_result.position_f
             feasible_velocity_f = flat_result.feasible_velocity_f
+            curriculum_residual_f = flat_result.curriculum_residual_f.clone()
+            curriculum_radius_f = flat_result.curriculum_radius_f.clone()
+            curriculum_usage = flat_result.curriculum_usage.clone()
             recovery_step = gait_state.recovery_step_active[new_swing]
             if torch.any(recovery_step).item():
                 recovery_target_f = make_recovery_foothold_target(
@@ -991,6 +1325,9 @@ class FootholdPlanner(SensorBase):
                         ),
                     )
                 )
+                curriculum_residual_f[recovery_step] = 0.0
+                curriculum_radius_f[recovery_step] = 0.0
+                curriculum_usage[recovery_step] = 0.0
 
             if self._data.raw_unclipped_foothold_f is not None:
                 self._data.raw_unclipped_foothold_f[new_swing_env_ids] = (
@@ -1128,6 +1465,53 @@ class FootholdPlanner(SensorBase):
 
             self._data.target_foothold_f[new_swing_env_ids] = target_foothold_f
             self._data.feasible_velocity_f[new_swing_env_ids] = feasible_velocity_f
+            if self._data.flat_target_level is not None:
+                self._data.flat_target_level[new_swing_env_ids] = level
+            if self._data.velocity_lookahead_s is not None:
+                self._data.velocity_lookahead_s[new_swing_env_ids] = (
+                    self._flat_provider_cfg.velocity_lookahead_s
+                )
+            target_delta_f = target_foothold_f[:, :2]
+            target_ellipse_max_x = (
+                self._flat_provider_cfg.outer_radius_x
+                * torch.sqrt(
+                    torch.clamp(
+                        1.0
+                        - (
+                            target_delta_f[:, 1]
+                            / self._flat_provider_cfg.outer_radius_y
+                        ).square(),
+                        min=0.0,
+                    )
+                )
+            )
+            target_ellipse_usage = torch.where(
+                target_ellipse_max_x > 1.0e-6,
+                torch.abs(target_delta_f[:, 0]) / target_ellipse_max_x,
+                torch.zeros_like(target_ellipse_max_x),
+            ).clamp(min=0.0)
+            if self._data.target_delta_f is not None:
+                self._data.target_delta_f[new_swing_env_ids] = target_delta_f
+            if self._data.curriculum_residual_f is not None:
+                self._data.curriculum_residual_f[new_swing_env_ids] = (
+                    curriculum_residual_f
+                )
+            if self._data.curriculum_radius_f is not None:
+                self._data.curriculum_radius_f[new_swing_env_ids] = (
+                    curriculum_radius_f
+                )
+            if self._data.curriculum_usage is not None:
+                self._data.curriculum_usage[new_swing_env_ids] = (
+                    curriculum_usage
+                )
+            if self._data.target_ellipse_max_x is not None:
+                self._data.target_ellipse_max_x[new_swing_env_ids] = (
+                    target_ellipse_max_x
+                )
+            if self._data.target_ellipse_usage is not None:
+                self._data.target_ellipse_usage[new_swing_env_ids] = (
+                    target_ellipse_usage
+                )
             self._data.target_foothold_w[new_swing_env_ids] = (
                 _compose_world_from_frame(
                     new_swing_stance_pos_w,
@@ -1139,11 +1523,70 @@ class FootholdPlanner(SensorBase):
                 new_swing_stance_pos_w[:, 2]
             )
 
+            assert self._data.default_swing_apex_height is not None
+            assert self._data.swing_apex_height is not None
+            assert self._data.swing_clearance_safe is not None
+            assert self._data.swing_clearance_penetration is not None
+
+            new_default_apex_height = torch.full(
+                (new_swing_count,),
+                self.cfg.swing_apex_height_m,
+                device=self._device,
+                dtype=target_foothold_f.dtype,
+            )
+            new_apex_height = new_default_apex_height
+            new_clearance_safe = torch.ones(
+                new_swing_count,
+                device=self._device,
+                dtype=torch.bool,
+            )
+            new_clearance_penetration = torch.zeros(
+                new_swing_count,
+                device=self._device,
+                dtype=target_foothold_f.dtype,
+            )
+
+            if self.cfg.enable_edge_clearance:
+                edge_obstacle = self._virtual_obstacles.get("edges")
+                if edge_obstacle is not None:
+                    edge_obstacle = cast("ClearanceObstacle", edge_obstacle)
+                    apex_adjustment = adjust_apex_for_edge_clearance(
+                        obstacle=edge_obstacle,
+                        start=self._data.swing_start_pos_w[new_swing_env_ids],
+                        goal=self._data.target_foothold_w[new_swing_env_ids],
+                        default_apex_height=new_default_apex_height,
+                        max_apex_height=self.cfg.clearance_max_apex_height_m,
+                        apex_step=self.cfg.clearance_apex_step_m,
+                        sample_spacing=self.cfg.clearance_sample_spacing_m,
+                        swing_duration_s=self.cfg.swing_duration_s,
+                    )
+                    new_apex_height = apex_adjustment.apex_height
+                    new_clearance_safe = apex_adjustment.is_safe
+                    new_clearance_penetration = (
+                        apex_adjustment.penetration.max_penetration_depth
+                    )
+
+            self._data.default_swing_apex_height[new_swing_env_ids] = (
+                new_default_apex_height
+            )
+            self._data.swing_apex_height[new_swing_env_ids] = new_apex_height
+            self._data.swing_clearance_safe[new_swing_env_ids] = (
+                new_clearance_safe
+            )
+            self._data.swing_clearance_penetration[new_swing_env_ids] = (
+                new_clearance_penetration
+            )
+
         default_apex_height = torch.full(
             (num_selected_envs,),
             self.cfg.swing_apex_height_m,
             device=self._device,
         )
+
+        assert self._data.default_swing_apex_height is not None
+        assert self._data.swing_apex_height is not None
+        assert self._data.swing_clearance_safe is not None
+        assert self._data.swing_clearance_penetration is not None
 
         default_swing_reference = quintic_swing_reference(
             start=self._data.swing_start_pos_w[env_ids],
@@ -1153,34 +1596,41 @@ class FootholdPlanner(SensorBase):
             swing_duration_s=self.cfg.swing_duration_s,
         )
 
-        apex_height = default_apex_height
+        cached_default_apex_height = self._data.default_swing_apex_height[env_ids]
+        cached_apex_height = self._data.swing_apex_height[env_ids]
+        cached_clearance_safe = self._data.swing_clearance_safe[env_ids]
+        cached_clearance_penetration = self._data.swing_clearance_penetration[
+            env_ids
+        ]
+        default_apex_height = torch.where(
+            active_swing,
+            cached_default_apex_height,
+            default_apex_height,
+        )
+        apex_height = torch.where(
+            active_swing,
+            cached_apex_height,
+            default_apex_height,
+        )
         clearance_safe = torch.ones(
             num_selected_envs,
             device=self._device,
             dtype=torch.bool,
         )
+        clearance_safe = torch.where(
+            active_swing,
+            cached_clearance_safe,
+            clearance_safe,
+        )
         clearance_penetration = torch.zeros(
             num_selected_envs,
             device=self._device,
         )
-
-        if self.cfg.enable_edge_clearance:
-            edge_obstacle = self._virtual_obstacles.get("edges")
-            if edge_obstacle is not None:
-                edge_obstacle = cast("ClearanceObstacle", edge_obstacle)
-                apex_adjustment = adjust_apex_for_edge_clearance(
-                    obstacle=edge_obstacle,
-                    start=self._data.swing_start_pos_w[env_ids],
-                    goal=self._data.target_foothold_w[env_ids],
-                    default_apex_height=default_apex_height,
-                    max_apex_height=self.cfg.clearance_max_apex_height_m,
-                    apex_step=self.cfg.clearance_apex_step_m,
-                    sample_spacing=self.cfg.clearance_sample_spacing_m,
-                    swing_duration_s=self.cfg.swing_duration_s,
-                )
-                apex_height = apex_adjustment.apex_height
-                clearance_safe = apex_adjustment.is_safe
-                clearance_penetration = apex_adjustment.penetration.max_penetration_depth
+        clearance_penetration = torch.where(
+            active_swing,
+            cached_clearance_penetration,
+            clearance_penetration,
+        )
 
         clearance_invalid = active_swing & ~clearance_safe
         if torch.any(clearance_invalid).item():
@@ -1200,11 +1650,6 @@ class FootholdPlanner(SensorBase):
 
         assert self._data.default_swing_reference_pos_w is not None
         assert self._data.swing_reference_pos_w is not None
-        assert self._data.default_swing_apex_height is not None
-        assert self._data.swing_apex_height is not None
-        assert self._data.swing_clearance_safe is not None
-        assert self._data.swing_clearance_penetration is not None
-
         self._data.default_swing_reference_pos_w[env_ids] = default_swing_reference.position
         self._data.swing_reference_pos_w[env_ids] = swing_reference.position
         self._data.default_swing_apex_height[env_ids] = default_apex_height

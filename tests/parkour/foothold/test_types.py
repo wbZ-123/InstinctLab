@@ -18,6 +18,7 @@ def test_gait_state_values_are_stable_for_checkpoints():
     assert GaitState.LEFT_SWING == 1
     assert GaitState.RIGHT_SWING == 2
     assert GaitState.RECOVERY == 8
+    assert GaitState.HOLD_CONTACT_LOST == 9
 
 
 def test_public_package_exports_core_types():

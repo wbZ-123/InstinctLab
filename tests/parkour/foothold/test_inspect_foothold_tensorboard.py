@@ -76,6 +76,9 @@ def test_build_report_marks_core_foothold_metrics():
         "Step_Monitor/foothold_planner_left_swing_stance_lost_per_swing_entry": [0.01, 0.04],
         "Step_Monitor/foothold_planner_right_swing_stance_lost_per_swing_entry": [0.2, 0.35],
         "Step_Monitor/foothold_planner_plan_invalid_mode_fraction": [0.0, 0.0],
+        "Step_Monitor/foothold_planner_hold_contact_lost_fraction": [0.0, 0.01],
+        "Step_Monitor/foothold_planner_hold_contact_lost_entry_step_rate": [0.0, 0.005],
+        "Step_Monitor/foothold_planner_hold_contact_lost_per_swing_entry": [0.05, 0.35],
         "Step_Monitor/foothold_planner_recovery_fraction": [0.01, 0.02],
         "Step_Monitor/foothold_planner_recovery_step_fraction": [0.0, 0.01],
         "Step_Monitor/foothold_planner_recovery_step_entry_step_rate": [0.0, 0.005],
@@ -104,6 +107,12 @@ def test_build_report_marks_core_foothold_metrics():
     assert by_name["foothold_planner_left_swing_stance_lost_per_swing_entry"].status == "OK"
     assert by_name["foothold_planner_right_swing_stance_lost_per_swing_entry"].status == "BAD"
     assert by_name["foothold_planner_plan_invalid_mode_fraction"].status == "OK"
+    assert by_name["foothold_planner_hold_contact_lost_fraction"].status == "BAD"
+    assert (
+        by_name["foothold_planner_hold_contact_lost_entry_step_rate"].status
+        == "INFO"
+    )
+    assert by_name["foothold_planner_hold_contact_lost_per_swing_entry"].status == "BAD"
     assert by_name["foothold_planner_recovery_fraction"].status == "OK"
     assert by_name["foothold_planner_recovery_step_fraction"].status == "INFO"
     assert (

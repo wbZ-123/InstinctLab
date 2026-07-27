@@ -10,6 +10,8 @@ class GaitMachineConfig:
     reset_hold_s: float = 0.40
     swing_s: float = 0.32
     contact_confirm_s: float = 0.04
+    stance_lost_confirm_s: float = 0.10
+    hold_contact_lost_confirm_s: float = 0.10
     early_contact_phase: float = 0.65
     overdue_s: float = 0.12
     recovery_hold_s: float = 0.20
@@ -20,6 +22,8 @@ class GaitMachineConfig:
             self.reset_hold_s,
             self.swing_s,
             self.contact_confirm_s,
+            self.stance_lost_confirm_s,
+            self.hold_contact_lost_confirm_s,
             self.overdue_s,
             self.recovery_hold_s,
             self.step_hold_s,
@@ -61,7 +65,19 @@ class GaitMachineState:
 def initial_gait_state(
     num_envs: int,
     device: torch.device | str,
+    env_ids: torch.Tensor | None = None,
 ) -> GaitMachineState:
+    if env_ids is None:
+        swing_side_source = torch.arange(
+            num_envs,
+            device=device,
+            dtype=torch.long,
+        )
+    else:
+        swing_side_source = env_ids.to(device=device, dtype=torch.long)
+        if swing_side_source.shape != (num_envs,):
+            raise ValueError("env_ids must match the number of environments.")
+
     return GaitMachineState(
         mode=torch.full(
             (num_envs,),
@@ -69,11 +85,7 @@ def initial_gait_state(
             device=device,
             dtype=torch.long,
         ),
-        swing_side=torch.arange(
-            num_envs,
-            device=device,
-            dtype=torch.long,
-        ).remainder(2),
+        swing_side=swing_side_source.remainder(2),
         elapsed_s=torch.zeros(num_envs, device=device),
         hold_elapsed_s=torch.zeros(num_envs, device=device),
         hold_required_s=torch.full((num_envs,), -1.0, device=device),
@@ -188,6 +200,7 @@ def advance_gait(
         | (state.mode == GaitState.EARLY_CONTACT)
         | (state.mode == GaitState.OVERDUE)
         | (state.mode == GaitState.STANCE_LOST)
+        | (state.mode == GaitState.HOLD_CONTACT_LOST)
     )
     mode[was_failure_reason] = GaitState.RECOVERY
 
@@ -201,6 +214,7 @@ def advance_gait(
     )
     mode[was_recovery] = GaitState.RECOVERY
     mode[recovery_ready] = GaitState.HOLD
+    swing_side[recovery_ready] = 1 - swing_side[recovery_ready]
     elapsed_s[recovery_ready] = 0.0
     hold_required_s[recovery_ready] = cfg.reset_hold_s
     swing_has_lifted[recovery_ready] = False
@@ -241,6 +255,17 @@ def advance_gait(
         & confirmed_hold_contact
         & (hold_elapsed_s >= hold_required_s - 1.0e-6)
     )
+
+    hold_contact_lost = (
+        valid_hold
+        & ~confirmed_hold_contact
+        & (
+            hold_elapsed_s
+            >= hold_required_s + cfg.hold_contact_lost_confirm_s - 1.0e-6
+        )
+    )
+
+    mode[hold_contact_lost] = GaitState.HOLD_CONTACT_LOST
 
     mode[start_swing] = torch.where(
         swing_side[start_swing] == 0,
@@ -328,7 +353,7 @@ def advance_gait(
 
     stance_lost = active_swing & ~accepted_late_touchdown & (
         stance_no_contact_s
-        >= cfg.contact_confirm_s - 1.0e-6
+        >= cfg.stance_lost_confirm_s - 1.0e-6
     )
 
     mode[stance_lost] = GaitState.STANCE_LOST

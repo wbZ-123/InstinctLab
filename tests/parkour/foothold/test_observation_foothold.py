@@ -69,6 +69,32 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
         ),
         phase=torch.tensor([0.25, 0.75]),
         swing_side=torch.tensor([0, 1]),
+        target_foothold_w=torch.tensor(
+            [
+                [1.00, 2.00, 0.10],
+                [3.00, 4.00, 0.20],
+            ]
+        ),
+        swing_reference_pos_w=torch.tensor(
+            [
+                [0.80, 1.90, 0.18],
+                [2.80, 4.10, 0.25],
+            ]
+        ),
+        actual_swing_foot_pos_w=torch.tensor(
+            [
+                [0.70, 1.85, 0.12],
+                [2.90, 4.00, 0.22],
+            ]
+        ),
+        foot_contact=torch.tensor(
+            [
+                [True, False],
+                [False, True],
+            ]
+        ),
+        swing_has_lifted=torch.tensor([False, True]),
+        recovery_step_active=torch.tensor([False, True]),
         default_swing_apex_height=torch.tensor([0.08, 0.08]),
         swing_apex_height=torch.tensor([0.14, 0.08]),
         swing_clearance_safe=torch.tensor([False, True]),
@@ -94,8 +120,24 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
 
     expected = torch.tensor(
         [
-            [0.10, 0.18, 0.00, 0.50, 0.00, 0.10, 0.25, -1.00, 0.14, 0.06, 0.00, 0.02,],
-            [0.08, -0.18, 0.00, 0.40, -0.05, -0.10, 0.75, 1.00, 0.08, 0.00, 1.00, 0.00,],
+            [
+                0.10, 0.18, 0.00,
+                0.50, 0.00, 0.10,
+                0.25, -1.00,
+                0.14, 0.06, 0.00, 0.02,
+                0.10, 0.05, 0.06,
+                0.30, 0.15, -0.02,
+                1.00, 0.00, 0.00,
+            ],
+            [
+                0.08, -0.18, 0.00,
+                0.40, -0.05, -0.10,
+                0.75, 1.00,
+                0.08, 0.00, 1.00, 0.00,
+                -0.10, 0.10, 0.03,
+                0.10, 0.00, -0.02,
+                1.00, 1.00, 1.00,
+            ],
         ]
     )
     torch.testing.assert_close(planner.desired_velocity, command)

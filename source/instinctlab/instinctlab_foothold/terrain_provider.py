@@ -32,6 +32,9 @@ def lift_flat_targets_to_terrain(
         yaw_f=flat_targets.yaw_f,
         normal_f=flat_targets.normal_f,
         feasible_velocity_f=flat_targets.feasible_velocity_f,
+        curriculum_residual_f=flat_targets.curriculum_residual_f,
+        curriculum_radius_f=flat_targets.curriculum_radius_f,
+        curriculum_usage=flat_targets.curriculum_usage,
         valid=flat_targets.valid,
         terrain=terrain_corridor,
     )

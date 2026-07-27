@@ -13,6 +13,7 @@ set -euo pipefail
 #   ./scripts/foothold_train.sh
 #   NUM_ENVS=4 MAX_ITERATIONS=1 RUN_NAME=foothold_reward_tag_check ./scripts/foothold_train.sh
 #   NUM_ENVS=64 MAX_ITERATIONS=500 RUN_NAME=foothold_planner_500it_real ./scripts/foothold_train.sh
+#   SAVE_INTERVAL=2000 RUN_NAME=foothold_checkpoint_2000 ./scripts/foothold_train.sh
 #   FOOTHOLD_DEBUG_EVENT_MAX_COUNT=20 RUN_NAME=foothold_debug ./scripts/foothold_train.sh
 #   DRY_RUN=1 ./scripts/foothold_train.sh
 
@@ -27,6 +28,7 @@ TASK="${TASK:-Instinct-Parkour-Target-Amp-G1-v0}"
 NUM_ENVS="${NUM_ENVS:-64}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-500}"
 RUN_NAME="${RUN_NAME:-foothold_planner}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 export FOOTHOLD_DEBUG_EVENT_PATH="${FOOTHOLD_DEBUG_EVENT_PATH:-${REPO_ROOT}/logs/foothold_debug_events/${RUN_NAME}.jsonl}"
 
 if [[ ! -f "${ISAACLAB_ROOT}/isaaclab.sh" ]]; then
@@ -52,6 +54,7 @@ cmd=(
     --num_envs "${NUM_ENVS}"
     --max_iterations "${MAX_ITERATIONS}"
     --run_name "${RUN_NAME}"
+    --save_interval "${SAVE_INTERVAL}"
     "$@"
 )
 
@@ -60,6 +63,7 @@ echo "[foothold_train] task: ${TASK}"
 echo "[foothold_train] num_envs: ${NUM_ENVS}"
 echo "[foothold_train] max_iterations: ${MAX_ITERATIONS}"
 echo "[foothold_train] run_name: ${RUN_NAME}"
+echo "[foothold_train] save_interval: ${SAVE_INTERVAL}"
 echo "[foothold_train] motion_reference_dir: ${PARKOUR_MOTION_REFERENCE_DIR}"
 echo "[foothold_train] motion_selection_file: ${PARKOUR_MOTION_SELECTION_FILE}"
 echo "[foothold_train] pythonpath_prefix: ${REPO_ROOT}/source/instinctlab"
@@ -69,8 +73,7 @@ echo "[foothold_train] foothold_debug_event_max_count: ${FOOTHOLD_DEBUG_EVENT_MA
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '[foothold_train] command:'
     printf ' %q' "${cmd[@]}"
-    printf '
-'
+    printf '\n'
     exit 0
 fi
 

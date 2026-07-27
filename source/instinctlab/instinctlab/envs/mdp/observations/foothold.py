@@ -45,6 +45,23 @@ def foothold_planner_observation(
         dtype=data.phase.dtype
     ).unsqueeze(-1)
     swing_clearance_penetration = data.swing_clearance_penetration.unsqueeze(-1)
+    reference_error_w = data.swing_reference_pos_w - data.actual_swing_foot_pos_w
+    target_error_w = data.target_foothold_w - data.actual_swing_foot_pos_w
+
+    env_ids = torch.arange(
+        data.foot_contact.shape[0],
+        device=data.foot_contact.device,
+    )
+    swing_side = data.swing_side.long().clamp(0, 1)
+    swing_foot_contact = data.foot_contact[env_ids, swing_side].to(
+        dtype=data.phase.dtype,
+    ).unsqueeze(-1)
+    swing_has_lifted = data.swing_has_lifted.to(
+        dtype=data.phase.dtype,
+    ).unsqueeze(-1)
+    recovery_step_active = data.recovery_step_active.to(
+        dtype=data.phase.dtype,
+    ).unsqueeze(-1)
 
     obs = torch.cat(
         (
@@ -56,6 +73,11 @@ def foothold_planner_observation(
             swing_apex_delta,
             swing_clearance_safe,
             swing_clearance_penetration,
+            reference_error_w,
+            target_error_w,
+            swing_foot_contact,
+            swing_has_lifted,
+            recovery_step_active,
         ),
         dim=-1,
     )

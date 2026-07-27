@@ -39,3 +39,4 @@ class GaitState(IntEnum):
     STANCE_LOST = 6
     PLAN_INVALID = 7
     RECOVERY = 8
+    HOLD_CONTACT_LOST = 9

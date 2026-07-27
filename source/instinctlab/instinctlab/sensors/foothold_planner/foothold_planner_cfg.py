@@ -21,14 +21,23 @@ class FootholdPlannerCfg(SensorBaseCfg):
 
     contact_sensor_name: str = "contact_forces"
 
-    sole_center_offset_b: tuple[float, float, float] = (0.0, 0.0, -0.05)
+    # Active G1 shoe URDF foot-contact envelope relative to ankle_roll_link:
+    # x=[-0.054, 0.132], y=[-0.036, 0.036], bottom z=-0.058.
+    sole_center_offset_b: tuple[float, float, float] = (0.039, 0.0, -0.058)
 
-    sole_half_length: float = 0.12
-    sole_half_width: float = 0.045
+    sole_half_length: float = 0.093
+    sole_half_width: float = 0.036
 
     swing_duration_s: float = 0.32
+    # Episode-start stabilisation window. During this time the foothold planner
+    # stays in HOLD and exposes no active swing/target plan, matching the play
+    # diagnosis where a short zero-action warmup prevented immediate
+    # bad-orientation resets. Set to 0.0 to preserve legacy behaviour.
+    startup_hold_s: float = 0.0
     reset_hold_s: float = 0.40
     contact_confirm_s: float = 0.04
+    stance_lost_confirm_s: float = 0.10
+    hold_contact_lost_confirm_s: float = 0.10
     early_contact_phase: float = 0.65
     overdue_s: float = 0.12
     recovery_hold_s: float = 0.20
@@ -44,6 +53,10 @@ class FootholdPlannerCfg(SensorBaseCfg):
     contact_force_threshold_n: float = 1.0
 
     swing_apex_height_m: float = 0.08
+    # Temporary calibration parameter: expected touchdown phase inside the
+    # nominal swing interval. The flat target velocity lookahead is derived as
+    # ``flat_target_lookahead_phase * swing_duration_s``.
+    flat_target_lookahead_phase: float = 0.8
 
     enable_edge_clearance: bool = True
     clearance_max_apex_height_m: float = 0.30
@@ -63,8 +76,8 @@ class FootholdPlannerCfg(SensorBaseCfg):
         (-1.0, -1.0),
     )
     safe_target_search_margin_m: float = 0.0
-    safe_target_foot_length_m: float = 0.20
-    safe_target_foot_width_m: float = 0.10
+    safe_target_foot_length_m: float = 0.186
+    safe_target_foot_width_m: float = 0.072
     safe_target_foot_grid_num_x: int = 10
     safe_target_foot_grid_num_y: int = 5
 

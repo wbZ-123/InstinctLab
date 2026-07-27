@@ -9,6 +9,10 @@ from instinctlab_foothold.flat_provider import (
 )
 
 
+def test_default_velocity_lookahead_is_short_enough_for_training_curriculum():
+    assert FlatProviderConfig().velocity_lookahead_s == 0.10
+
+
 def test_targets_stay_reachable_and_do_not_cross_legs():
     num_envs = 4096
     cfg = FlatProviderConfig()
@@ -195,6 +199,9 @@ def test_flat_provider_returns_complete_flat_contract():
     assert result.yaw_f.shape == (num_envs,)
     assert result.normal_f.shape == (num_envs, 3)
     assert result.feasible_velocity_f.shape == (num_envs, 3)
+    assert result.curriculum_residual_f.shape == (num_envs, 2)
+    assert result.curriculum_radius_f.shape == (num_envs, 2)
+    assert result.curriculum_usage.shape == (num_envs,)
     assert result.valid.shape == (num_envs,)
     assert result.valid.dtype == torch.bool
 
@@ -214,6 +221,11 @@ def test_flat_provider_returns_complete_flat_contract():
         result.feasible_velocity_f,
         torch.zeros((num_envs, 3)),
     )
+    torch.testing.assert_close(
+        result.curriculum_radius_f,
+        torch.tensor([0.04, 0.02]).expand(num_envs, 2),
+    )
+    assert torch.all(result.curriculum_usage <= 1.0 + 1.0e-6)
 
     assert result.terrain.heights.shape == (num_envs, 8)
     assert result.terrain.confidences.shape == (num_envs, 8)
@@ -265,6 +277,45 @@ def test_yaw_intent_is_limited_by_curriculum_level():
         result.yaw_f,
         torch.tensor([0.0, 0.10, 0.20]),
     )
+
+
+def test_flat_provider_exports_curriculum_residual_radius_and_usage():
+    cfg = FlatProviderConfig(
+        curriculum_radius_x=(0.04, 0.08, 0.12),
+        curriculum_radius_y=(0.02, 0.04, 0.06),
+    )
+    level = torch.tensor([0, 1, 2])
+
+    result = sample_flat_targets(
+        stance_xy=torch.zeros((3, 2)),
+        swing_side=torch.tensor([0, 1, 0]),
+        desired_velocity=torch.zeros((3, 3)),
+        level=level,
+        generator=torch.Generator().manual_seed(7),
+        cfg=cfg,
+    )
+
+    torch.testing.assert_close(
+        result.curriculum_radius_f,
+        torch.tensor(
+            [
+                [0.04, 0.02],
+                [0.08, 0.04],
+                [0.12, 0.06],
+            ]
+        ),
+    )
+    normalized = torch.where(
+        result.curriculum_radius_f > 1.0e-6,
+        torch.abs(result.curriculum_residual_f)
+        / result.curriculum_radius_f,
+        torch.zeros_like(result.curriculum_residual_f),
+    )
+    torch.testing.assert_close(
+        result.curriculum_usage,
+        torch.linalg.norm(normalized, dim=-1),
+    )
+    assert torch.all(result.curriculum_usage <= 1.0 + 1.0e-6)
 
 
 def test_feasible_velocity_matches_the_clipped_plan():
