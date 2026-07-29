@@ -219,7 +219,7 @@ git commit -m "feat: add foothold frame height transform"
 - Later planner task consumes `env.learned_foothold_action_normalized` and
   performs the only meter-valued mapping.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Change `tests/parkour/foothold/test_learned_foothold_action.py` so the action
 term only clamps policy output. It must not contain or apply meter-valued
@@ -240,7 +240,7 @@ def test_normalize_foothold_action_clamps_without_meter_scaling():
     )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -250,7 +250,7 @@ PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" /home/zhangweibo/miniconda3/env
 
 Expected: FAIL because `normalize_foothold_action` does not exist.
 
-- [ ] **Step 3: Implement normalized action storage**
+- [x] **Step 3: Implement normalized action storage**
 
 Change `foothold_actions.py` to:
 
@@ -315,11 +315,11 @@ class LearnedFootholdActionCfg(ActionTermCfg):
     asset_name: str = "robot"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run the same pytest command. Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add source/instinctlab/instinctlab/envs/mdp/actions tests/parkour/foothold/test_learned_foothold_action.py

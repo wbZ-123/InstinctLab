@@ -36,27 +36,22 @@ def _load_foothold_actions_module(monkeypatch):
     return module
 
 
-def test_scale_foothold_action_maps_unit_action_to_local_range(monkeypatch):
+def test_normalize_foothold_action_preserves_values_inside_unit_range(monkeypatch):
     module = _load_foothold_actions_module(monkeypatch)
-    raw = torch.tensor([[-1.0, 0.0], [1.0, 1.0]])
+    raw = torch.tensor([[-1.0, 0.25], [0.5, 1.0]])
 
-    scaled = module.scale_foothold_action(
-        raw,
-        x_range=(-0.05, 0.35),
-        y_range=(-0.22, 0.22),
-    )
+    normalized = module.normalize_foothold_action(raw)
 
-    expected = torch.tensor([[-0.05, 0.0], [0.35, 0.22]])
-    torch.testing.assert_close(scaled, expected)
+    torch.testing.assert_close(normalized, raw)
 
 
-def test_scale_foothold_action_clamps_out_of_range_policy_output(monkeypatch):
+def test_normalize_foothold_action_clamps_without_meter_scaling(monkeypatch):
     module = _load_foothold_actions_module(monkeypatch)
-    raw = torch.tensor([[-2.0, 2.0]])
+    raw = torch.tensor([[-2.0, 0.25], [0.5, 2.0]])
 
-    scaled = module.scale_foothold_action(
-        raw,
-        x_range=(-0.05, 0.35),
-        y_range=(-0.22, 0.22),
+    normalized = module.normalize_foothold_action(raw)
+
+    torch.testing.assert_close(
+        normalized,
+        torch.tensor([[-1.0, 0.25], [0.5, 1.0]]),
     )
-    torch.testing.assert_close(scaled, torch.tensor([[-0.05, 0.22]]))

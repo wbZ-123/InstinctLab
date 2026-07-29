@@ -11,24 +11,14 @@ if TYPE_CHECKING:
     from .action_cfg import LearnedFootholdActionCfg
 
 
-def scale_foothold_action(
-    raw_action: torch.Tensor,
-    *,
-    x_range: tuple[float, float],
-    y_range: tuple[float, float],
-) -> torch.Tensor:
-    """Scale raw unit policy output to support-frame foothold XY coordinates."""
+def normalize_foothold_action(raw_action: torch.Tensor) -> torch.Tensor:
+    """Clamp the policy output without assigning meter-valued semantics."""
 
-    clipped = torch.clamp(raw_action, -1.0, 1.0)
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    x = x_min + 0.5 * (clipped[:, 0] + 1.0) * (x_max - x_min)
-    y = y_min + 0.5 * (clipped[:, 1] + 1.0) * (y_max - y_min)
-    return torch.stack([x, y], dim=-1)
+    return torch.clamp(raw_action, -1.0, 1.0)
 
 
 class LearnedFootholdAction(ActionTerm):
-    """Stores a learned explicit foothold target for event-based planner consumption."""
+    """Stores normalized foothold output for event-based planner consumption."""
 
     cfg: "LearnedFootholdActionCfg"
 
@@ -37,7 +27,7 @@ class LearnedFootholdAction(ActionTerm):
         self._raw_actions = torch.zeros(env.num_envs, 2, device=env.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
         env.learned_foothold_action_raw = self._raw_actions
-        env.learned_foothold_action_f = self._processed_actions
+        env.learned_foothold_action_normalized = self._processed_actions
 
     @property
     def action_dim(self) -> int:
@@ -53,11 +43,7 @@ class LearnedFootholdAction(ActionTerm):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
-        self._processed_actions[:] = scale_foothold_action(
-            actions,
-            x_range=self.cfg.x_range,
-            y_range=self.cfg.y_range,
-        )
+        self._processed_actions[:] = normalize_foothold_action(actions)
 
     def apply_actions(self) -> None:
         return None
