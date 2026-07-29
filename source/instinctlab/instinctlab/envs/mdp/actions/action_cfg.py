@@ -2,8 +2,10 @@ from dataclasses import MISSING
 
 from isaaclab.envs.mdp import JointPositionActionCfg
 from isaaclab.managers import ActionTerm, SceneEntityCfg
+from isaaclab.managers.action_manager import ActionTermCfg
 from isaaclab.utils import configclass
 
+from . import foothold_actions
 from . import joint_actions
 
 
@@ -21,3 +23,19 @@ class ActionOverridenJointPositionActionCfg(JointPositionActionCfg):
 
     override_value: float = 0.0
     """Delay in frames before the action is overridden. Defaults to 0."""
+
+
+@configclass
+class LearnedFootholdActionCfg(ActionTermCfg):
+    """Configuration for learned explicit foothold planner action output."""
+
+    class_type: type[ActionTerm] = foothold_actions.LearnedFootholdAction
+
+    asset_name: str = "robot"
+    """Scene asset used only to satisfy IsaacLab action term initialization."""
+
+    x_range: tuple[float, float] = (-0.05, 0.35)
+    """Support-frame forward foothold output range in meters."""
+
+    y_range: tuple[float, float] = (-0.22, 0.22)
+    """Support-frame lateral foothold output range in meters."""
