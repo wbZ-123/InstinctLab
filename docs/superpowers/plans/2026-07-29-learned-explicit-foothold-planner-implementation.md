@@ -2,23 +2,41 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a learned explicit foothold planner path where the policy outputs final support-frame foothold `x_f, y_f` at planning events, while the existing joint action policy tracks the resulting analytic swing trajectory.
+**Goal:** Add a learned explicit foothold planner path where the policy supplies
+a normalized 2D foothold action, the planner decodes it through the existing
+reachability ellipse into final support-frame `x_f, y_f`, and the existing
+joint action policy tracks the resulting analytic swing trajectory.
 
-**Architecture:** Use IsaacLab's action manager to add a separate 2D high-level foothold action term beside the existing joint-position action term. The foothold planner consumes the learned foothold action only during HOLD/new-swing planning events, converts it through the strict local/world height-query contract, locks the resulting target during SWING, and exposes diagnostics/rewards for training.
+**Architecture:** Use IsaacLab's action manager to add a separate normalized 2D
+high-level foothold action term beside the existing joint-position action term.
+During confirmed double-support HOLD, the foothold planner decodes the current
+action with `FlatProviderConfig.outer_radius_x/y`, converts it through the
+strict local/world height-query contract, and caches the latest valid prepared
+target. At the new-SWING transition it locks that target and ignores later
+high-level outputs until touchdown.
 
 **Tech Stack:** Python, PyTorch tensors, IsaacLab manager-based env/action manager, existing `FootholdPlanner` sensor, existing `instinctlab_foothold` pure planning utilities, pytest.
 
 ## Global Constraints
 
-- High-level learned planner directly outputs final explicit foothold `x_f, y_f` in the support-foot planner frame.
+- The action term stores only normalized `u_x, u_y ∈ [-1, 1]`.
+- The planner maps normalized output into final explicit `x_f, y_f` using the
+  existing `FlatProviderConfig.outer_radius_x/y` reachability ellipse.
+- Do not define an independent learned-action range in meters.
 - Terrain height query always uses world-frame `x_w, y_w`; never local `x_f, y_f` directly.
 - `z_f = z_w - support_foot_z_w`.
-- Learned foothold action is consumed only during HOLD/new-swing preparation and ignored during SWING after the target is locked.
+- Learned foothold action is consumed only while both feet are confirmed in
+  HOLD, with a one-shot new-SWING fallback when no prepared target exists.
+- The accepted target is locked and learned foothold output is ignored during active SWING.
 - Network never predicts terrain height.
 - Danger-cylinder information is training reward/diagnostic only, not policy observation.
 - Existing explicit planner remains available as nominal-prior, debug, and fallback path.
 - Learned planner path must be disabled by default for old checkpoints and existing play commands.
 - No per-step dense candidate enumeration in the learned planner path.
+- The current actor depth-image observation is the learned planner's terrain
+  input; do not add danger-cylinder or mesh internals to actor observations.
+- Replace duplicate local/world final-target composition in `FootholdPlanner`
+  with the shared helpers from `instinctlab_foothold.frame_transform`.
 
 ---
 
@@ -27,7 +45,7 @@
 - Create `source/instinctlab/instinctlab_foothold/frame_transform.py`: pure local/world foothold transform helpers with height-query contract.
 - Modify `source/instinctlab/instinctlab_foothold/__init__.py`: export new transform helpers.
 - Create `tests/parkour/foothold/test_frame_transform.py`: coordinate-system regression tests.
-- Create `source/instinctlab/instinctlab/envs/mdp/actions/foothold_actions.py`: action term storing bounded learned foothold `x_f, y_f`.
+- Create `source/instinctlab/instinctlab/envs/mdp/actions/foothold_actions.py`: action term storing clipped normalized foothold output.
 - Modify `source/instinctlab/instinctlab/envs/mdp/actions/action_cfg.py`: config for learned foothold action term.
 - Modify `source/instinctlab/instinctlab/envs/mdp/actions/__init__.py`: export new action term/config.
 - Create `tests/parkour/foothold/test_learned_foothold_action.py`: action scaling/bounds tests.
@@ -60,7 +78,7 @@
 - Produces: `apply_world_height_to_planner_target(origin_w: torch.Tensor, target_xy_f: torch.Tensor, yaw_w: torch.Tensor, terrain_height_query_w: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]`
 - Later tasks consume these helpers inside `FootholdPlanner`.
 
-- [ ] **Step 1: Write the failing coordinate tests**
+- [x] **Step 1: Write the failing coordinate tests**
 
 Create `tests/parkour/foothold/test_frame_transform.py`:
 
@@ -109,7 +127,7 @@ def test_apply_world_height_queries_world_xy_and_returns_local_z():
     assert valid.tolist() == [True]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -120,7 +138,7 @@ PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" /home/zhangweibo/miniconda3/env
 
 Expected: FAIL with import error for `planner_frame_to_world_xy`.
 
-- [ ] **Step 3: Implement the minimal transform helpers**
+- [x] **Step 3: Implement the minimal transform helpers**
 
 Create `source/instinctlab/instinctlab_foothold/frame_transform.py`:
 
@@ -171,11 +189,11 @@ from .frame_transform import apply_world_height_to_planner_target, planner_frame
 
 and add both names to `__all__`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run the same pytest command. Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add source/instinctlab/instinctlab_foothold/frame_transform.py source/instinctlab/instinctlab_foothold/__init__.py tests/parkour/foothold/test_frame_transform.py
@@ -184,7 +202,7 @@ git commit -m "feat: add foothold frame height transform"
 
 ---
 
-### Task 2: Add a bounded learned foothold action term
+### Task 2: Store a normalized learned foothold action
 
 **Files:**
 - Create: `source/instinctlab/instinctlab/envs/mdp/actions/foothold_actions.py`
@@ -196,42 +214,30 @@ git commit -m "feat: add foothold frame height transform"
 - Produces config: `LearnedFootholdActionCfg`
 - Produces action term: `LearnedFootholdAction`
 - Stores on env:
-  - `env.learned_foothold_action_f: torch.Tensor` with shape `(num_envs, 2)`
   - `env.learned_foothold_action_raw: torch.Tensor` with shape `(num_envs, 2)`
-- Later planner task consumes `env.learned_foothold_action_f`.
+  - `env.learned_foothold_action_normalized: torch.Tensor` with shape `(num_envs, 2)`
+- Later planner task consumes `env.learned_foothold_action_normalized` and
+  performs the only meter-valued mapping.
 
 - [ ] **Step 1: Write failing tests**
 
-Create `tests/parkour/foothold/test_learned_foothold_action.py` with a small fake env and direct term construction. The test should assert raw `[-1, 1]` maps to configured local ranges and left/right y bounds are not applied here; swing-side bounds belong to the planner event consumer.
+Change `tests/parkour/foothold/test_learned_foothold_action.py` so the action
+term only clamps policy output. It must not contain or apply meter-valued
+foothold bounds.
 
 ```python
 import torch
 
-from instinctlab.envs.mdp.actions.foothold_actions import scale_foothold_action
+from instinctlab.envs.mdp.actions.foothold_actions import normalize_foothold_action
 
 
-def test_scale_foothold_action_maps_unit_action_to_local_range():
-    raw = torch.tensor([[-1.0, 0.0], [1.0, 1.0]])
-
-    scaled = scale_foothold_action(
-        raw,
-        x_range=(-0.05, 0.35),
-        y_range=(-0.22, 0.22),
+def test_normalize_foothold_action_clamps_without_meter_scaling():
+    raw = torch.tensor([[-2.0, 0.25], [0.5, 2.0]])
+    normalized = normalize_foothold_action(raw)
+    torch.testing.assert_close(
+        normalized,
+        torch.tensor([[-1.0, 0.25], [0.5, 1.0]]),
     )
-
-    expected = torch.tensor([[-0.05, 0.0], [0.35, 0.22]])
-    torch.testing.assert_close(scaled, expected)
-
-
-def test_scale_foothold_action_clamps_out_of_range_policy_output():
-    raw = torch.tensor([[-2.0, 2.0]])
-
-    scaled = scale_foothold_action(
-        raw,
-        x_range=(-0.05, 0.35),
-        y_range=(-0.22, 0.22),
-    )
-    torch.testing.assert_close(scaled, torch.tensor([[-0.05, 0.22]]))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -242,11 +248,11 @@ Run:
 PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" /home/zhangweibo/miniconda3/envs/hiking/bin/python -m pytest -q tests/parkour/foothold/test_learned_foothold_action.py
 ```
 
-Expected: FAIL because `foothold_actions.py` does not exist.
+Expected: FAIL because `normalize_foothold_action` does not exist.
 
-- [ ] **Step 3: Implement action scaling helper and action term**
+- [ ] **Step 3: Implement normalized action storage**
 
-Create `foothold_actions.py` with:
+Change `foothold_actions.py` to:
 
 ```python
 from __future__ import annotations
@@ -261,13 +267,8 @@ if TYPE_CHECKING:
     from .action_cfg import LearnedFootholdActionCfg
 
 
-def scale_foothold_action(raw_action: torch.Tensor, *, x_range: tuple[float, float], y_range: tuple[float, float]) -> torch.Tensor:
-    clipped = torch.clamp(raw_action, -1.0, 1.0)
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    x = x_min + 0.5 * (clipped[:, 0] + 1.0) * (x_max - x_min)
-    y = y_min + 0.5 * (clipped[:, 1] + 1.0) * (y_max - y_min)
-    return torch.stack([x, y], dim=-1)
+def normalize_foothold_action(raw_action: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(raw_action, -1.0, 1.0)
 
 
 class LearnedFootholdAction(ActionTerm):
@@ -278,7 +279,7 @@ class LearnedFootholdAction(ActionTerm):
         self._raw_actions = torch.zeros(env.num_envs, 2, device=env.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
         env.learned_foothold_action_raw = self._raw_actions
-        env.learned_foothold_action_f = self._processed_actions
+        env.learned_foothold_action_normalized = self._processed_actions
 
     @property
     def action_dim(self) -> int:
@@ -294,7 +295,7 @@ class LearnedFootholdAction(ActionTerm):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
-        self._processed_actions[:] = scale_foothold_action(actions, x_range=self.cfg.x_range, y_range=self.cfg.y_range)
+        self._processed_actions[:] = normalize_foothold_action(actions)
 
     def apply_actions(self) -> None:
         return None
@@ -311,8 +312,7 @@ from . import foothold_actions
 @configclass
 class LearnedFootholdActionCfg(ActionTermCfg):
     class_type: type[ActionTerm] = foothold_actions.LearnedFootholdAction
-    x_range: tuple[float, float] = (-0.05, 0.35)
-    y_range: tuple[float, float] = (-0.22, 0.22)
+    asset_name: str = "robot"
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -323,14 +323,16 @@ Run the same pytest command. Expected: PASS.
 
 ```bash
 git add source/instinctlab/instinctlab/envs/mdp/actions tests/parkour/foothold/test_learned_foothold_action.py
-git commit -m "feat: add learned foothold action term"
+git commit -m "fix: normalize learned foothold action"
 ```
 
 ---
 
-### Task 3: Add learned planner buffers and event-locking logic
+### Task 3: Decode, prepare, and lock learned footholds
 
 **Files:**
+- Create: `source/instinctlab/instinctlab_foothold/learned_target.py`
+- Modify: `source/instinctlab/instinctlab_foothold/__init__.py`
 - Modify: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_cfg.py`
 - Modify: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner_data.py`
 - Modify: `source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py`
@@ -338,11 +340,16 @@ git commit -m "feat: add learned foothold action term"
 - Test: `tests/parkour/foothold/test_learned_foothold_planner.py`
 
 **Interfaces:**
-- Consumes: `env.learned_foothold_action_f` from Task 2.
+- Consumes: `env.learned_foothold_action_normalized` from Task 2.
 - Consumes: `apply_world_height_to_planner_target` from Task 1.
 - Produces data fields:
   - `learned_foothold_enabled`
-  - `learned_foothold_action_f`
+  - `learned_foothold_action_normalized`
+  - `learned_foothold_decoded_f`
+  - `learned_foothold_prepared_f`
+  - `learned_foothold_prepared_w`
+  - `learned_foothold_prepared_valid`
+  - `learned_foothold_locked`
   - `learned_foothold_target_f`
   - `learned_foothold_target_w`
   - `learned_foothold_used`
@@ -359,7 +366,12 @@ from instinctlab.sensors.foothold_planner.foothold_planner_data import FootholdP
 
 def test_foothold_planner_data_has_learned_foothold_fields():
     data = FootholdPlannerData()
-    assert data.learned_foothold_action_f is None
+    assert data.learned_foothold_action_normalized is None
+    assert data.learned_foothold_decoded_f is None
+    assert data.learned_foothold_prepared_f is None
+    assert data.learned_foothold_prepared_w is None
+    assert data.learned_foothold_prepared_valid is None
+    assert data.learned_foothold_locked is None
     assert data.learned_foothold_target_f is None
     assert data.learned_foothold_target_w is None
     assert data.learned_foothold_used is None
@@ -383,10 +395,11 @@ Add to `FootholdPlannerCfg`:
 
 ```python
 enable_learned_foothold: bool = False
-learned_foothold_x_range: tuple[float, float] = (-0.05, 0.35)
-learned_foothold_y_range: tuple[float, float] = (-0.22, 0.22)
 learned_foothold_step_height_limit_m: float = 0.25
 ```
+
+Do not add learned-planner meter-valued x/y bounds. Decode with
+`self._flat_provider_cfg.outer_radius_x/y`.
 
 Add dataclass fields listed above to `FootholdPlannerData`.
 
@@ -394,39 +407,59 @@ Initialize runtime tensors in planner buffer initialization with shapes `(num_en
 
 - [ ] **Step 4: Write event-locking tests**
 
-Create `tests/parkour/foothold/test_learned_foothold_planner.py` with pure helper-level tests. If direct planner construction is too heavy, extract a pure helper in `foothold_planner.py` named `_should_consume_learned_foothold(gait_mode, elapsed_s, enable)` and test it:
+Create `tests/parkour/foothold/test_learned_foothold_planner.py` with pure
+helper-level tests. Put the pure helpers in
+`instinctlab_foothold/learned_target.py` so tests do not require Isaac Sim:
 
 ```python
 import torch
 
-from instinctlab.sensors.foothold_planner.foothold_planner import _should_consume_learned_foothold
-from instinctlab_foothold import GaitState
+from instinctlab_foothold import (
+    decode_normalized_foothold,
+    learned_foothold_event_masks,
+)
 
 
-def test_learned_foothold_is_consumed_only_at_new_swing_or_hold_planning_event():
-    mode = torch.tensor([GaitState.LEFT_SWING, GaitState.LEFT_SWING, GaitState.HOLD])
-    elapsed_s = torch.tensor([0.0, 0.1, 0.0])
-    mask = _should_consume_learned_foothold(mode, elapsed_s, enable=True)
-    assert mask.tolist() == [True, False, True]
+def test_decode_normalized_foothold_uses_shared_reachability_ellipse():
+    normalized = torch.tensor([[1.0, 1.0]])
+    target = decode_normalized_foothold(
+        normalized,
+        radius_x=0.42,
+        radius_y=0.25,
+    )
+    usage = (
+        (target[:, 0] / 0.42).square()
+        + (target[:, 1] / 0.25).square()
+    )
+    torch.testing.assert_close(usage, torch.ones_like(usage))
 
 
-def test_learned_foothold_is_disabled_by_config():
-    mode = torch.tensor([GaitState.LEFT_SWING])
-    elapsed_s = torch.tensor([0.0])
-    mask = _should_consume_learned_foothold(mode, elapsed_s, enable=False)
-    assert mask.tolist() == [False]
+def test_event_masks_prepare_in_confirmed_hold_and_lock_only_on_new_swing():
+    prepare, lock = learned_foothold_event_masks(
+        hold=torch.tensor([True, True, False, False]),
+        both_contacts_confirmed=torch.tensor([True, False, True, True]),
+        new_swing=torch.tensor([False, False, True, False]),
+        enable=True,
+    )
+    assert prepare.tolist() == [True, False, False, False]
+    assert lock.tolist() == [False, False, True, False]
 ```
 
-- [ ] **Step 5: Implement event consumption**
+- [ ] **Step 5: Implement HOLD preparation and SWING locking**
 
-Inside the new-swing planning block, after nominal target generation and before safe-target search/terrain application, if `cfg.enable_learned_foothold` and `env.learned_foothold_action_f` exists:
+During confirmed-contact HOLD, if `cfg.enable_learned_foothold` and
+`env.learned_foothold_action_normalized` exists:
 
 ```python
-learned_xy_f = self._env.learned_foothold_action_f[new_swing_env_ids]
-target_foothold_f, target_foothold_w, terrain_valid = apply_world_height_to_planner_target(
-    origin_w=new_swing_stance_pos_w,
+learned_xy_f = decode_normalized_foothold(
+    self._env.learned_foothold_action_normalized[prepare_env_ids],
+    radius_x=self._flat_provider_cfg.outer_radius_x,
+    radius_y=self._flat_provider_cfg.outer_radius_y,
+)
+prepared_f, prepared_w, terrain_valid = apply_world_height_to_planner_target(
+    origin_w=prepare_stance_pos_w,
     target_xy_f=learned_xy_f,
-    yaw_w=base_yaw_w[new_swing],
+    yaw_w=base_yaw_w[prepare],
     terrain_height_query_w=self._query_target_terrain_height_at_xy_w,
 )
 ```
@@ -434,10 +467,21 @@ target_foothold_f, target_foothold_w, terrain_valid = apply_world_height_to_plan
 Then apply hard gates:
 
 ```python
-height_valid = terrain_valid & (torch.abs(target_foothold_f[:, 2]) <= self.cfg.learned_foothold_step_height_limit_m)
+height_valid = terrain_valid & (
+    torch.abs(prepared_f[:, 2])
+    <= self.cfg.learned_foothold_step_height_limit_m
+)
 ```
 
-Store learned diagnostics. Do not read learned actions again during SWING.
+Store only valid prepared targets. At `new_swing`, use the cached prepared
+target. If none exists, evaluate the current output once through the same
+pipeline. Lock the accepted target and trajectory. Do not read learned actions
+again during active SWING. Clear prepared/locked state after touchdown, reset,
+recovery transition, or plan invalidation.
+
+Replace `_compose_world_from_frame` and `_apply_terrain_height_to_target` uses
+for final target construction with `apply_world_height_to_planner_target`.
+Keep unrelated vector-rotation utilities only where still needed.
 
 - [ ] **Step 6: Run tests**
 
@@ -452,8 +496,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add source/instinctlab/instinctlab/sensors/foothold_planner tests/parkour/foothold/test_foothold_planner_data.py tests/parkour/foothold/test_learned_foothold_planner.py
-git commit -m "feat: consume learned foothold targets at planning events"
+git add source/instinctlab/instinctlab_foothold/learned_target.py source/instinctlab/instinctlab_foothold/__init__.py source/instinctlab/instinctlab/sensors/foothold_planner tests/parkour/foothold/test_foothold_planner_data.py tests/parkour/foothold/test_learned_foothold_planner.py
+git commit -m "feat: prepare and lock learned foothold targets"
 ```
 
 ---
@@ -508,6 +552,9 @@ target error to swing foot
 learned_foothold_used flag
 learned_foothold_height_valid flag
 ```
+
+The actor already receives `depth_image` in `ObservationsCfg.PolicyCfg`.
+Do not add a second terrain patch and do not expose danger-cylinder data.
 
 Do not include candidate counts, danger-cylinder internals, or penetration statistics in policy observation.
 
@@ -638,8 +685,7 @@ In `parkour_env_cfg.py`, add:
 ```python
 def enable_learned_explicit_foothold_planner(self):
     self.actions.learned_foothold = mdp.LearnedFootholdActionCfg(
-        x_range=self.scene.foothold_planner.learned_foothold_x_range,
-        y_range=self.scene.foothold_planner.learned_foothold_y_range,
+        asset_name="robot",
     )
     self.scene.foothold_planner.enable_learned_foothold = True
 ```

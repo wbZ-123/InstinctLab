@@ -52,12 +52,30 @@ final_foothold_y_f
 
 It does not output `dx, dy` as the primary interface. The nominal foothold is provided as an input prior, and a reward term may penalize excessive deviation from that prior, but the semantic output is the final foothold.
 
-The output is bounded before use:
+The policy action term itself stores only a clipped, normalized
+two-dimensional output:
 
 ```text
-x_f: limited to the robot's configured reachable step-length interval
-y_f: limited according to swing side and configured step-width interval
+u_x, u_y ∈ [-1, 1]
 ```
+
+The foothold planner converts this normalized point into final support-frame
+coordinates using the planner's existing kinematic reachability source of
+truth. The first implementation uses `FlatProviderConfig.outer_radius_x` and
+`FlatProviderConfig.outer_radius_y`; it must not introduce a second independent
+set of meter-valued action bounds. The normalized point is radially projected
+into the configured reachability ellipse before scaling:
+
+```text
+u_safe = u / max(1, ||u||)
+x_f = outer_radius_x * u_safe_x
+y_f = outer_radius_y * u_safe_y
+```
+
+Swing-side foot-separation checks and all other hard gates remain in the
+planner. The current outer radii are already listed as requiring kinematic
+calibration in `docs/foothold_parameter_audit.md`; this feature reuses them so
+that later calibration changes one source of truth instead of two.
 
 The network never predicts terrain height directly.
 
@@ -93,28 +111,40 @@ z_f = z_w - support_foot_z_w
 The high-level foothold output is event-triggered, not continuously applied during swing.
 
 ```text
-HOLD / new-swing preparation:
-    read high-level foothold output
-    convert to final 3D foothold
-    generate swing reference
-    cache and lock the final foothold
+HOLD with both feet confirmed:
+    the state machine already identifies the next swing side
+    read the current normalized high-level output
+    decode it with the shared reachability ellipse
+    convert it to a final 3D foothold
+    run hard validity checks
+    cache the latest valid prepared foothold
 
-SWING:
+new-SWING transition:
+    use the prepared foothold if one exists
+    otherwise evaluate the current output once as a transition fallback
+    lock the accepted foothold
+    generate and lock the swing reference
+
+active SWING:
     ignore new high-level foothold outputs
     track the locked foothold and trajectory
 
 TOUCHDOWN / next HOLD:
+    clear the previous prepared/locked state
     evaluate touchdown and prepare the next planning event
 ```
 
-This prevents the target from moving while the swing leg is already trying to track a trajectory.
+The HOLD preparation removes terrain-query and safety-check work from the
+critical swing-transition instant. The SWING lock prevents the target from
+moving while the swing leg is already trying to track a trajectory.
 
 ## Inputs
 
 The learned foothold head can use inputs available in simulation and eventually reproducible on hardware:
 
 - nominal foothold prior in the support-foot planner frame;
-- local terrain representation, initially privileged height map or terrain-derived features;
+- the existing actor depth-image observation, which is reproducible by the
+  planned hardware depth camera;
 - current support-foot and swing-foot positions;
 - swing side;
 - gait mode and phase / planning-event flag;
@@ -122,7 +152,10 @@ The learned foothold head can use inputs available in simulation and eventually 
 - base orientation and velocity;
 - proprioceptive state needed by the existing policy.
 
-Training-time privileged labels/rewards may use simulator-only information, but simulator-only information must not be fed as deployment-time observation.
+The first implementation does not add a second actor height-map observation:
+the current parkour actor already receives the delayed/noised depth image.
+Training-time privileged labels/rewards may use simulator-only information,
+but simulator-only information must not be fed as deployment-time observation.
 
 Allowed training-only privileged signals:
 
@@ -245,16 +278,15 @@ The implementation must include tests for:
 
 - No per-step dense candidate enumeration in the final learned planner path.
 - High-level foothold head forward pass should be lightweight relative to the existing action policy.
-- Terrain height query happens only at planning events, not every simulation step for every possible candidate.
+- Terrain height query may happen during the short HOLD preparation window for
+  the current point only; it must not enumerate dense candidates or run during
+  active SWING.
 - Any rollout-time feature extraction must be benchmarked with 4096 environments before a long training run.
 
-## Open Implementation Choice
+## Chosen Implementation
 
-The preferred first implementation is a separate high-level output head sharing the main policy observation pipeline where practical. It can be implemented either as:
-
-1. an expanded action vector from the current policy; or
-2. a small high-level head attached beside the current action head.
-
-The implementation plan should choose the option that fits the current PPO runner with the smallest stable change.
-
-The design decision is fixed at the behavioral level: the learned planner directly outputs final explicit foothold `x_f, y_f` in the support-foot planner frame.
+The first implementation uses an expanded action vector managed by IsaacLab's
+existing action manager. Two normalized action dimensions are appended beside
+the existing joint-position action dimensions. The planner, rather than the
+action term, performs the shared reachability decoding and produces the final
+explicit foothold `x_f, y_f` in the support-foot planner frame.
