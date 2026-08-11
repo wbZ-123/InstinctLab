@@ -42,6 +42,12 @@ parser.add_argument(
     help="Local rank for distributed training. No need to add manually, it will be set automatically in the script.",
 )
 parser.add_argument("--debug", action="store_true", default=False, help="Enable debug mode.")
+parser.add_argument(
+    "--enable_learned_foothold_planner",
+    action="store_true",
+    default=False,
+    help="Add the learned 2D foothold action and nominal-prior observation.",
+)
 # train.py specific arguments
 parser.add_argument("--cprofile", action="store_true", default=False, help="Enable cProfile.")
 # append Instinct-RL cli arguments
@@ -51,6 +57,7 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 if "LOCAL_RANK" in os.environ:
     args_cli.distributed = True
+cli_args.validate_checkpoint_modes(args_cli)
 
 # always enable cameras to record video
 if args_cli.video:
@@ -69,6 +76,7 @@ import gymnasium as gym
 import torch
 import torch.distributed as dist
 from datetime import datetime
+from math import prod
 
 from instinct_rl.runners import OnPolicyRunner
 
@@ -86,6 +94,13 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
 from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
+from instinctlab.learning import (
+    build_legacy_input_column_map,
+    initialize_runner_from_legacy_checkpoint,
+    learned_foothold_policy_input_expansion,
+    register_event_gated_foothold_algorithm,
+)
+from play_curriculum import attach_foothold_curriculum_checkpoint_metadata
 
 # wait for attach if in debug mode
 if args_cli.debug:
@@ -127,6 +142,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    if args_cli.enable_learned_foothold_planner:
+        if not hasattr(env_cfg, "enable_learned_foothold_planner"):
+            raise RuntimeError(
+                "Selected task does not support the learned foothold planner."
+            )
+        reachability_radii_m = env_cfg.enable_learned_foothold_planner()
+        if not hasattr(agent_cfg, "enable_event_gated_foothold_ppo"):
+            raise RuntimeError(
+                "Selected agent config does not support event-gated "
+                "foothold PPO."
+            )
+        agent_cfg.enable_event_gated_foothold_ppo(
+            reachability_radii_m
+        )
+        register_event_gated_foothold_algorithm()
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -200,15 +230,131 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for instinct-rl
     env = InstinctRlVecEnvWrapper(env)
 
+    if args_cli.enable_learned_foothold_planner:
+        if env.num_actions != 31:
+            raise RuntimeError(
+                "Learned foothold PPO requires 31 actions "
+                f"(29 motor + 2 foothold), got {env.num_actions}."
+            )
+        if env.num_rewards != 2:
+            raise RuntimeError(
+                "Learned foothold PPO requires two reward groups "
+                f"(execution + foothold), got {env.num_rewards}."
+            )
+        foothold_std_m = agent_cfg.algorithm.foothold_initial_std_m
+        foothold_radii_m = (
+            agent_cfg.algorithm.foothold_reachability_radii_m
+        )
+        print(
+            "[INFO]: Learned foothold PPO: "
+            "motor_actions=29 foothold_actions=2"
+        )
+        print(
+            "[INFO]: Learned foothold exploration: "
+            f"x={foothold_std_m[0]:g}m/{foothold_radii_m[0]:g}m="
+            f"{foothold_std_m[0] / foothold_radii_m[0]:.6f} "
+            f"y={foothold_std_m[1]:g}m/{foothold_radii_m[1]:g}m="
+            f"{foothold_std_m[1] / foothold_radii_m[1]:.6f}"
+        )
+        print(
+            "[INFO]: Independent foothold optimizer: "
+            f"lr={agent_cfg.algorithm.foothold_learning_rate:g} "
+            f"desired_kl={agent_cfg.algorithm.foothold_desired_kl:g} "
+            "stop_kl="
+            f"{agent_cfg.algorithm.foothold_desired_kl * agent_cfg.algorithm.foothold_kl_stop_multiplier:g} "
+            f"entropy_coef={agent_cfg.algorithm.foothold_entropy_coef:g} "
+            f"std_bounds_m={agent_cfg.algorithm.foothold_min_std_m}.."
+            f"{agent_cfg.algorithm.foothold_max_std_m}"
+        )
+
     # create runner from instinct-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    attach_foothold_curriculum_checkpoint_metadata(runner, env)
     # # write git state to logs
     runner.add_git_repo_to_log(__file__)
+    if args_cli.initialize_learned_foothold_from:
+        expected_input_expansion = (
+            learned_foothold_policy_input_expansion(
+                nominal_foothold_dim=3,
+            )
+        )
+        actor_critic = runner.alg.actor_critic
+        if actor_critic.critic_encoders is None:
+            raise RuntimeError(
+                "Audited learned-foothold migration requires a critic "
+                "encoder layout."
+            )
+        actor_segments = actor_critic.encoders.output_segment
+        critic_segments = actor_critic.critic_encoders.output_segment
+        actor_input_columns = build_legacy_input_column_map(
+            actor_segments,
+            temporal_appends={},
+            new_components={"nominal_foothold"},
+        )
+        critic_input_columns = build_legacy_input_column_map(
+            critic_segments,
+            temporal_appends={},
+            new_components={"nominal_foothold"},
+        )
+        actor_input_expansion = (
+            sum(prod(shape) for shape in actor_segments.values())
+            - len(actor_input_columns)
+        )
+        critic_input_expansion = (
+            sum(prod(shape) for shape in critic_segments.values())
+            - len(critic_input_columns)
+        )
+        if (
+            actor_input_expansion != expected_input_expansion
+            or critic_input_expansion != expected_input_expansion
+        ):
+            raise RuntimeError(
+                "Learned foothold input expansion does not match the "
+                "configured observation/action histories: "
+                f"expected={expected_input_expansion}, "
+                f"actor={actor_input_expansion}, "
+                f"critic={critic_input_expansion}."
+            )
+        normalized_std = tuple(
+            std_m / radius_m
+            for std_m, radius_m in zip(
+                agent_cfg.algorithm.foothold_initial_std_m,
+                agent_cfg.algorithm.foothold_reachability_radii_m,
+            )
+        )
+        report = initialize_runner_from_legacy_checkpoint(
+            runner,
+            args_cli.initialize_learned_foothold_from,
+            motor_action_dim=agent_cfg.algorithm.motor_action_dim,
+            input_column_maps={
+                "actor": actor_input_columns,
+                "critics.0": critic_input_columns,
+            },
+            foothold_normalized_std=normalized_std,
+        )
+        print(
+            "[INFO]: Initialized learned foothold PPO from legacy "
+            f"checkpoint: {args_cli.initialize_learned_foothold_from}"
+        )
+        print(
+            "[INFO]: Checkpoint migration: "
+            f"policy_input_expansion={actor_input_expansion} "
+            f"source_learning_rate={report.source_learning_rate:g} "
+            f"copied={len(report.copied)} "
+            f"expanded={len(report.expanded)} "
+            f"initialized={len(report.initialized)}"
+        )
     # load the checkpoint
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        loaded_lr = cli_args.sync_runner_learning_rate_after_resume(runner)
+        if loaded_lr is not None:
+            print(
+                "[INFO]: Restored adaptive PPO learning rate from "
+                f"optimizer checkpoint: {loaded_lr:.8g}"
+            )
 
     # dump the configuration into log-directory
     if not ("LOCAL_RANK" in os.environ and dist.get_rank() > 0):

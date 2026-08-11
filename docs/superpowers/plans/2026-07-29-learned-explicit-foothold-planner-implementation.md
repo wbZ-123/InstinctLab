@@ -9,11 +9,15 @@ joint action policy tracks the resulting analytic swing trajectory.
 
 **Architecture:** Use IsaacLab's action manager to add a separate normalized 2D
 high-level foothold action term beside the existing joint-position action term.
-During confirmed double-support HOLD, the foothold planner decodes the current
-action with `FlatProviderConfig.outer_radius_x/y`, converts it through the
-strict local/world height-query contract, and caches the latest valid prepared
-target. At the new-SWING transition it locks that target and ignores later
-high-level outputs until touchdown.
+On entering HOLD, the analytic planner first publishes a cached nominal
+foothold into the learned-only observation.  On the following policy/control
+cycle, the foothold planner decodes the current action with
+`FlatProviderConfig.outer_radius_x/y`, converts it through the strict
+local/world height-query contract, and caches the latest geometrically valid
+prepared target. At the new-SWING transition, privileged training routing uses
+the nominal target when it is danger-safe and the learned target when the
+nominal target is danger-unsafe. It then locks the selected target and ignores
+later high-level outputs until touchdown.
 
 **Tech Stack:** Python, PyTorch tensors, IsaacLab manager-based env/action manager, existing `FootholdPlanner` sensor, existing `instinctlab_foothold` pure planning utilities, pytest.
 
@@ -25,12 +29,28 @@ high-level outputs until touchdown.
 - Do not define an independent learned-action range in meters.
 - Terrain height query always uses world-frame `x_w, y_w`; never local `x_f, y_f` directly.
 - `z_f = z_w - support_foot_z_w`.
+- The analytic nominal foothold is generated and exposed during HOLD at least
+  one policy/control cycle before the corresponding learned action is consumed.
 - Learned foothold action is consumed only while both feet are confirmed in
-  HOLD, with a one-shot new-SWING fallback when no prepared target exists.
+  HOLD.
 - The accepted target is locked and learned foothold output is ignored during active SWING.
 - Network never predicts terrain height.
 - Danger-cylinder information is training reward/diagnostic only, not policy observation.
-- Existing explicit planner remains available as nominal-prior, debug, and fallback path.
+- Geometric hard validity is limited to valid terrain height, the existing
+  `max_foothold_step_height_m`, and the shared reachability ellipse.
+- The continuous safety score uses only sole-perimeter penetration count/ratio
+  and summed penetration depth. Do not add separate support-area or edge-distance
+  scores that duplicate the danger-cylinder representation.
+- Existing explicit planner remains available as nominal-prior, debug, and
+  legacy path.
+- In the initial privileged training route, a danger-safe nominal target is
+  executed unchanged, while a danger-unsafe nominal target selects the learned
+  target if the learned target passes hard geometry.
+- A geometrically valid learned target is executed even when its soft
+  danger-cylinder score is poor, so PPO receives causal experience.
+- Learned mode must not invoke or fall back to the legacy candidate search.
+- Add a nominal-closeness reward for danger-safe nominal events and use the
+  continuous sole-penetration reward for danger-unsafe nominal events.
 - Learned planner path must be disabled by default for old checkpoints and existing play commands.
 - No per-step dense candidate enumeration in the learned planner path.
 - The current actor depth-image observation is the learned planner's terrain
@@ -356,7 +376,7 @@ git commit -m "fix: normalize learned foothold action"
   - `learned_foothold_height_valid`
   - `learned_foothold_safety_valid`
 
-- [ ] **Step 1: Write failing planner data test**
+- [x] **Step 1: Write failing planner data test**
 
 Extend `tests/parkour/foothold/test_foothold_planner_data.py` to assert new fields exist and initialize to `None` by dataclass default.
 
@@ -379,7 +399,7 @@ def test_foothold_planner_data_has_learned_foothold_fields():
     assert data.learned_foothold_safety_valid is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run:
 
@@ -389,23 +409,23 @@ PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" /home/zhangweibo/miniconda3/env
 
 Expected: FAIL because fields do not exist.
 
-- [ ] **Step 3: Add cfg/data fields**
+- [x] **Step 3: Add cfg/data fields**
 
 Add to `FootholdPlannerCfg`:
 
 ```python
 enable_learned_foothold: bool = False
-learned_foothold_step_height_limit_m: float = 0.25
 ```
 
 Do not add learned-planner meter-valued x/y bounds. Decode with
-`self._flat_provider_cfg.outer_radius_x/y`.
+`self._flat_provider_cfg.outer_radius_x/y`. Reuse the existing
+`max_foothold_step_height_m`; do not define a learned-specific duplicate.
 
 Add dataclass fields listed above to `FootholdPlannerData`.
 
 Initialize runtime tensors in planner buffer initialization with shapes `(num_envs, 2)`, `(num_envs, 3)`, or `(num_envs,)`.
 
-- [ ] **Step 4: Write event-locking tests**
+- [x] **Step 4: Write event-locking tests**
 
 Create `tests/parkour/foothold/test_learned_foothold_planner.py` with pure
 helper-level tests. Put the pure helpers in
@@ -469,7 +489,7 @@ Then apply hard gates:
 ```python
 height_valid = terrain_valid & (
     torch.abs(prepared_f[:, 2])
-    <= self.cfg.learned_foothold_step_height_limit_m
+    <= self.cfg.max_foothold_step_height_m
 )
 ```
 

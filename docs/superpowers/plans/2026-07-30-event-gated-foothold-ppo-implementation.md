@@ -643,19 +643,20 @@ git commit -m "feat: wire learned foothold PPO opt in"
 
 Build small fake state dictionaries with:
 
-- input weight expanding from `old_obs` to `old_obs + 3`;
+- input weight expanding by an explicitly supplied policy-input delta;
 - four MoE actor output weights expanding from 29 to 31 rows;
 - `std` expanding from 29 to 31;
-- four critic output weights expanding from one to two rows;
+- legacy `critic.*` parameters mapping to the execution critic
+  `critics.0.*`, while `critics.1.*` remains freshly initialized;
 - one unexpected mismatch.
 
 Assert:
 
 ```python
 assert migrated["actor.experts.0.6.weight"][:29].equal(source_weight)
-assert migrated["critic.experts.0.6.weight"][0].equal(source_critic[0])
+assert migrated["critics.0.experts.0.6.weight"].equal(source_critic)
 assert "actor.experts.0.6.weight[29:31]" in report.initialized
-assert "critic.experts.0.6.weight[1]" in report.initialized
+assert "critics.1.experts.0.6.weight" in report.initialized
 assert report.unexpected == []
 ```
 
@@ -674,18 +675,22 @@ PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" \
 Implement migration against the destination model's initialized state dict.
 Allowed transformations are only:
 
-- append exactly 3 observation columns to first actor/critic/gate input
-  matrices and copy all old columns;
+- expand the first actor/execution-critic input matrices by the exact,
+  audited flattened observation delta. For the current configuration this is
+  exactly `3`: the current nominal-foot coordinates in a dedicated
+  observation term. The legacy foothold history remains unchanged, and the
+  last-action history continues to contain only the 29 motor actions;
 - append exactly 2 rows to every final actor expert weight/bias and copy the
   first 29;
-- append exactly 1 row to every final critic expert weight/bias and copy the
-  execution row;
+- map the legacy single `critic.*` module to `critics.0.*` and retain the
+  initialized `critics.1.*` planning critic;
 - append exactly 2 entries to `std`, copy the first 29, and initialize the last
   two with the physical conversion.
 
 All equal-shape tensors copy exactly. Any other mismatch raises. Load
-discriminator weights strictly. Do not load either optimizer, and start runner
-iteration at zero.
+discriminator weights strictly. Do not load optimizer moments, but initialize
+the fresh actor-critic optimizer with the source checkpoint's saved scalar
+learning rate, and start runner iteration at zero.
 
 - [ ] **Step 4: Wire mutually exclusive CLI modes**
 
@@ -739,7 +744,7 @@ git commit -m "feat: migrate base policy to learned foothold PPO"
 - Inspector reports motor/planner KL, event count, planner projection rate,
   both reward groups, gradient norm, and learning rate.
 
-- [ ] **Step 1: Write failing inspector tests**
+- [x] **Step 1: Write failing inspector tests**
 
 Add scalar fixtures for:
 
@@ -755,7 +760,7 @@ Loss/learning_rate
 
 Assert missing finite-safety or event metrics produce a BAD inspection result.
 
-- [ ] **Step 2: Run inspector tests and verify RED**
+- [x] **Step 2: Run inspector tests and verify RED**
 
 ```bash
 PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" \
@@ -763,13 +768,13 @@ PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" \
   tests/parkour/foothold/test_inspect_foothold_tensorboard.py
 ```
 
-- [ ] **Step 3: Implement inspector and documentation updates**
+- [x] **Step 3: Implement inspector and documentation updates**
 
 Document the `0.05 m` exploration source as the touchdown reward zero-crossing
 and mark it runtime-uncalibrated until the acceptance runs report projection
 statistics.
 
-- [ ] **Step 4: Run the complete foothold unit suite**
+- [x] **Step 4: Run the complete foothold unit suite**
 
 ```bash
 cd /home/zhangweibo/InstinctLab-foothold
@@ -781,13 +786,13 @@ git diff --check
 
 Expected: all tests pass and no whitespace errors.
 
-- [ ] **Step 5: Run learned-disabled compatibility smoke**
+- [x] **Step 5: Run learned-disabled compatibility smoke**
 
 Use 64 environments and 2 iterations without
 `ENABLE_LEARNED_FOOTHOLD_PLANNER`. Confirm 29 actions, one reward, and original
 `WasabiPPO`.
 
-- [ ] **Step 6: Run learned-enabled 64-environment smoke**
+- [x] **Step 6: Run learned-enabled 64-environment smoke**
 
 ```bash
 ENABLE_LEARNED_FOOTHOLD_PLANNER=1 \
@@ -801,7 +806,7 @@ SAVE_INTERVAL=10 \
 Acceptance: 31 actions, two rewards, finite diagnostics, nonzero event count,
 and `model_10.pt`.
 
-- [ ] **Step 7: Run 4096-environment numerical acceptance**
+- [x] **Step 7: Run 4096-environment numerical acceptance**
 
 ```bash
 ENABLE_LEARNED_FOOTHOLD_PLANNER=1 \
@@ -821,7 +826,7 @@ Acceptance:
 - both reward streams are finite;
 - TensorBoard inspector passes.
 
-- [ ] **Step 8: Compare learned-disabled performance**
+- [x] **Step 8: Compare learned-disabled performance**
 
 Run the original 4096-environment 100-iteration baseline under the same GPU
 conditions. Event-gated code must add no learned-planner tensors or material
@@ -837,3 +842,35 @@ git add \
   tests/parkour/foothold/test_inspect_foothold_tensorboard.py
 git commit -m "docs: verify event-gated foothold training"
 ```
+
+#### Runtime acceptance record (2026-07-31)
+
+- Full foothold suite: `284 passed, 1 skipped`.
+- Learned-disabled smoke:
+  - 29 actions (`joint_pos` only);
+  - one reward group;
+  - original `WasabiPPO`;
+  - completed two iterations and wrote `model_2.pt`.
+- Learned-enabled 64-environment smoke:
+  - 31 actions ordered as 29 motor + 2 foothold;
+  - two reward groups;
+  - finite motor/planner KL and nonzero foothold events.
+- The first 4096-environment diagnostic exposed four non-finite planner
+  returns.  Root cause was the edge-cylinder kernel's undefined penetration
+  direction when a sole point lies exactly on a cylinder centerline.  The
+  safety scorer now conservatively converts that undefined penetration to its
+  existing full-penalty depth instead of allowing NaN to enter GAE.
+- Final 4096-environment acceptance reached `model_100.pt` without a finite
+  guard, traceback, or empty event update:
+  - motor KL mean `0.00748`;
+  - foothold KL mean `0.00977`;
+  - foothold event count range `664.75` to `4826.5` per reported update;
+  - execution and planner reward streams remained finite;
+  - stable mean collection time `5.546 s`;
+  - stable mean learning time `1.814 s`;
+  - stable mean total iteration time `7.360 s`.
+- Learned-disabled runtime contains no learned action, observation expansion,
+  second reward, second critic, or event-gated storage.  The learned-enabled
+  collection time remains close to the previously measured clean 4096-env
+  baseline; the expected remaining overhead is concentrated in the second
+  critic and grouped PPO learning phase.

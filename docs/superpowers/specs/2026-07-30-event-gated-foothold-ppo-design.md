@@ -213,7 +213,8 @@ The first validation run initializes from a stable 30000-iteration
 - initialize the foothold-planning critic output independently;
 - initialize weights connected to newly appended nominal-foothold observation
   columns without altering the copied old columns;
-- do not load incompatible optimizer state;
+- do not load incompatible optimizer moments, but recover the stable
+  checkpoint's final scalar learning rate for the fresh optimizer;
 - emit a parameter-by-parameter migration report and fail if an unexpected
   tensor is skipped.
 

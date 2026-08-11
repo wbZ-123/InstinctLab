@@ -4,7 +4,7 @@
 
 **Goal:** Replace the unstable shared 31-output MoE policy with a 29-output motor MoE and an independently optimized two-output foothold MLP while preserving the environment action interface.
 
-**Architecture:** A project-local actor-critic reuses the existing encoded policy observation, sends it normally to the motor MoE, and sends a detached copy to a small foothold MLP. The event-gated PPO owns disjoint motor and foothold optimizers, standard deviations, KL schedules, and gradient clipping; their sampled actions are concatenated only at the environment boundary.
+**Architecture:** A project-local actor-critic sends the existing encoded policy observation normally to the motor MoE. The foothold MLP receives a detached copy plus a lightweight planner-only encoding of the same deployable depth image. The event-gated PPO owns disjoint motor and foothold optimizers, standard deviations, KL schedules, and gradient clipping; their sampled actions are concatenated only at the environment boundary.
 
 **Tech Stack:** Python 3.11, PyTorch, Instinct-RL PPO/WASABI, IsaacLab configuration, pytest.
 
@@ -12,7 +12,8 @@
 
 - Keep learned-disabled parkour on the original 29-action `WasabiPPO` path.
 - Keep the learned environment action ordering as 29 motor values followed by two normalized foothold XY values.
-- Encode the depth observation only once; planner input is detached encoded observation.
+- Keep the original motor depth encoder unchanged and add a small planner-only
+  depth branch owned by the foothold optimizer.
 - Initial foothold exploration remains `0.05 m` per axis.
 - Minimum foothold exploration is the existing `0.02 m` touchdown tolerance; maximum is the existing `0.05 m` initial exploration source.
 - Motor and foothold desired KL both use the existing PPO target `0.01`, but control separate optimizers.
@@ -333,4 +334,3 @@ architecture for long training only when:
 - physical foothold standard deviation remains within `0.02--0.05 m`;
 - no repeated abrupt episode-length collapse appears;
 - collection and learning timings are recorded against the previous baseline.
-

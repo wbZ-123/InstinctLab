@@ -29,6 +29,9 @@ NUM_ENVS="${NUM_ENVS:-64}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-500}"
 RUN_NAME="${RUN_NAME:-foothold_planner}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
+ENABLE_LEARNED_FOOTHOLD_PLANNER="${ENABLE_LEARNED_FOOTHOLD_PLANNER:-0}"
+LEARNED_FOOTHOLD_BASE_CHECKPOINT="${LEARNED_FOOTHOLD_BASE_CHECKPOINT:-}"
+LEARNED_FOOTHOLD_ALGORITHM="WasabiPPO"
 export FOOTHOLD_DEBUG_EVENT_PATH="${FOOTHOLD_DEBUG_EVENT_PATH:-${REPO_ROOT}/logs/foothold_debug_events/${RUN_NAME}.jsonl}"
 
 if [[ ! -f "${ISAACLAB_ROOT}/isaaclab.sh" ]]; then
@@ -58,12 +61,30 @@ cmd=(
     "$@"
 )
 
+if [[ "${ENABLE_LEARNED_FOOTHOLD_PLANNER}" == "1" ]]; then
+    cmd+=(--enable_learned_foothold_planner)
+    LEARNED_FOOTHOLD_ALGORITHM="EventGatedWasabiPPO"
+fi
+if [[ -n "${LEARNED_FOOTHOLD_BASE_CHECKPOINT}" ]]; then
+    if [[ "${ENABLE_LEARNED_FOOTHOLD_PLANNER}" != "1" ]]; then
+        echo "[foothold_train] LEARNED_FOOTHOLD_BASE_CHECKPOINT requires ENABLE_LEARNED_FOOTHOLD_PLANNER=1." >&2
+        exit 1
+    fi
+    cmd+=(
+        --initialize_learned_foothold_from
+        "${LEARNED_FOOTHOLD_BASE_CHECKPOINT}"
+    )
+fi
+
 echo "[foothold_train] repo: ${REPO_ROOT}"
 echo "[foothold_train] task: ${TASK}"
 echo "[foothold_train] num_envs: ${NUM_ENVS}"
 echo "[foothold_train] max_iterations: ${MAX_ITERATIONS}"
 echo "[foothold_train] run_name: ${RUN_NAME}"
 echo "[foothold_train] save_interval: ${SAVE_INTERVAL}"
+echo "[foothold_train] learned_foothold_planner: ${ENABLE_LEARNED_FOOTHOLD_PLANNER}"
+echo "[foothold_train] learned_foothold_algorithm: ${LEARNED_FOOTHOLD_ALGORITHM}"
+echo "[foothold_train] learned_foothold_base_checkpoint: ${LEARNED_FOOTHOLD_BASE_CHECKPOINT:-none}"
 echo "[foothold_train] motion_reference_dir: ${PARKOUR_MOTION_REFERENCE_DIR}"
 echo "[foothold_train] motion_selection_file: ${PARKOUR_MOTION_SELECTION_FILE}"
 echo "[foothold_train] pythonpath_prefix: ${REPO_ROOT}/source/instinctlab"

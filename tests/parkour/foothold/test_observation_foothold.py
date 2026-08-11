@@ -95,6 +95,10 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
         ),
         swing_has_lifted=torch.tensor([False, True]),
         recovery_step_active=torch.tensor([False, True]),
+        stabilization_active=torch.tensor([False, True]),
+        confirmed_foot_contact=torch.tensor(
+            [[True, False], [False, True]]
+        ),
         default_swing_apex_height=torch.tensor([0.08, 0.08]),
         swing_apex_height=torch.tensor([0.14, 0.08]),
         swing_clearance_safe=torch.tensor([False, True]),
@@ -130,15 +134,56 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
                 1.00, 0.00, 0.00,
             ],
             [
-                0.08, -0.18, 0.00,
-                0.40, -0.05, -0.10,
+                0.00, 0.00, 0.00,
+                0.00, 0.00, 0.00,
                 0.75, 1.00,
                 0.08, 0.00, 1.00, 0.00,
-                -0.10, 0.10, 0.03,
-                0.10, 0.00, -0.02,
+                0.00, 0.00, 0.00,
+                0.00, 0.00, 0.00,
                 1.00, 1.00, 1.00,
             ],
         ]
     )
     torch.testing.assert_close(planner.desired_velocity, command)
     torch.testing.assert_close(observation, expected)
+
+
+def test_nominal_foothold_observation_syncs_command_before_sensor_read():
+    foothold = _load_foothold_observation_module()
+
+    planner_data = SimpleNamespace(
+        target_foothold_f=torch.tensor([[0.30, 0.10, 0.02]]),
+        raw_unclipped_foothold_f=torch.tensor([[0.24, 0.08, 0.01]]),
+        feasible_velocity_f=torch.tensor([[0.50, 0.00, 0.00]]),
+        phase=torch.tensor([0.0]),
+        swing_side=torch.tensor([0]),
+        target_foothold_w=torch.tensor([[1.30, 2.10, 0.12]]),
+        swing_reference_pos_w=torch.tensor([[1.00, 2.00, 0.10]]),
+        actual_swing_foot_pos_w=torch.tensor([[1.00, 2.00, 0.10]]),
+        foot_contact=torch.tensor([[True, True]]),
+        swing_has_lifted=torch.tensor([False]),
+        recovery_step_active=torch.tensor([False]),
+        stabilization_active=torch.tensor([False]),
+        confirmed_foot_contact=torch.tensor([[True, True]]),
+        default_swing_apex_height=torch.tensor([0.08]),
+        swing_apex_height=torch.tensor([0.08]),
+        swing_clearance_safe=torch.tensor([True]),
+        swing_clearance_penetration=torch.tensor([0.0]),
+    )
+    command = torch.tensor([[0.50, 0.00, 0.00]])
+    planner = _FakePlanner(planner_data)
+    env = SimpleNamespace(
+        command_manager=_FakeCommandManager(command),
+        scene=SimpleNamespace(sensors={"foothold_planner": planner}),
+    )
+
+    nominal_observation = foothold.nominal_foothold_observation(env)
+    legacy_observation = foothold.foothold_planner_observation(env)
+
+    assert legacy_observation.shape == (1, 21)
+    assert nominal_observation.shape == (1, 3)
+    torch.testing.assert_close(planner.desired_velocity, command)
+    torch.testing.assert_close(
+        nominal_observation,
+        planner_data.raw_unclipped_foothold_f,
+    )

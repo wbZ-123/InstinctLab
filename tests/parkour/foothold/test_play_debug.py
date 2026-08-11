@@ -23,8 +23,9 @@ def _load_play_debug_module():
 
 
 class FakeCommandManager:
-    def __init__(self, command: torch.Tensor):
+    def __init__(self, command: torch.Tensor, term=None):
         self._command = command
+        self._terms = {"base_velocity": term} if term is not None else {}
 
     def get_command(self, name: str) -> torch.Tensor:
         assert name == "base_velocity"
@@ -120,6 +121,20 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
         phase=torch.tensor([0.25]),
         foot_contact=torch.tensor([[True, False]]),
         planner_valid=torch.tensor([True]),
+        learned_foothold_prepared_valid=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_height_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_route_event=torch.tensor([True]),
+        learned_foothold_route_use_nominal=torch.tensor([True]),
+        learned_foothold_route_use_learned=torch.tensor([False]),
+        learned_foothold_route_initial_executable=torch.tensor([True]),
+        learned_foothold_lock_geometric_valid=torch.tensor([True]),
+        target_terrain_valid=torch.tensor([True]),
+        nominal_geometric_valid=torch.tensor([True]),
+        nominal_safety_valid=torch.tensor([True]),
+        swing_clearance_safe=torch.tensor([True]),
         touchdown_accepted=torch.tensor([False]),
         touchdown_swing_contact=torch.tensor([False]),
         touchdown_xy_ok=torch.tensor([True]),
@@ -131,6 +146,10 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
         safe_target_final_valid=torch.tensor([True]),
         safe_target_used_fallback=torch.tensor([False]),
         safe_target_score=torch.tensor([0.0]),
+        safe_target_final_max_penetration_depth=torch.tensor([0.012]),
+        safe_target_candidate_count=torch.tensor([32.0]),
+        safe_target_candidate_obstacle_safe_count=torch.tensor([24.0]),
+        safe_target_candidate_valid_count=torch.tensor([8.0]),
         target_foothold_f=torch.tensor([[0.2, -0.1, 0.0]]),
         target_foothold_w=torch.tensor([[1.0, 2.0, 0.3]]),
         actual_swing_foot_pos_w=torch.tensor([[1.03, 1.96, 0.35]]),
@@ -161,7 +180,16 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
         no_contact_elapsed_s=torch.tensor([[0.10, 0.0]]),
     )
     env = SimpleNamespace(
-        command_manager=FakeCommandManager(torch.tensor([[0.5, 0.0, -0.2]])),
+        command_manager=FakeCommandManager(
+            torch.tensor([[0.5, 0.0, -0.2]]),
+            term=SimpleNamespace(
+                pos_command_w=torch.tensor([[1.3, 2.4, 0.3]]),
+                pos_command_b=torch.tensor([[0.3, 0.4, 0.0]]),
+                max_command_b=torch.tensor([[0.8, 0.0, 1.0]]),
+                is_standing_env=torch.tensor([False]),
+                cfg=SimpleNamespace(target_dis_threshold=0.4),
+            ),
+        ),
         scene=SimpleNamespace(
             sensors={
                 "foothold_planner": SimpleNamespace(
@@ -177,6 +205,13 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     line = module.format_foothold_debug_line(12, payload)
 
     assert payload["command"] == [0.5, 0.0, -0.2]
+    assert payload["env_id"] == 0
+    assert payload["command_target_w"] == [1.3, 2.4, 0.3]
+    assert payload["command_target_b"] == [0.3, 0.4, 0.0]
+    assert payload["command_target_dist_xy"] == 0.5
+    assert payload["command_target_threshold"] == 0.4
+    assert payload["command_max_b"] == [0.8, 0.0, 1.0]
+    assert payload["command_is_standing_env"] is False
     assert payload["gait_mode"] == "LEFT_SWING"
     assert payload["foot_contact"] == [True, False]
     assert payload["touchdown_swing_contact"] is False
@@ -185,6 +220,20 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     assert payload["touchdown_within_tolerance"] is True
     assert payload["swing_has_lifted"] is True
     assert payload["recovery_step_active"] is True
+    assert payload["learned_prepared_valid"] is True
+    assert payload["learned_geometric_valid"] is True
+    assert payload["learned_height_valid"] is True
+    assert payload["learned_safety_valid"] is True
+    assert payload["learned_evaluated"] is True
+    assert payload["route_event"] is True
+    assert payload["route_use_nominal"] is True
+    assert payload["route_use_learned"] is False
+    assert payload["route_executable"] is True
+    assert payload["lock_geometric_valid"] is True
+    assert payload["target_terrain_valid"] is True
+    assert payload["nominal_geometric_valid"] is True
+    assert payload["nominal_safety_valid"] is True
+    assert payload["swing_clearance_safe"] is True
     assert payload["actual_swing_w"] == [1.03, 1.96, 0.35]
     assert payload["actual_stance_w"] == [0.95, 2.2, 0.31]
     assert payload["left_sole_w"] == [0.95, 2.2, 0.31]
@@ -217,9 +266,18 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     assert payload["curriculum_usage"] == 0.41667
     assert payload["target_ellipse_max_x"] == 0.3
     assert payload["target_ellipse_usage"] == 0.75
+    assert payload["safe_target_final_max_penetration_depth"] == 0.012
+    assert payload["safe_target_candidate_count"] == 32.0
+    assert payload["safe_target_candidate_obstacle_safe_count"] == 24.0
+    assert payload["safe_target_candidate_valid_count"] == 8.0
     assert "step=12" in line
+    assert "env_id=0" in line
     assert "mode=LEFT_SWING" in line
     assert "command=[0.5, 0.0, -0.2]" in line
+    assert "command_target_dist_xy=0.5" in line
+    assert "command_target_threshold=0.4" in line
+    assert "command_max_b=[0.8, 0.0, 1.0]" in line
+    assert "command_is_standing=False" in line
     assert "td_contact=False" in line
     assert "td_xy_ok=True" in line
     assert "td_z_ok=True" in line
@@ -234,6 +292,8 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     assert "sole_width_xy_w=0.25298" in line
     assert "planned_width_f=0.1" in line
     assert "target_w=[1.0, 2.0, 0.3]" in line
+    assert "final_penetration=0.012" in line
+    assert "candidate_valid=8.0/32.0" in line
     assert "swing_ref_w=[1.01, 1.99, 0.32]" in line
     assert "swing_start_w=[0.8, 1.7, 0.25]" in line
     assert "ref_xy_err=0.03606" in line
@@ -254,6 +314,14 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     assert "no_contact_elapsed_s=[0.1, 0.0]" in line
     assert "td_xy_err=0.05" in line
     assert "td_z_err=0.05" in line
+
+
+def test_is_foothold_debug_plan_event_detects_safe_search_frame():
+    module = _load_play_debug_module()
+
+    assert module.is_foothold_debug_plan_event({"safe_target_search": True}) is True
+    assert module.is_foothold_debug_plan_event({"safe_target_search": False}) is False
+    assert module.is_foothold_debug_plan_event({"safe_target_search": None}) is False
 
 
 def test_build_foothold_debug_payload_reports_startup_pose_and_action_diagnostics():
@@ -355,16 +423,22 @@ def test_build_foothold_debug_payload_selects_foot_contact_times_by_planner_body
             sensors={
                 "foothold_planner": SimpleNamespace(
                     data=data,
-                    _left_contact_body_id=2,
-                    _right_contact_body_id=3,
+                    _left_contact_body_id=0,
+                    _right_contact_body_id=1,
                     _contact_body_names=[
+                        "left_ankle_roll_link",
+                        "right_ankle_roll_link",
+                    ],
+                ),
+                "contact_forces": SimpleNamespace(
+                    body_names=[
                         "pelvis",
                         "torso",
                         "left_ankle_roll_link",
                         "right_ankle_roll_link",
                     ],
+                    data=contact_data,
                 ),
-                "contact_forces": SimpleNamespace(data=contact_data),
             }
         ),
     )

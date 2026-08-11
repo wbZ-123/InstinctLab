@@ -42,6 +42,9 @@ class MoEPolicyCfg(InstinctRlEncoderMoEActorCriticCfg):
 @configclass
 class AmpAlgoCfg(InstinctRlPpoAlgorithmCfg):
     class_name = "WasabiPPO"
+    # With the legacy single reward this is equivalent to the upstream scalar
+    # default, while making the intended routing explicit.
+    auxiliary_reward_per_env_reward_coefs = [1.0]
     discriminator_kwargs = {
         "hidden_sizes": [1024, 512],
         "nonlinearity": "ReLU",
@@ -83,3 +86,43 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
     empirical_normalization = False
     policy = MoEPolicyCfg()
     algorithm = AmpAlgoCfg()
+
+    def enable_event_gated_foothold_ppo(
+        self, reachability_radii_m: tuple[float, float]
+    ) -> None:
+        """Select sparse high-level PPO while preserving legacy defaults."""
+
+        if (
+            len(reachability_radii_m) != 2
+            or any(radius <= 0.0 for radius in reachability_radii_m)
+        ):
+            raise ValueError(
+                "reachability_radii_m must contain positive XY radii."
+            )
+        self.algorithm.class_name = "EventGatedWasabiPPO"
+        self.policy.class_name = (
+            "instinctlab.learning.independent_foothold_actor_critic:"
+            "IndependentFootholdEncoderMoEActorCritic"
+        )
+        self.policy.motor_action_dim = 29
+        self.policy.foothold_hidden_dims = [128, 64]
+        self.policy.foothold_depth_output_size = 64
+        self.policy.foothold_depth_hidden_channels = 8
+        self.algorithm.auxiliary_reward_per_env_reward_coefs = [1.0, 0.0]
+        self.algorithm.motor_action_dim = 29
+        self.algorithm.execution_reward_index = 0
+        self.algorithm.foothold_reward_index = 1
+        self.algorithm.foothold_initial_std_m = (0.05, 0.05)
+        self.algorithm.foothold_min_std_m = (0.02, 0.02)
+        self.algorithm.foothold_max_std_m = (0.05, 0.05)
+        self.algorithm.foothold_reachability_radii_m = reachability_radii_m
+        # A 64-env acceptance run showed that one 1e-3 planner update creates
+        # O(1e2) KL.  Start at PPO's existing adaptive lower bound; the
+        # independent KL schedule can increase it when updates are genuinely
+        # small instead of accepting one destructive bootstrap step.
+        self.algorithm.foothold_learning_rate = 1.0e-5
+        self.algorithm.foothold_desired_kl = self.algorithm.desired_kl
+        self.algorithm.foothold_kl_stop_multiplier = 2.0
+        self.algorithm.foothold_surrogate_coef = 1.0
+        self.algorithm.foothold_entropy_coef = self.algorithm.entropy_coef
+        self.algorithm.full_finite_check_interval = 100

@@ -3,8 +3,46 @@ from __future__ import annotations
 import torch
 
 
+FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH = 100.0
+FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH = 700.0
+
+
 def _foothold_planner_data(env, sensor_name: str):
     return env.scene.sensors[sensor_name].data
+
+
+def foothold_stabilization_mask(data) -> torch.Tensor:
+    """Return environments in which foothold rewards must be paused.
+
+    Contact-adaptive recovery exposes ``stabilization_active``.  The legacy
+    field is kept as a fallback so older checkpoints/configurations retain
+    their previous behavior when the new planner mode is disabled.
+    """
+
+    active = getattr(data, "stabilization_active", None)
+    if active is None:
+        active = getattr(data, "recovery_step_active", None)
+    if active is None:
+        gait_mode = getattr(data, "gait_mode", None)
+        if gait_mode is not None:
+            return torch.zeros_like(gait_mode, dtype=torch.bool)
+        # Small unit-test fakes and legacy event-only data may not expose a
+        # gait mode; infer the batch shape from the first tensor field.
+        for value in vars(data).values():
+            if torch.is_tensor(value):
+                return torch.zeros_like(value, dtype=torch.bool)
+        raise AttributeError(
+            "Planner data must expose gait_mode or a tensor batch field."
+        )
+    return active.bool()
+
+
+def _mask_stabilization_reward(value: torch.Tensor, data) -> torch.Tensor:
+    return torch.where(
+        foothold_stabilization_mask(data),
+        torch.zeros_like(value),
+        value,
+    )
 
 
 def _sync_desired_velocity_command(
@@ -49,6 +87,82 @@ def _is_late_touchdown_tracking_mode(
     min_phase: float,
 ) -> torch.Tensor:
     return _is_valid_swing_mode(data) & (data.phase >= min_phase)
+
+
+def learned_foothold_safety_event_reward(
+    env,
+    sensor_name: str = "foothold_planner",
+) -> torch.Tensor:
+    """Reward only control steps where a learned foothold was evaluated."""
+
+    data = _foothold_planner_data(env, sensor_name)
+    event = data.learned_foothold_evaluated.bool()
+    geometric_valid = data.learned_foothold_geometric_valid.bool()
+    score = data.learned_foothold_safety_score.clamp(-1.0, 1.0)
+    score = torch.where(
+        geometric_valid,
+        score,
+        torch.full_like(score, -1.0),
+    )
+    return _mask_stabilization_reward(
+        torch.where(event, score, torch.zeros_like(score)),
+        data,
+    )
+
+
+def learned_foothold_planning_event_reward(
+    env,
+    sensor_name: str = "foothold_planner",
+    reachability_radius_x: float = 0.42,
+    reachability_radius_y: float = 0.25,
+) -> torch.Tensor:
+    """Train identity on safe nominals and safety correction otherwise.
+
+    Nominal deviation is normalized by the same reachability ellipse that
+    decodes the learned action, avoiding a second arbitrary meter threshold.
+    """
+
+    if reachability_radius_x <= 0.0 or reachability_radius_y <= 0.0:
+        raise ValueError("reachability radii must be positive.")
+
+    data = _foothold_planner_data(env, sensor_name)
+    event = data.learned_foothold_evaluated.bool()
+    nominal_safe = (
+        data.nominal_geometric_valid.bool()
+        & data.nominal_safety_valid.bool()
+    )
+
+    delta_xy = (
+        data.learned_foothold_decoded_f[:, :2]
+        - data.raw_unclipped_foothold_f[:, :2]
+    )
+    radii = delta_xy.new_tensor(
+        (reachability_radius_x, reachability_radius_y)
+    )
+    normalized_distance = torch.linalg.vector_norm(
+        delta_xy / radii,
+        dim=-1,
+    ).clamp(0.0, 1.0)
+    nominal_closeness = 1.0 - 2.0 * normalized_distance
+
+    learned_safety = data.learned_foothold_safety_score.clamp(
+        -1.0,
+        1.0,
+    )
+    learned_safety = torch.where(
+        data.learned_foothold_geometric_valid.bool(),
+        learned_safety,
+        torch.full_like(learned_safety, -1.0),
+    )
+    score = torch.where(
+        nominal_safe,
+        nominal_closeness,
+        learned_safety,
+    )
+    return _mask_stabilization_reward(
+        torch.where(event, score, torch.zeros_like(score)),
+        data,
+    )
 
 
 def _swing_foot_contact(data) -> torch.Tensor:
@@ -229,8 +343,8 @@ def _apply_reward_curriculum(
     curriculum_end_scale: float,
     curriculum_ramp_steps: int,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -275,8 +389,8 @@ def foothold_reward_curriculum_scale(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -332,8 +446,8 @@ def foothold_swing_tracking_exp(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -349,7 +463,10 @@ def foothold_swing_tracking_exp(
     reward = torch.exp(-squared_error / (std * std))
 
     return _apply_reward_curriculum(
-        reward * _is_valid_swing_mode(data).float(),
+        _mask_stabilization_reward(
+            reward * _is_valid_swing_mode(data).float(),
+            data,
+        ),
         env,
         curriculum_start_scale,
         curriculum_end_scale,
@@ -375,8 +492,8 @@ def foothold_touchdown_tracking_exp(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -392,7 +509,10 @@ def foothold_touchdown_tracking_exp(
     reward = torch.exp(-squared_error / (std * std))
 
     return _apply_reward_curriculum(
-        reward * _is_valid_touchdown_confirm_mode(data).float(),
+        _mask_stabilization_reward(
+            reward * _is_valid_touchdown_confirm_mode(data).float(),
+            data,
+        ),
         env,
         curriculum_start_scale,
         curriculum_end_scale,
@@ -417,8 +537,8 @@ def foothold_swing_contact_indicator(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -464,8 +584,8 @@ def foothold_no_liftoff_indicator(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -511,8 +631,8 @@ def foothold_swing_height_under_error_l1(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -560,8 +680,8 @@ def foothold_swing_xy_error_l2(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -614,8 +734,8 @@ def foothold_touchdown_xy_error_l2(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -678,8 +798,8 @@ def foothold_touchdown_z_error_l1(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -799,8 +919,8 @@ def foothold_gait_anomaly_indicator(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -843,8 +963,8 @@ def foothold_recovery_indicator(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -889,8 +1009,8 @@ def foothold_clearance_penetration_l1(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,
@@ -925,8 +1045,8 @@ def foothold_touchdown_accepted_indicator(
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
     curriculum_gate: str | None = None,
-    curriculum_min_episode_length: float = 100.0,
-    curriculum_full_episode_length: float = 300.0,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
     curriculum_velocity_command_name: str = "base_velocity",
     curriculum_velocity_std: float = 0.5,
     curriculum_velocity_start_score: float = 0.4,

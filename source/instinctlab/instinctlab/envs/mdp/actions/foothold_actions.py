@@ -26,6 +26,10 @@ class LearnedFootholdAction(ActionTerm):
         super().__init__(cfg, env)
         self._raw_actions = torch.zeros(env.num_envs, 2, device=env.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
+        planner_data = env.scene[cfg.sensor_name].data
+        planner_data.learned_foothold_action_normalized = (
+            self._processed_actions
+        )
         env.learned_foothold_action_raw = self._raw_actions
         env.learned_foothold_action_normalized = self._processed_actions
 

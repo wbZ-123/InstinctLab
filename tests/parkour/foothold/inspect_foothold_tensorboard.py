@@ -86,7 +86,26 @@ CORE_TAGS = (
     "Step_Monitor/foothold_planner_left_touchdown_confirm_step_rate",
     "Step_Monitor/foothold_planner_right_touchdown_confirm_step_rate",
     "Step_Monitor/foothold_planner_reward_curriculum_scale",
+    "Train/motor_kl",
+    "Train/foothold_kl",
+    "Train/foothold_event_count",
+    "Train/foothold_raw_out_of_range_fraction",
+    "Train/foothold_ellipse_projection_fraction",
+    "Train/grad_norm",
+    "Train/motor_grad_norm",
+    "Train/foothold_grad_norm",
+    "Train/motor_learning_rate",
+    "Train/foothold_learning_rate",
+    "Train/foothold_kl_skip_count",
+    "Train/foothold_std_normalized_x",
+    "Train/foothold_std_normalized_y",
+    "Train/foothold_std_m_x",
+    "Train/foothold_std_m_y",
+    "Loss/learning_rate",
+    "Train/mean_reward_0",
+    "Train/mean_reward_1",
     "Train/time/mean_reward_0",
+    "Train/time/mean_reward_1",
     "Train/time/mean_episode_length",
 )
 
@@ -237,9 +256,12 @@ def _status_for(
         return "BAD"
     if name in {
         "mean_reward_0",
+        "mean_reward_1",
         "mean_episode_length",
     }:
         return "OK" if summary.trend == "up" else "WATCH"
+    if name == "foothold_event_count":
+        return "OK" if summary.max > 0.0 else "BAD"
     return "INFO"
 
 

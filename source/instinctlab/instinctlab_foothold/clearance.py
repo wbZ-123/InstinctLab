@@ -26,6 +26,9 @@ class SwingCenterlinePenetration:
     collides: torch.Tensor
     max_penetration_depth: torch.Tensor
     deepest_phase: torch.Tensor
+    start_penetration_depth: torch.Tensor
+    goal_penetration_depth: torch.Tensor
+    start_escape_safe: torch.Tensor
 
 @dataclass(frozen=True)
 class ApexAdjustmentResult:
@@ -114,8 +117,11 @@ def check_swing_centerline_penetration(
     min_samples: int = 9,
     max_samples: int = 25,
     penetration_tolerance: float = 0.0,
+    foot_points_xy: torch.Tensor | None = None,
+    foot_yaw_w: torch.Tensor | float | None = None,
+    allow_start_penetration_escape: bool = False,
 ) -> SwingCenterlinePenetration:
-    """Check whether a swing-foot centerline penetrates a virtual obstacle."""
+    """Check a sampled swing path, optionally sweeping the sole perimeter."""
     path_points, phases = sample_swing_centerline(
         start=start,
         goal=goal,
@@ -127,20 +133,112 @@ def check_swing_centerline_penetration(
     )
     num_envs, num_samples, _ = path_points.shape
 
-    penetration_offset = obstacle.get_points_penetration_offset(
-        path_points.reshape(-1, 3)
-    ).reshape(num_envs, num_samples, 3)
+    if foot_points_xy is None:
+        query_points = path_points.unsqueeze(2)
+    else:
+        sole_points_xy = torch.as_tensor(
+            foot_points_xy,
+            device=path_points.device,
+            dtype=path_points.dtype,
+        )
+        if sole_points_xy.ndim != 2 or sole_points_xy.shape[-1] != 2:
+            raise ValueError("foot_points_xy must have shape (num_points, 2).")
+        if sole_points_xy.shape[0] == 0:
+            raise ValueError("foot_points_xy must contain at least one point.")
 
-    penetration_offset = torch.nan_to_num(
-        penetration_offset,
+        yaw = torch.as_tensor(
+            0.0 if foot_yaw_w is None else foot_yaw_w,
+            device=path_points.device,
+            dtype=path_points.dtype,
+        )
+        if yaw.ndim == 0:
+            yaw = yaw.expand(num_envs)
+        if yaw.shape != (num_envs,):
+            raise ValueError(
+                "foot_yaw_w must be scalar or have shape (num_envs,)."
+            )
+
+        cos_yaw = torch.cos(yaw).unsqueeze(-1)
+        sin_yaw = torch.sin(yaw).unsqueeze(-1)
+        point_x = sole_points_xy[:, 0].unsqueeze(0)
+        point_y = sole_points_xy[:, 1].unsqueeze(0)
+        rotated_xy = torch.stack(
+            (
+                cos_yaw * point_x - sin_yaw * point_y,
+                sin_yaw * point_x + cos_yaw * point_y,
+            ),
+            dim=-1,
+        )
+        sole_offsets_w = torch.cat(
+            (
+                rotated_xy,
+                torch.zeros(
+                    num_envs,
+                    sole_points_xy.shape[0],
+                    1,
+                    device=path_points.device,
+                    dtype=path_points.dtype,
+                ),
+            ),
+            dim=-1,
+        )
+        query_points = (
+            path_points.unsqueeze(2) + sole_offsets_w.unsqueeze(1)
+        )
+
+    num_foot_points = query_points.shape[2]
+    raw_penetration_offset = obstacle.get_points_penetration_offset(
+        query_points.reshape(-1, 3)
+    ).reshape(num_envs, num_samples, num_foot_points, 3)
+    nonfinite = ~torch.isfinite(raw_penetration_offset).all(dim=-1)
+    finite_penetration_offset = torch.nan_to_num(
+        raw_penetration_offset,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-
-    penetration_depth = torch.linalg.norm(penetration_offset, dim=-1)
+    point_penetration_depth = torch.linalg.norm(
+        finite_penetration_offset,
+        dim=-1,
+    )
+    point_penetration_depth = torch.where(
+        nonfinite,
+        torch.full_like(point_penetration_depth, float("inf")),
+        point_penetration_depth,
+    )
+    penetration_depth, deepest_point_indices = torch.max(
+        point_penetration_depth,
+        dim=-1,
+    )
+    penetration_offset = torch.gather(
+        finite_penetration_offset,
+        dim=2,
+        index=deepest_point_indices[..., None, None].expand(-1, -1, 1, 3),
+    ).squeeze(2)
     max_penetration_depth, deepest_indices = torch.max(penetration_depth, dim=-1)
+    start_penetration_depth = penetration_depth[:, 0]
+    goal_penetration_depth = penetration_depth[:, -1]
+    start_penetrates = start_penetration_depth > penetration_tolerance
+    start_escape_safe = torch.zeros_like(start_penetrates)
+    if num_samples > 1:
+        post_start_depth = penetration_depth[:, 1:]
+        leaves_initial_region = torch.min(post_start_depth, dim=-1).values <= (
+            penetration_tolerance + 1.0e-6
+        )
+        does_not_deepen = torch.max(post_start_depth, dim=-1).values <= (
+            start_penetration_depth + penetration_tolerance + 1.0e-6
+        )
+        start_escape_safe = start_penetrates & leaves_initial_region & does_not_deepen
+
     collides = max_penetration_depth > penetration_tolerance
+    if allow_start_penetration_escape:
+        # A virtual edge cylinder may already overlap the swing foot at
+        # liftoff.  That overlap cannot be removed by raising the apex.  Allow
+        # the trajectory only when it exits the initial overlap, never gets
+        # deeper, and finishes clear; endpoint and mid-swing collisions remain
+        # hard failures.
+        escaped_start = start_escape_safe & (goal_penetration_depth <= penetration_tolerance)
+        collides = torch.where(start_penetrates, ~escaped_start, collides)
     deepest_phase = phases[deepest_indices]
 
     return SwingCenterlinePenetration(
@@ -151,6 +249,9 @@ def check_swing_centerline_penetration(
         collides=collides,
         max_penetration_depth=max_penetration_depth,
         deepest_phase=deepest_phase,
+        start_penetration_depth=start_penetration_depth,
+        goal_penetration_depth=goal_penetration_depth,
+        start_escape_safe=start_escape_safe,
     )
 
 def adjust_apex_for_edge_clearance(
@@ -165,8 +266,11 @@ def adjust_apex_for_edge_clearance(
     min_samples: int = 9,
     max_samples: int = 25,
     penetration_tolerance: float = 0.0,
+    foot_points_xy: torch.Tensor | None = None,
+    foot_yaw_w: torch.Tensor | float | None = None,
+    allow_start_penetration_escape: bool = False,
 ) -> ApexAdjustmentResult:
-    """Increase swing apex until the centerline clears edge obstacles."""
+    """Increase swing apex until the sampled sole sweep clears edge obstacles."""
     if apex_step <= 0.0:
         raise ValueError("apex_step must be positive.")
 
@@ -201,6 +305,9 @@ def adjust_apex_for_edge_clearance(
         min_samples=min_samples,
         max_samples=max_samples,
         penetration_tolerance=penetration_tolerance,
+        foot_points_xy=foot_points_xy,
+        foot_yaw_w=foot_yaw_w,
+        allow_start_penetration_escape=allow_start_penetration_escape,
     )
 
     for iteration in range(max_iterations):
@@ -214,6 +321,9 @@ def adjust_apex_for_edge_clearance(
             min_samples=min_samples,
             max_samples=max_samples,
             penetration_tolerance=penetration_tolerance,
+            foot_points_xy=foot_points_xy,
+            foot_yaw_w=foot_yaw_w,
+            allow_start_penetration_escape=allow_start_penetration_escape,
         )
 
         unsafe = penetration.collides

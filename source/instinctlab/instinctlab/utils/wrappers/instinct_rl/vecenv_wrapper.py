@@ -12,6 +12,21 @@ if TYPE_CHECKING:
 from instinct_rl.env import VecEnv
 
 
+def foothold_event_from_generation(
+    before: torch.Tensor,
+    after: torch.Tensor,
+) -> torch.Tensor:
+    """Return transitions that consumed a learned foothold action."""
+
+    if before.shape != after.shape:
+        raise ValueError("Foothold event generation shapes must match.")
+    if before.dtype != torch.int64 or after.dtype != torch.int64:
+        raise TypeError("Foothold event generation must use torch.int64.")
+    if torch.any(after < before):
+        raise ValueError("Foothold event generation must be monotonic.")
+    return after != before
+
+
 class InstinctRlVecEnvWrapper(VecEnv):
     """Wraps around Isaac Lab environment for Instinct-RL library
     Reference:
@@ -161,7 +176,24 @@ class InstinctRlVecEnvWrapper(VecEnv):
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         # record step information
+        foothold_generation_before = (
+            self._read_learned_foothold_event_generation()
+        )
         obs_pack, rew, terminated, truncated, extras = self.env.step(actions)
+        if foothold_generation_before is not None:
+            foothold_generation_after = (
+                self._read_learned_foothold_event_generation()
+            )
+            if foothold_generation_after is None:
+                raise RuntimeError(
+                    "Learned foothold action disappeared during env.step()."
+                )
+            extras["learned_foothold_action_event"] = (
+                foothold_event_from_generation(
+                    foothold_generation_before,
+                    foothold_generation_after,
+                )
+            )
         obs_pack = self._flatten_all_obs_groups(obs_pack)
         # compute dones for compatibility with RSL-RL
         dones = (terminated | truncated).to(dtype=torch.long)
@@ -218,6 +250,50 @@ class InstinctRlVecEnvWrapper(VecEnv):
     """
     Internal Helpers
     """
+
+    def _read_learned_foothold_event_generation(
+        self,
+    ) -> torch.Tensor | None:
+        """Read the causal event counter without triggering a sensor update."""
+
+        action_manager = getattr(self.unwrapped, "action_manager", None)
+        if (
+            action_manager is None
+            or "learned_foothold" not in action_manager.active_terms
+        ):
+            return None
+
+        scene = getattr(self.unwrapped, "scene", None)
+        sensors = getattr(scene, "sensors", {})
+        planner = sensors.get("foothold_planner")
+        if planner is None:
+            raise RuntimeError(
+                "Learned foothold action requires the foothold_planner sensor."
+            )
+
+        # Access the backing data directly. The public ``data`` property may
+        # update the sensor and would consume the previous action before the
+        # environment processes the current one.
+        planner_data = getattr(planner, "_data", None)
+        generation = getattr(
+            planner_data,
+            "learned_foothold_event_generation",
+            None,
+        )
+        if generation is None:
+            raise RuntimeError(
+                "Foothold planner event generation is not initialized."
+            )
+        if generation.shape != (self.num_envs,):
+            raise ValueError(
+                "Foothold planner event generation must have shape "
+                f"({self.num_envs},), got {tuple(generation.shape)}."
+            )
+        if generation.dtype != torch.int64:
+            raise TypeError(
+                "Foothold planner event generation must use torch.int64."
+            )
+        return generation.clone()
 
     def _flatten_obs_group(self, obs_group: dict) -> torch.Tensor:
         """Considering observation_manager only concatenate observation terms of 1D tensors,

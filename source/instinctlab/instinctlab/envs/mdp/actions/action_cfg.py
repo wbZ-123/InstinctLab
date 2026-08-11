@@ -33,3 +33,6 @@ class LearnedFootholdActionCfg(ActionTermCfg):
 
     asset_name: str = "robot"
     """Scene asset used only to satisfy IsaacLab action term initialization."""
+
+    sensor_name: str = "foothold_planner"
+    """Planner sensor whose normalized action buffer receives this output."""

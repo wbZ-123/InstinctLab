@@ -54,7 +54,13 @@ parser.add_argument(
     "--print_foothold_debug_env_id",
     type=int,
     default=0,
-    help="Environment id to print when --print_foothold_debug is enabled.",
+    help="Primary environment id for reset debug and foothold marker visualization.",
+)
+parser.add_argument(
+    "--print_foothold_debug_env_ids",
+    type=str,
+    default=None,
+    help="Comma-separated environment ids to print, or 'all'. Defaults to --print_foothold_debug_env_id.",
 )
 parser.add_argument(
     "--print_foothold_marker_debug",
@@ -67,6 +73,12 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Print foothold debug only when an anomaly or large tracking error is detected.",
+)
+parser.add_argument(
+    "--print_foothold_debug_on_plan_event",
+    action="store_true",
+    default=False,
+    help="Also print foothold debug on fresh safe-target planning events, even between interval samples.",
 )
 parser.add_argument(
     "--print_reset_debug",
@@ -94,6 +106,36 @@ parser.add_argument(
         "Override foothold reward/planner curriculum scale during play. "
         "Use 1.0 to evaluate a checkpoint with the full foothold planner curriculum."
     ),
+)
+parser.add_argument(
+    "--foothold_step_terrain_only",
+    action="store_true",
+    default=False,
+    help="Restrict play terrain generation to a single stair terrain family for foothold diagnostics.",
+)
+parser.add_argument(
+    "--foothold_step_terrain_name",
+    type=str,
+    default="pyramid_stairs",
+    help="Stair terrain family used by --foothold_step_terrain_only.",
+)
+parser.add_argument(
+    "--foothold_step_terrain_rows",
+    type=int,
+    default=1,
+    help="Number of terrain rows when --foothold_step_terrain_only is enabled.",
+)
+parser.add_argument(
+    "--foothold_step_terrain_cols",
+    type=int,
+    default=1,
+    help="Number of terrain columns when --foothold_step_terrain_only is enabled.",
+)
+parser.add_argument(
+    "--foothold_step_terrain_level",
+    type=int,
+    default=0,
+    help="Initial terrain level when --foothold_step_terrain_only is enabled.",
 )
 # append Instinct-RL cli arguments
 cli_args.add_instinct_rl_args(parser)
@@ -126,6 +168,7 @@ from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 
 # Import extensions to set up environment tasks
 import instinctlab.tasks  # noqa: F401
+from instinctlab.learning import register_event_gated_foothold_algorithm
 from instinctlab.managers.reward_manager import MultiRewardManager
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
 from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
@@ -136,9 +179,19 @@ from play_debug import (
     format_foothold_debug_line,
     format_reset_debug_line,
     is_foothold_debug_anomaly,
+    is_foothold_debug_plan_event,
 )
-from play_curriculum import load_recorded_foothold_curriculum_scale
+from play_curriculum import (
+    load_checkpoint_foothold_curriculum_scale,
+    load_recorded_foothold_curriculum_scale,
+)
 from play_foothold_viz import make_foothold_visualizer, update_foothold_visualizer
+from play_learned_config import configure_learned_foothold_play
+from play_step_terrain import (
+    configure_free_world_camera,
+    configure_step_only_terrain,
+    configure_step_play_visuals,
+)
 
 
 def _read_nested_config_value(obj, path):
@@ -201,12 +254,47 @@ if args_cli.debug:
     debugpy.breakpoint()
 
 
+
+
+def _parse_debug_env_ids(value: str | None, fallback_env_id: int, num_envs: int) -> list[int]:
+    if value is None or value == "":
+        env_ids = [int(fallback_env_id)]
+    elif value.strip().lower() in {"all", "*"}:
+        env_ids = list(range(int(num_envs)))
+    else:
+        env_ids = [int(item.strip()) for item in value.split(",") if item.strip()]
+    unique_env_ids = []
+    for env_id in env_ids:
+        if env_id < 0 or env_id >= num_envs:
+            raise ValueError(f"Debug env id {env_id} is outside [0, {num_envs}).")
+        if env_id not in unique_env_ids:
+            unique_env_ids.append(env_id)
+    return unique_env_ids
+
+
 def main():
     """Play with Instinct-RL agent."""
     # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    if args_cli.foothold_step_terrain_only:
+        step_terrain_summary = configure_step_only_terrain(
+            env_cfg,
+            terrain_name=args_cli.foothold_step_terrain_name,
+            num_rows=args_cli.foothold_step_terrain_rows,
+            num_cols=args_cli.foothold_step_terrain_cols,
+            terrain_level=args_cli.foothold_step_terrain_level,
+            disable_perlin=True,
+        )
+        print(f"[PLAY_TERRAIN] step_only={step_terrain_summary}", flush=True)
+        visual_summary = configure_step_play_visuals(
+            env_cfg,
+            leg_volume_debug_vis=False,
+        )
+        print(f"[PLAY_VISUALS] step_diagnostic={visual_summary}", flush=True)
+        camera_summary = configure_free_world_camera(env_cfg)
+        print(f"[PLAY_CAMERA] free_world={camera_summary}", flush=True)
     agent_cfg: InstinctRlOnPolicyRunnerCfg = cli_args.parse_instinct_rl_cfg(args_cli.task, args_cli)
 
     # specify directory for logging experiments
@@ -232,12 +320,35 @@ def main():
         log_dir = os.path.join(log_root_path, agent_cfg.run_name + "_play")
         resume_path = "model_scratch.pt"
 
+    saved_agent_cfg = None
+    saved_agent_cfg_path = os.path.join(log_dir, "params", "agent.yaml")
+    if agent_cfg.load_run is not None and os.path.isfile(saved_agent_cfg_path):
+        saved_agent_cfg = load_yaml(saved_agent_cfg_path)
+
     if args_cli.env_cfg:
         env_cfg = load_yaml(os.path.join(log_dir, "params", "env.yaml"))
-    if args_cli.agent_cfg:
-        agent_cfg_dict = load_yaml(os.path.join(log_dir, "params", "agent.yaml"))
+
+    learned_foothold_play = False
+    if saved_agent_cfg is not None:
+        learned_foothold_play = configure_learned_foothold_play(
+            env_cfg,
+            saved_agent_cfg,
+            register_algorithm=register_event_gated_foothold_algorithm,
+        )
+    if args_cli.agent_cfg or learned_foothold_play:
+        if saved_agent_cfg is None:
+            raise RuntimeError(
+                f"Saved agent configuration not found: {saved_agent_cfg_path}"
+            )
+        agent_cfg_dict = saved_agent_cfg
     else:
         agent_cfg_dict = agent_cfg.to_dict()
+    print(
+        "[PLAY_CONFIG] learned_foothold="
+        f"{learned_foothold_play} agent_config_source="
+        f"{'checkpoint' if args_cli.agent_cfg or learned_foothold_play else 'task_default'}",
+        flush=True,
+    )
 
     if args_cli.print_foothold_debug or args_cli.print_reset_debug:
         _print_foothold_config_debug("before_gym_make", env_cfg)
@@ -265,6 +376,16 @@ def main():
         env = multi_agent_to_single_agent(env)
 
     foothold_curriculum_scale_override = args_cli.foothold_curriculum_scale_override
+    if foothold_curriculum_scale_override is None and agent_cfg.load_run is not None:
+        foothold_curriculum_scale_override = (
+            load_checkpoint_foothold_curriculum_scale(resume_path)
+        )
+        if foothold_curriculum_scale_override is not None:
+            print(
+                "[INFO] Loaded foothold reward/planner curriculum scale "
+                "from checkpoint for play: "
+                f"{foothold_curriculum_scale_override:.3f}"
+            )
     if foothold_curriculum_scale_override is None and agent_cfg.load_run is not None:
         foothold_curriculum_scale_override = load_recorded_foothold_curriculum_scale(
             log_dir,
@@ -326,6 +447,13 @@ def main():
 
     # reset environment
     obs, _ = env.get_observations()
+    debug_env_ids = _parse_debug_env_ids(
+        args_cli.print_foothold_debug_env_ids,
+        args_cli.print_foothold_debug_env_id,
+        env.unwrapped.num_envs,
+    )
+    if args_cli.print_foothold_debug or args_cli.print_reset_debug:
+        print(f"[PLAY_DEBUG_CONFIG] debug_env_ids={debug_env_ids}", flush=True)
     timestep = 0
     foothold_visualizer = make_foothold_visualizer() if args_cli.show_foothold_debug_markers else None
     foothold_visualizer_warned = False
@@ -337,12 +465,13 @@ def main():
             # agent stepping
             actions = policy(obs)
             zero_act_active = timestep < args_cli.zero_act_until
-            reset_debug_snapshot = None
+            reset_debug_snapshots = {}
             if args_cli.print_reset_debug:
-                reset_debug_snapshot = capture_reset_debug_snapshot(
-                    env.unwrapped,
-                    env_id=args_cli.print_foothold_debug_env_id,
-                )
+                for env_id in debug_env_ids:
+                    reset_debug_snapshots[env_id] = capture_reset_debug_snapshot(
+                        env.unwrapped,
+                        env_id=env_id,
+                    )
             if zero_act_active:
                 actions[:] = 0.0
             # env stepping
@@ -350,55 +479,62 @@ def main():
         timestep += 1
 
         if args_cli.print_reset_debug:
-            env_id = args_cli.print_foothold_debug_env_id
-            try:
-                done = bool(dones[env_id].detach().cpu().item())
-            except Exception:
-                done = False
-            if done:
+            for env_id in debug_env_ids:
                 try:
-                    payload = build_reset_debug_payload(
-                        env.unwrapped,
-                        env_id=env_id,
-                        done=done,
-                        pre_step_snapshot=reset_debug_snapshot,
-                    )
-                    print(format_reset_debug_line(timestep, payload), flush=True)
-                except Exception as exc:
-                    print(
-                        f"[RESET_DEBUG] step={timestep} failed to read reset debug: {exc}",
-                        flush=True,
-                    )
+                    done = bool(dones[env_id].detach().cpu().item())
+                except Exception:
+                    done = False
+                if done:
+                    try:
+                        payload = build_reset_debug_payload(
+                            env.unwrapped,
+                            env_id=env_id,
+                            done=done,
+                            pre_step_snapshot=reset_debug_snapshots.get(env_id),
+                        )
+                        print(format_reset_debug_line(timestep, payload), flush=True)
+                    except Exception as exc:
+                        print(
+                            f"[RESET_DEBUG] step={timestep} env_id={env_id} failed to read reset debug: {exc}",
+                            flush=True,
+                        )
 
         print_foothold_debug = (
             args_cli.print_foothold_debug or args_cli.print_foothold_marker_debug
         )
-        if print_foothold_debug and (
-            timestep % max(args_cli.print_foothold_debug_interval, 1) == 0
-        ):
-            try:
-                payload = build_foothold_debug_payload(
-                    env.unwrapped,
-                    env_id=args_cli.print_foothold_debug_env_id,
-                    actions=actions,
-                )
-                if (
-                    not args_cli.print_foothold_debug_on_anomaly
-                    or is_foothold_debug_anomaly(payload)
-                ):
+        if print_foothold_debug:
+            interval_tick = timestep % max(args_cli.print_foothold_debug_interval, 1) == 0
+            for env_id in debug_env_ids:
+                try:
+                    payload = build_foothold_debug_payload(
+                        env.unwrapped,
+                        env_id=env_id,
+                        actions=actions,
+                    )
+                    plan_event = (
+                        args_cli.print_foothold_debug_on_plan_event
+                        and is_foothold_debug_plan_event(payload)
+                    )
+                    if not interval_tick and not plan_event:
+                        continue
+                    if (
+                        not args_cli.print_foothold_debug_on_anomaly
+                        or is_foothold_debug_anomaly(payload)
+                        or plan_event
+                    ):
+                        print(
+                            format_foothold_debug_line(
+                                timestep,
+                                payload,
+                                zero_act_active=zero_act_active,
+                            ),
+                            flush=True,
+                        )
+                except Exception as exc:
                     print(
-                        format_foothold_debug_line(
-                            timestep,
-                            payload,
-                            zero_act_active=zero_act_active,
-                        ),
+                        f"[PLAY_DEBUG] step={timestep} env_id={env_id} failed to read foothold debug: {exc}",
                         flush=True,
                     )
-            except Exception as exc:
-                print(
-                    f"[PLAY_DEBUG] step={timestep} failed to read foothold debug: {exc}",
-                    flush=True,
-                )
 
         if foothold_visualizer is not None:
             try:

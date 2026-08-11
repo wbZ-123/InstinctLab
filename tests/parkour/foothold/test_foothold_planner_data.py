@@ -49,6 +49,10 @@ def _load_foothold_planner_module():
             "instinctlab_foothold",
             fromlist=["GaitState"],
         ).GaitState,
+        "clear_learned_foothold_buffers": __import__(
+            "instinctlab_foothold",
+            fromlist=["clear_learned_foothold_buffers"],
+        ).clear_learned_foothold_buffers,
         "FootholdPlannerData": object,
         "Sequence": Sequence,
         "replace": __import__("dataclasses", fromlist=["replace"]).replace,
@@ -65,11 +69,15 @@ def _load_foothold_planner_module():
         ],
         apply_startup_hold_gate=namespace["_apply_startup_hold_gate"],
         yaw_from_quat_wxyz=namespace["_yaw_from_quat_wxyz"],
+        select_sole_roles=namespace["_select_sole_roles"],
         compose_world_from_frame=namespace["_compose_world_from_frame"],
         make_required_body_paths_glob=namespace[
             "_make_required_body_paths_glob"
         ],
         adaptive_step_hold_s=namespace["_adaptive_step_hold_s"],
+        apply_terrain_height_to_target=namespace[
+            "_apply_terrain_height_to_target"
+        ],
         derive_flat_provider_config=namespace["_derive_flat_provider_config"],
         flat_target_level_from_curriculum_scale=namespace[
             "flat_target_level_from_curriculum_scale"
@@ -106,6 +114,32 @@ def test_foothold_planner_data_exposes_touchdown_debug_fields():
     }.issubset(field_names)
 
 
+def test_foothold_planner_data_exposes_monotonic_learned_action_event_generation():
+    FootholdPlannerData = _load_foothold_planner_data_class()
+
+    assert (
+        "learned_foothold_event_generation"
+        in FootholdPlannerData.__annotations__
+    )
+
+
+def test_foothold_planner_data_exposes_authoritative_hold_frame():
+    FootholdPlannerData = _load_foothold_planner_data_class()
+    field_names = {field.name for field in fields(FootholdPlannerData)}
+
+    assert {
+        "nominal_frame_origin_w",
+        "nominal_frame_yaw_w",
+    }.issubset(field_names)
+
+
+def test_foothold_planner_data_exposes_safe_target_penetration_debug_field():
+    FootholdPlannerData = _load_foothold_planner_data_class()
+    field_names = {field.name for field in fields(FootholdPlannerData)}
+
+    assert "safe_target_final_max_penetration_depth" in field_names
+
+
 def test_clear_safe_target_event_buffers_resets_event_fields_only_for_selected_envs():
     module = _load_foothold_planner_module()
     data = SimpleNamespace(
@@ -120,6 +154,7 @@ def test_clear_safe_target_event_buffers_resets_event_fields_only_for_selected_e
         safe_target_candidate_inside_ellipse_count=torch.ones(3) * 24.0,
         safe_target_candidate_obstacle_safe_count=torch.ones(3) * 8.0,
         safe_target_candidate_valid_count=torch.ones(3) * 4.0,
+        safe_target_final_max_penetration_depth=torch.ones(3) * 0.03,
     )
 
     module.clear_safe_target_event_buffers(data, torch.tensor([0, 2]))
@@ -163,6 +198,10 @@ def test_clear_safe_target_event_buffers_resets_event_fields_only_for_selected_e
     torch.testing.assert_close(
         data.safe_target_candidate_valid_count,
         torch.tensor([0.0, 4.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        data.safe_target_final_max_penetration_depth,
+        torch.tensor([0.0, 0.03, 0.0]),
     )
 
 
@@ -248,7 +287,10 @@ def test_startup_hold_gate_freezes_selected_envs_and_clears_active_plans():
 
     torch.testing.assert_close(gait_state.mode, torch.tensor([0, 2, 0]))
     torch.testing.assert_close(gait_state.elapsed_s, torch.tensor([0.0, 0.20, 0.0]))
-    torch.testing.assert_close(gait_state.hold_elapsed_s, torch.tensor([0.0, 0.20, 0.0]))
+    torch.testing.assert_close(
+        gait_state.hold_elapsed_s,
+        torch.tensor([0.12, 0.20, 0.04]),
+    )
     torch.testing.assert_close(gait_state.hold_required_s, torch.tensor([0.4, 0.04, 0.4]))
     torch.testing.assert_close(gait_state.swing_has_lifted, torch.tensor([False, True, False]))
     torch.testing.assert_close(gait_state.recovery_step_pending, torch.tensor([False, True, False]))
@@ -265,6 +307,60 @@ def test_startup_hold_gate_freezes_selected_envs_and_clears_active_plans():
     torch.testing.assert_close(data.touchdown_accepted, torch.tensor([False, True, False]))
     torch.testing.assert_close(data.swing_has_lifted, torch.tensor([False, True, False]))
     torch.testing.assert_close(data.recovery_step_active, torch.tensor([False, True, False]))
+
+
+def test_startup_hold_does_not_prepare_or_score_discarded_footholds():
+    planner_text = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py"
+    ).read_text()
+
+    assert "startup_hold_mask = self._startup_hold_mask(selected_env_ids)" in planner_text
+    prepare_nominal_block = planner_text[
+        planner_text.index("prepare_nominal = nominal_foothold_prepare_mask(") :
+        planner_text.index("prepare_learned, _ = learned_foothold_event_masks(")
+    ]
+    assert "hold_contact_ready=hold_contact_ready" in prepare_nominal_block
+    assert "startup_hold=startup_hold_mask" in prepare_nominal_block
+    assert "prepare_learned &= ~startup_hold_mask" in planner_text
+    assert "entered_hold &= ~startup_hold_mask" in planner_text
+
+
+def test_planner_uses_event_gated_hold_contact_readiness():
+    planner_text = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py"
+    ).read_text()
+
+    assert "confirmed_contact = (" in planner_text
+    assert "stance_side = 1 - previous_gait_state.swing_side" in planner_text
+    assert "new_support_confirmed = confirmed_contact[" in planner_text
+    assert "confirmed_contact_lost = (" in planner_text
+    assert "new_support_lost = confirmed_contact_lost[" in planner_text
+    assert "strict_double_support = (" in planner_text
+    assert "startup_hold_mask" in planner_text
+    assert "initial_stabilization_hold = (" in planner_text
+    assert "previous_gait_state.hold_required_s" in planner_text
+    assert "previous_gait_state.recovery_step_pending" in planner_text
+    assert planner_text.count("hold_contact_ready=hold_contact_ready") >= 2
+    assert "hold_contact_lost=hold_contact_lost" in planner_text
+    assert "step_hold_s = torch.zeros_like(" in planner_text
+
+
+def test_command_updates_preserve_the_current_hold_plan_transaction():
+    planner_text = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py"
+    ).read_text()
+    setter_start = planner_text.index("    def set_desired_velocity(")
+    setter_end = planner_text.index(
+        "    def set_flat_target_curriculum_scale(",
+        setter_start,
+    )
+    setter_text = planner_text[setter_start:setter_end]
+
+    assert "self._data.desired_velocity_f[resolved_env_ids] = desired_velocity_f" in setter_text
+    assert "_invalidate_nominal_on_command_change" not in setter_text
 
 
 def test_compose_world_from_frame_rotates_body_target_by_yaw():
@@ -300,6 +396,29 @@ def test_yaw_from_quat_wxyz_reads_heading_about_world_z():
     )
 
 
+def test_sole_roles_follow_the_post_transition_swing_side():
+    """A toggled gait side must immediately toggle stance/swing geometry."""
+    module = _load_foothold_planner_module()
+    left_sole_w = torch.tensor(
+        [[1.00, 0.18, 0.0], [2.00, 0.18, 0.0]]
+    )
+    right_sole_w = torch.tensor(
+        [[1.00, 0.00, 0.0], [2.00, 0.00, 0.0]]
+    )
+
+    stance_w, swing_w = module.select_sole_roles(
+        left_sole_w=left_sole_w,
+        right_sole_w=right_sole_w,
+        # env 0: next swing is right, so the new support is left.
+        # env 1: next swing is left, so the new support is right.
+        swing_side=torch.tensor([1, 0]),
+    )
+
+    torch.testing.assert_close(stance_w[0], left_sole_w[0])
+    torch.testing.assert_close(swing_w[0], right_sole_w[0])
+    torch.testing.assert_close(stance_w[1], right_sole_w[1])
+    torch.testing.assert_close(swing_w[1], left_sole_w[1])
+
 def test_adaptive_step_hold_s_shortens_hold_as_command_speed_increases():
     module = _load_foothold_planner_module()
 
@@ -322,6 +441,58 @@ def test_adaptive_step_hold_s_shortens_hold_as_command_speed_increases():
         hold_s,
         torch.tensor([0.04, 0.02, 0.0]),
     )
+
+
+def test_apply_terrain_height_to_target_updates_world_and_local_z_only_when_valid():
+    module = _load_foothold_planner_module()
+    target_w = torch.tensor(
+        [
+            [1.0, 0.2, -0.50],
+            [2.0, -0.1, -0.30],
+        ]
+    )
+    target_f = torch.tensor(
+        [
+            [0.3, 0.18, 0.0],
+            [0.4, -0.18, 0.0],
+        ]
+    )
+    stance_w = torch.tensor(
+        [
+            [0.7, 0.02, -0.50],
+            [1.6, 0.08, -0.30],
+        ]
+    )
+    terrain_height = torch.tensor([0.20, float("inf")])
+    terrain_valid = torch.tensor([True, False])
+
+    corrected_w, corrected_f, valid = module.apply_terrain_height_to_target(
+        target_foothold_w=target_w,
+        target_foothold_f=target_f,
+        stance_pos_w=stance_w,
+        terrain_height_w=terrain_height,
+        terrain_valid=terrain_valid,
+    )
+
+    torch.testing.assert_close(
+        corrected_w,
+        torch.tensor(
+            [
+                [1.0, 0.2, 0.20],
+                [2.0, -0.1, -0.30],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        corrected_f,
+        torch.tensor(
+            [
+                [0.3, 0.18, 0.70],
+                [0.4, -0.18, 0.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(valid, torch.tensor([True, False]))
 
 
 def test_flat_target_level_follows_reward_curriculum_scale():
@@ -403,6 +574,16 @@ def test_parkour_cfg_uses_short_startup_hold_to_reduce_command_planner_conflict(
 
     assert "startup_hold_s=0.15" in env_cfg_text
     assert "startup_hold_s=0.40" not in env_cfg_text
+
+
+def test_parkour_cfg_uses_short_reset_hold_after_recovery():
+    repo_root = Path(__file__).resolve().parents[3]
+    env_cfg_text = (
+        repo_root
+        / "source/instinctlab/instinctlab/tasks/parkour/config/parkour_env_cfg.py"
+    ).read_text()
+
+    assert "reset_hold_s=0.15" in env_cfg_text
 
 
 def test_flat_provider_lookahead_is_derived_from_planner_swing_duration():
@@ -501,13 +682,22 @@ def test_touchdown_error_uses_fresh_sole_positions_before_acceptance():
     ).read_text()
 
     left_sole_index = planner_text.index("left_sole_pos_w =")
+    sole_role_index = planner_text.index(
+        "stance_sole_pos_w, swing_sole_pos_w = _select_sole_roles"
+    )
     actual_swing_index = planner_text.index(
-        "self._data.actual_swing_foot_pos_w[env_ids] = torch.where"
+        "self._data.actual_swing_foot_pos_w[env_ids] = swing_sole_pos_w"
     )
     foot_error_index = planner_text.index("foot_target_error =")
     touchdown_index = planner_text.index("self._data.touchdown_accepted[env_ids] =")
 
-    assert left_sole_index < actual_swing_index < foot_error_index < touchdown_index
+    assert (
+        left_sole_index
+        < sole_role_index
+        < actual_swing_index
+        < foot_error_index
+        < touchdown_index
+    )
 
 
 def test_touchdown_acceptance_requires_confirmed_liftoff():
@@ -524,6 +714,8 @@ def test_touchdown_acceptance_requires_confirmed_liftoff():
 
     assert "current_swing_has_lifted" in assignment
     assert "& current_swing_has_lifted" in assignment
+    assert "& touchdown_xy_ok" in assignment
+    assert "& touchdown_z_ok" in assignment
 
 
 def test_new_swing_target_uses_state_machine_swing_side_after_transition():
@@ -535,3 +727,37 @@ def test_new_swing_target_uses_state_machine_swing_side_after_transition():
 
     assert "new_swing_side = gait_state.swing_side[new_swing]" in planner_text
     assert "new_swing_side = swing_side[new_swing]" not in planner_text
+
+
+def test_contact_adaptive_config_gate_does_not_invert_python_bool_mask():
+    planner_text = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py"
+    ).read_text()
+
+    assert "& ~self.cfg.enable_contact_adaptive_recovery" not in planner_text
+
+
+def test_post_transition_sole_roles_are_refreshed_before_hold_plan_is_cached():
+    planner_text = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/sensors/foothold_planner/foothold_planner.py"
+    ).read_text()
+
+    advance_index = planner_text.index("gait_state = advance_gait(")
+    refresh_index = planner_text.index(
+        "stance_sole_pos_w, swing_sole_pos_w = _select_sole_roles(",
+        advance_index,
+    )
+    entered_hold_index = planner_text.index("entered_hold = (", refresh_index)
+    prepare_index = planner_text.index(
+        "self._prepare_nominal_footholds(",
+        planner_text.index("prepare_nominal = nominal_foothold_prepare_mask(") ,
+    )
+
+    assert prepare_index < advance_index < refresh_index
+    entered_hold_end = planner_text.index("_apply_startup_hold_gate(", entered_hold_index)
+    entered_hold_block = planner_text[entered_hold_index:entered_hold_end]
+    assert "clear_learned_foothold_buffers(" in entered_hold_block
+    assert "self._data.nominal_foothold_prepared" in entered_hold_block
+    assert "self._prepare_nominal_footholds(" not in entered_hold_block

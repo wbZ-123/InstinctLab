@@ -95,6 +95,31 @@ def _get_planner_contact_body_names(
     return [str(contact_body_names[index]) for index in contact_body_ids]
 
 
+def _resolve_full_contact_body_ids(
+    planner_sensor: Any | None,
+    contact_sensor: Any | None,
+) -> tuple[list[int] | None, list[str] | None]:
+    """Resolve planner foot names in the full contact sensor index space."""
+
+    reduced_ids = _get_planner_contact_body_ids(planner_sensor)
+    reduced_names = _get_planner_contact_body_names(
+        planner_sensor,
+        reduced_ids,
+    )
+    full_names = _safe_getattr(contact_sensor, "body_names")
+    if (
+        not reduced_names
+        or not isinstance(full_names, (list, tuple))
+    ):
+        return None, None
+    full_names = [str(name) for name in full_names]
+    try:
+        full_ids = [full_names.index(name) for name in reduced_names]
+    except ValueError:
+        return None, None
+    return full_ids, reduced_names
+
+
 def _get_sensor(base_env: Any, sensor_name: str) -> Any | None:
     scene = _safe_getattr(base_env, "scene")
     sensors = _safe_getattr(scene, "sensors")
@@ -116,6 +141,43 @@ def _get_command(base_env: Any, command_name: str, env_id: int) -> Any | None:
     except (AttributeError, KeyError, RuntimeError):
         return None
     return _select_env_value(command, env_id)
+
+
+
+
+def _get_command_term(base_env: Any, command_name: str) -> Any | None:
+    command_manager = _safe_getattr(base_env, "command_manager")
+    if command_manager is None:
+        return None
+    for attr_name in ("_terms", "_command_terms", "terms"):
+        terms = _safe_getattr(command_manager, attr_name)
+        if isinstance(terms, Mapping):
+            return terms.get(command_name)
+    try:
+        return command_manager.get_term(command_name)
+    except Exception:
+        return None
+
+
+def _command_term_diagnostics(
+    base_env: Any,
+    command_name: str,
+    env_id: int,
+) -> dict[str, Any]:
+    term = _get_command_term(base_env, command_name)
+    cfg = _safe_getattr(term, "cfg")
+    target_b = _select_env_value(_safe_getattr(term, "pos_command_b"), env_id)
+    target_dist_xy = None
+    if isinstance(target_b, list) and len(target_b) >= 2:
+        target_dist_xy = round(math.hypot(float(target_b[0]), float(target_b[1])), 5)
+    return {
+        "command_target_w": _select_env_value(_safe_getattr(term, "pos_command_w"), env_id),
+        "command_target_b": target_b,
+        "command_target_dist_xy": target_dist_xy,
+        "command_target_threshold": _safe_getattr(cfg, "target_dis_threshold"),
+        "command_max_b": _select_env_value(_safe_getattr(term, "max_command_b"), env_id),
+        "command_is_standing_env": _select_env_value(_safe_getattr(term, "is_standing_env"), env_id),
+    }
 
 
 def _get_scene_entity(scene: Any, name: str) -> Any | None:
@@ -562,8 +624,11 @@ def build_foothold_debug_payload(
         target_w,
     )
     actual_width_f = _actual_width(actual_delta_f)
-    contact_body_ids = _get_planner_contact_body_ids(sensor)
-    contact_body_names = _get_planner_contact_body_names(sensor, contact_body_ids)
+    contact_sensor = _get_sensor(base_env, "contact_forces")
+    contact_body_ids, contact_body_names = _resolve_full_contact_body_ids(
+        sensor,
+        contact_sensor,
+    )
     contact_data = _get_sensor_data(base_env, "contact_forces")
     air_time_s = _select_env_indices(
         _safe_getattr(contact_data, "current_air_time"),
@@ -593,6 +658,7 @@ def build_foothold_debug_payload(
         reference_z_error = None
 
     payload = {
+        "env_id": env_id,
         "command": _get_command(base_env, command_name, env_id),
         "gait_mode": GAIT_MODE_NAMES.get(gait_mode_int, gait_mode),
         "swing_side": swing_side,
@@ -617,6 +683,61 @@ def build_foothold_debug_payload(
         "swing_air_time_s": swing_air_time_s,
         "foot_contact": _select_env_value(_safe_getattr(data, "foot_contact"), env_id),
         "planner_valid": _select_env_value(_safe_getattr(data, "planner_valid"), env_id),
+        "learned_prepared_valid": _select_env_value(
+            _safe_getattr(data, "learned_foothold_prepared_valid"), env_id
+        ),
+        "learned_geometric_valid": _select_env_value(
+            _safe_getattr(data, "learned_foothold_geometric_valid"), env_id
+        ),
+        "learned_height_valid": _select_env_value(
+            _safe_getattr(data, "learned_foothold_height_valid"), env_id
+        ),
+        "learned_safety_valid": _select_env_value(
+            _safe_getattr(data, "learned_foothold_safety_valid"), env_id
+        ),
+        "learned_evaluated": _select_env_value(
+            _safe_getattr(data, "learned_foothold_evaluated"), env_id
+        ),
+        "route_event": _select_env_value(
+            _safe_getattr(data, "learned_foothold_route_event"), env_id
+        ),
+        "route_use_nominal": _select_env_value(
+            _safe_getattr(data, "learned_foothold_route_use_nominal"), env_id
+        ),
+        "route_use_learned": _select_env_value(
+            _safe_getattr(data, "learned_foothold_route_use_learned"), env_id
+        ),
+        "route_executable": _select_env_value(
+            _safe_getattr(data, "learned_foothold_route_initial_executable"),
+            env_id,
+        ),
+        "lock_geometric_valid": _select_env_value(
+            _safe_getattr(data, "learned_foothold_lock_geometric_valid"), env_id
+        ),
+        "target_terrain_valid": _select_env_value(
+            _safe_getattr(data, "target_terrain_valid"), env_id
+        ),
+        "nominal_geometric_valid": _select_env_value(
+            _safe_getattr(data, "nominal_geometric_valid"), env_id
+        ),
+        "nominal_safety_valid": _select_env_value(
+            _safe_getattr(data, "nominal_safety_valid"), env_id
+        ),
+        "swing_clearance_safe": _select_env_value(
+            _safe_getattr(data, "swing_clearance_safe"), env_id
+        ),
+        "swing_clearance_deepest_phase": _select_env_value(
+            _safe_getattr(data, "swing_clearance_deepest_phase"), env_id
+        ),
+        "swing_clearance_start_penetration": _select_env_value(
+            _safe_getattr(data, "swing_clearance_start_penetration"), env_id
+        ),
+        "swing_clearance_goal_penetration": _select_env_value(
+            _safe_getattr(data, "swing_clearance_goal_penetration"), env_id
+        ),
+        "swing_clearance_start_escape_safe": _select_env_value(
+            _safe_getattr(data, "swing_clearance_start_escape_safe"), env_id
+        ),
         "touchdown_accepted": _select_env_value(
             _safe_getattr(data, "touchdown_accepted"), env_id
         ),
@@ -649,6 +770,18 @@ def build_foothold_debug_payload(
         ),
         "safe_target_score": _select_env_value(
             _safe_getattr(data, "safe_target_score"), env_id
+        ),
+        "safe_target_final_max_penetration_depth": _select_env_value(
+            _safe_getattr(data, "safe_target_final_max_penetration_depth"), env_id
+        ),
+        "safe_target_candidate_count": _select_env_value(
+            _safe_getattr(data, "safe_target_candidate_count"), env_id
+        ),
+        "safe_target_candidate_obstacle_safe_count": _select_env_value(
+            _safe_getattr(data, "safe_target_candidate_obstacle_safe_count"), env_id
+        ),
+        "safe_target_candidate_valid_count": _select_env_value(
+            _safe_getattr(data, "safe_target_candidate_valid_count"), env_id
         ),
         "target_f": target_f,
         "target_w": target_w,
@@ -703,6 +836,7 @@ def build_foothold_debug_payload(
             _safe_getattr(data, "feasible_velocity_f"), env_id
         ),
     }
+    payload.update(_command_term_diagnostics(base_env, command_name, env_id))
     payload.update(
         _build_startup_pose_diagnostics(
             base_env,
@@ -798,8 +932,13 @@ def format_foothold_debug_line(
 ) -> str:
     return (
         f"[PLAY_DEBUG] step={timestep} "
+        f"env_id={payload['env_id']} "
         f"zero_act_active={zero_act_active} "
         f"command={payload['command']} "
+        f"command_target_dist_xy={payload['command_target_dist_xy']} "
+        f"command_target_threshold={payload['command_target_threshold']} "
+        f"command_max_b={payload['command_max_b']} "
+        f"command_is_standing={payload['command_is_standing_env']} "
         f"mode={payload['gait_mode']} "
         f"swing_side={payload['swing_side']} "
         f"phase={payload['phase']} "
@@ -814,6 +953,24 @@ def format_foothold_debug_line(
         f"swing_air_time_s={payload['swing_air_time_s']} "
         f"contact={payload['foot_contact']} "
         f"planner_valid={payload['planner_valid']} "
+        f"learned_prepared={payload['learned_prepared_valid']} "
+        f"learned_geom={payload['learned_geometric_valid']} "
+        f"learned_height={payload['learned_height_valid']} "
+        f"learned_safety={payload['learned_safety_valid']} "
+        f"learned_eval={payload['learned_evaluated']} "
+        f"route_event={payload['route_event']} "
+        f"route_nominal={payload['route_use_nominal']} "
+        f"route_learned={payload['route_use_learned']} "
+        f"route_exec={payload['route_executable']} "
+        f"lock_geom={payload['lock_geometric_valid']} "
+        f"terrain_valid={payload['target_terrain_valid']} "
+        f"nominal_geom={payload['nominal_geometric_valid']} "
+        f"nominal_safety={payload['nominal_safety_valid']} "
+        f"clearance_safe={payload['swing_clearance_safe']} "
+        f"clearance_phase={payload['swing_clearance_deepest_phase']} "
+        f"clearance_start={payload['swing_clearance_start_penetration']} "
+        f"clearance_goal={payload['swing_clearance_goal_penetration']} "
+        f"clearance_start_escape={payload['swing_clearance_start_escape_safe']} "
         f"touchdown={payload['touchdown_accepted']} "
         f"td_contact={payload['touchdown_swing_contact']} "
         f"td_xy_ok={payload['touchdown_xy_ok']} "
@@ -825,6 +982,10 @@ def format_foothold_debug_line(
         f"safe_valid={payload['safe_target_valid']} "
         f"fallback={payload['safe_target_fallback']} "
         f"score={payload['safe_target_score']} "
+        f"final_penetration={payload['safe_target_final_max_penetration_depth']} "
+        f"candidate_valid={payload['safe_target_candidate_valid_count']}/"
+        f"{payload['safe_target_candidate_count']} "
+        f"candidate_obstacle_safe={payload['safe_target_candidate_obstacle_safe_count']} "
         f"target_f={payload['target_f']} "
         f"target_w={payload['target_w']} "
         f"swing_ref_w={payload['swing_reference_w']} "
@@ -903,3 +1064,9 @@ def is_foothold_debug_anomaly(
         return True
 
     return False
+
+
+def is_foothold_debug_plan_event(payload: dict[str, Any]) -> bool:
+    """Return whether this payload corresponds to a fresh safe-target planning event."""
+
+    return bool(payload.get("safe_target_search"))

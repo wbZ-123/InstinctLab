@@ -106,21 +106,57 @@ z_f = z_w - support_foot_z_w
 6. Reward, debug, and visualization must compare quantities in the same coordinate frame.
 7. Tests must cover non-zero support-foot world position and non-zero planner yaw, so local/world mix-ups are caught.
 
+## Nominal-Prior Routing Contract
+
+The analytic planner must publish the nominal foothold to the learned policy
+before the learned foothold action is consumed.  In the initial privileged
+training stage:
+
+```text
+nominal foothold is geometrically valid and danger-safe:
+    execute the nominal foothold
+    reward the learned output for remaining close to the nominal foothold
+
+nominal foothold is geometrically valid but danger-unsafe:
+    execute the learned foothold when its hard geometry is valid
+    use continuous penetration diagnostics as the learned-planner reward
+
+learned foothold fails a hard geometric check:
+    do not execute it
+    continue HOLD / enter planning failure
+```
+
+Danger-cylinder safety is a soft learning signal, not a hard rejection gate
+for a geometrically valid learned proposal during simulation.  Otherwise PPO
+would never observe the consequences of the unsafe proposal it must improve.
+The learned route never invokes the legacy 32-point candidate search.
+
+The privileged nominal-safe routing gate is training scaffolding.  It must be
+phased out before deployment so the deployed policy always produces the final
+foothold from hardware-reproducible observations.  Danger-cylinder internals
+remain unavailable to the actor.
+
 ## Timing Contract
 
 The high-level foothold output is event-triggered, not continuously applied during swing.
 
 ```text
-HOLD with both feet confirmed:
+enter HOLD:
     the state machine already identifies the next swing side
+    generate and cache the analytic nominal foothold
+    expose that nominal foothold in the learned-only policy observation
+
+next policy/control cycle while both feet remain confirmed in HOLD:
     read the current normalized high-level output
     decode it with the shared reachability ellipse
     convert it to a final 3D foothold
     run hard validity checks
-    cache the latest valid prepared foothold
+    compute soft danger-cylinder diagnostics
+    cache the latest geometrically valid prepared foothold
 
 new-SWING transition:
-    use the prepared foothold if one exists
+    route between the nominal and learned foothold using the training-stage
+    contract above
     otherwise evaluate the current output once as a transition fallback
     lock the accepted foothold
     generate and lock the swing reference
@@ -173,15 +209,21 @@ Forbidden deployment-time inputs:
 
 ## Height and Safety Checks
 
-After the learned head outputs `x_f, y_f`, the system queries height and forms a 3D foothold. The 3D foothold must pass hard checks before being used:
+After the learned head outputs `x_f, y_f`, the system queries height and forms a 3D foothold. The 3D foothold must pass these hard geometric checks before being used:
 
 - terrain height query is valid;
 - step height difference from current support foot is at most `0.25 m`;
 - foothold is inside the configured reachable support-foot region;
-- foot support area is physically plausible for the current terrain representation;
 - during simulation, danger-cylinder penetration diagnostics are computed for training reward and debug.
 
-During training, a dangerous foothold is penalized. During execution, the planner must not knowingly output a foothold that fails the hard safety gate. If the gate fails, the environment should continue HOLD/recovery instead of producing a dangerous swing reference.
+Do not add separate support-area or edge-distance scores: in the current
+simulation representation those duplicate the danger-cylinder geometry.  The
+continuous foot-safety score uses only the number/ratio of sole-perimeter
+points that penetrate danger cylinders and their summed penetration depth.
+During training, this bounded score teaches the high-level foothold action.
+It must not reject a geometrically valid learned proposal merely because its
+current soft safety score is poor.  Only hard geometric invalidity keeps the
+environment in HOLD/recovery.
 
 ## Swing Trajectory Contract
 
@@ -213,9 +255,8 @@ Rewards are separated by role:
 
 ### Foothold-planning rewards
 
-- danger-cylinder penetration penalty during simulation;
-- penetrating sole-point ratio penalty;
-- support-area / edge-safety reward;
+- bounded danger-cylinder penetration-depth penalty during simulation;
+- bounded penetrating sole-perimeter-point count/ratio penalty;
 - reachability reward or hard gate;
 - step-height hard gate at `0.25 m`;
 - nominal-prior deviation penalty;
@@ -257,7 +298,8 @@ It will serve as:
 - fallback when learned planner is disabled;
 - source of coordinate-frame utilities and terrain height query code.
 
-The current hand-written safe-target candidate search should not be further expanded as the final intelligence source. It may remain as debug/fallback while the learned planner is being introduced.
+The current hand-written safe-target candidate search remains available only
+on the legacy planner path.  It is not a fallback inside the learned route.
 
 ## Testing Requirements
 

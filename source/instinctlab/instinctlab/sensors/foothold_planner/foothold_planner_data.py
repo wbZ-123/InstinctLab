@@ -23,6 +23,54 @@ class FootholdPlannerData:
 
     target_foothold_w: torch.Tensor | None = None
     target_foothold_f: torch.Tensor | None = None
+    # Learned planner action and event-latched target diagnostics. The action
+    # is normalized; all ``*_f`` targets use the support-foot planner frame.
+    learned_foothold_enabled: torch.Tensor | None = None
+    learned_foothold_action_normalized: torch.Tensor | None = None
+    learned_foothold_decoded_f: torch.Tensor | None = None
+    learned_foothold_prepared_f: torch.Tensor | None = None
+    learned_foothold_prepared_w: torch.Tensor | None = None
+    learned_foothold_prepared_valid: torch.Tensor | None = None
+    # Event diagnostics only; these flags do not participate in planning.
+    learned_foothold_lock_geometric_valid: torch.Tensor | None = None
+    target_terrain_valid: torch.Tensor | None = None
+    learned_foothold_locked: torch.Tensor | None = None
+    learned_foothold_target_f: torch.Tensor | None = None
+    learned_foothold_target_w: torch.Tensor | None = None
+    learned_foothold_used: torch.Tensor | None = None
+    learned_foothold_height_valid: torch.Tensor | None = None
+    learned_foothold_geometric_valid: torch.Tensor | None = None
+    learned_foothold_safety_valid: torch.Tensor | None = None
+    learned_foothold_evaluated: torch.Tensor | None = None
+    # Monotonic counter incremented exactly when the current high-level action
+    # is evaluated. Unlike per-step flags, this is never cleared by reset.
+    learned_foothold_event_generation: torch.Tensor | None = None
+    # True only on the update where a prepared proposal is routed at the
+    # transition into a new swing. This is distinct from HOLD evaluations,
+    # which may happen repeatedly before the route is committed.
+    learned_foothold_route_event: torch.Tensor | None = None
+    learned_foothold_route_use_nominal: torch.Tensor | None = None
+    learned_foothold_route_use_learned: torch.Tensor | None = None
+    learned_foothold_route_initial_executable: torch.Tensor | None = None
+    learned_foothold_safety_score: torch.Tensor | None = None
+    learned_foothold_penetrating_point_count: torch.Tensor | None = None
+    learned_foothold_penetrating_point_ratio: torch.Tensor | None = None
+    learned_foothold_total_penetration_depth: torch.Tensor | None = None
+    # Exact analytic nominal plan published during HOLD. These auxiliary
+    # values keep the later SWING plan identical to the prior seen by policy.
+    nominal_foothold_prepared: torch.Tensor | None = None
+    nominal_feasible_velocity_f: torch.Tensor | None = None
+    nominal_curriculum_residual_f: torch.Tensor | None = None
+    nominal_curriculum_radius_f: torch.Tensor | None = None
+    nominal_curriculum_usage: torch.Tensor | None = None
+    # Authoritative support frame captured when the HOLD nominal is prepared.
+    # Learned proposals for that HOLD event must be decoded in this same frame.
+    nominal_frame_origin_w: torch.Tensor | None = None
+    nominal_frame_yaw_w: torch.Tensor | None = None
+    nominal_foothold_w: torch.Tensor | None = None
+    nominal_geometric_valid: torch.Tensor | None = None
+    nominal_safety_valid: torch.Tensor | None = None
+    nominal_safety_score: torch.Tensor | None = None
     desired_velocity_f: torch.Tensor | None = None
     feasible_velocity_f: torch.Tensor | None = None
     default_swing_reference_pos_w: torch.Tensor | None = None
@@ -31,10 +79,23 @@ class FootholdPlannerData:
     swing_apex_height: torch.Tensor | None = None
     swing_clearance_safe: torch.Tensor | None = None
     swing_clearance_penetration: torch.Tensor | None = None
+    swing_clearance_deepest_phase: torch.Tensor | None = None
+    swing_clearance_start_penetration: torch.Tensor | None = None
+    swing_clearance_goal_penetration: torch.Tensor | None = None
+    swing_clearance_start_escape_safe: torch.Tensor | None = None
     actual_stance_foot_pos_w: torch.Tensor | None = None
     actual_swing_foot_pos_w: torch.Tensor | None = None
     swing_start_pos_w: torch.Tensor | None = None
     foot_contact: torch.Tensor | None = None
+    confirmed_foot_contact: torch.Tensor | None = None
+    body_tilt_rad: torch.Tensor | None = None
+    body_angular_speed_rad_s: torch.Tensor | None = None
+    body_horizontal_speed_m_s: torch.Tensor | None = None
+    support_slip_m_s: torch.Tensor | None = None
+    stabilization_active: torch.Tensor | None = None
+    stabilization_ready: torch.Tensor | None = None
+    event_response: torch.Tensor | None = None
+    planning_failure: torch.Tensor | None = None
 
     touchdown_accepted: torch.Tensor | None = None
     touchdown_xy_error: torch.Tensor | None = None
@@ -71,6 +132,7 @@ class FootholdPlannerData:
     safe_target_candidate_inside_ellipse_count: torch.Tensor | None = None
     safe_target_candidate_obstacle_safe_count: torch.Tensor | None = None
     safe_target_candidate_valid_count: torch.Tensor | None = None
+    safe_target_final_max_penetration_depth: torch.Tensor | None = None
     # Historical debug target before safe-target search. Despite the name,
     # this currently records the flat-provider nominal target after flat
     # reachability constraints, not the raw velocity-only point.

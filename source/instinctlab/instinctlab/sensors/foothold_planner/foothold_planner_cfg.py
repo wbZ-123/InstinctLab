@@ -58,6 +58,32 @@ class FootholdPlannerCfg(SensorBaseCfg):
     # ``flat_target_lookahead_phase * swing_duration_s``.
     flat_target_lookahead_phase: float = 0.8
 
+    # Project the final planned XY foothold onto the runtime terrain mesh.
+    # This keeps the flat planner responsible for horizontal foothold selection
+    # while using the terrain surface as the source of truth for target z.
+    enable_target_terrain_height: bool = True
+    target_terrain_mesh_prim_path: str = "/World/ground"
+    # Matches the parkour foot height scanners' 20 m downward ray origin.
+    target_terrain_raycast_start_height_m: float = 20.0
+    target_terrain_raycast_max_dist_m: float = 40.0
+    target_terrain_height_offset_m: float = 0.0
+    # Ordinary parkour stair height range tops out at 0.23 m; 0.25 m keeps a
+    # small tolerance while preventing one swing from spanning multiple steps.
+    max_foothold_step_height_m: float = 0.25
+
+    # Opt-in while the learned explicit foothold path is integrated.  When
+    # disabled, the existing analytical planner remains the only target source.
+    # Learned XY actions reuse FlatProviderConfig.outer_radius_x/y and the
+    # existing max_foothold_step_height_m instead of defining duplicate limits.
+    enable_learned_foothold: bool = False
+
+    # Contact-adaptive recovery is opt-in until stability bounds have been
+    # calibrated from a successful normal-HOLD run.  Enabling it without the
+    # generated JSON is rejected by the planner instead of using guessed
+    # thresholds.
+    enable_contact_adaptive_recovery: bool = False
+    recovery_stability_calibration_path: str = ""
+
     enable_edge_clearance: bool = True
     clearance_max_apex_height_m: float = 0.30
     clearance_apex_step_m: float = 0.03

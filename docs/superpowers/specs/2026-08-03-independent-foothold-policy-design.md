@@ -29,14 +29,16 @@ dimensions 29..30 : normalized foothold XY proposal
 Internally, produce those groups using two policy modules:
 
 1. The existing depth encoder and MoE motor actor produce only the 29 motor
-   actions.
+   actions and keep their original optimization path.
 2. A small foothold MLP produces the two foothold actions.
-3. The foothold MLP consumes the planner-relevant encoded observation through
-   a detached tensor. Foothold loss must not update the depth encoder, motor
-   MoE experts, or motor gate.
-4. Do not add a second depth CNN. Perception is computed once, keeping the
-   additional learning and inference cost small.
-5. Concatenate the independently sampled motor and foothold actions only at
+3. The foothold MLP consumes a detached copy of the existing encoded state and
+   a planner-only feature from the same deployable depth image.
+4. The planner-only depth encoder is lightweight and belongs exclusively to
+   the foothold optimizer. Foothold loss must not update the original depth
+   encoder, motor MoE experts, or motor gate.
+5. Old saved configurations without the planner-only encoder field retain the
+   original network shape so existing checkpoints remain playable.
+6. Concatenate the independently sampled motor and foothold actions only at
    the environment interface.
 
 The two policies still train online in the same rollout. Isolation applies to
@@ -76,6 +78,13 @@ deviation. That minimum is a calibration parameter and must be logged in both
 meters and normalized units. It must not silently default to the numerical
 `1e-15` floor used by the generic motor policy.
 
+The planner optimizer starts at `1e-5`. This is not inherited blindly from
+the motor policy: a 64-environment acceptance run measured approximately 155
+KL after the first planner step at `1e-3`. At `1e-5`, the first-iteration mean
+planner KL was approximately `0.0195`, close to the independent `0.02` stop
+ceiling. The adaptive planner schedule may increase this rate only when its
+own KL is below target.
+
 An entropy coefficient may shape exploration above the minimum, but the hard
 physical floor is the safety net that prevents the observed sub-millimetre
 collapse.
@@ -101,8 +110,9 @@ Legacy 29-action initialization remains supported:
 
 - copy the existing encoder, motor MoE, motor critic, motor standard
   deviations, and discriminator exactly;
-- initialize the independent foothold MLP, foothold critic, foothold standard
-  deviation, and foothold optimizer explicitly;
+- initialize the independent foothold MLP, planner-only depth encoder,
+  foothold critic, foothold standard deviation, and foothold optimizer
+  explicitly;
 - never reinterpret the last two rows of a shared 31-action head as an
   independent planner checkpoint.
 
@@ -135,4 +145,3 @@ Before another long run, verify:
 6. A 4096-environment short run has finite losses, nonzero foothold events,
    bounded foothold KL, and no abrupt episode-length collapse before a long run
    is authorized.
-

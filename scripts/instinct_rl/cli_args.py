@@ -9,6 +9,78 @@ if TYPE_CHECKING:
     from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
 
 
+def sync_runner_learning_rate_after_resume(runner) -> float | None:
+    """Restore PPO's adaptive-LR scalar from the loaded optimizer state.
+
+    Instinct-RL loads the optimizer from a checkpoint, but its PPO
+    ``learning_rate`` attribute otherwise keeps the fresh config value. The
+    adaptive KL schedule then overwrites the loaded optimizer LR with that
+    stale value on the first resumed minibatch.
+    """
+
+    algorithm = getattr(runner, "alg", None)
+    optimizer = getattr(algorithm, "optimizer", None)
+    param_groups = getattr(optimizer, "param_groups", None)
+    if (
+        algorithm is None
+        or not hasattr(algorithm, "learning_rate")
+        or not param_groups
+        or "lr" not in param_groups[0]
+    ):
+        return None
+
+    loaded_lr = float(param_groups[0]["lr"])
+    algorithm.learning_rate = loaded_lr
+    foothold_optimizer = getattr(algorithm, "foothold_optimizer", None)
+    foothold_param_groups = getattr(
+        foothold_optimizer,
+        "param_groups",
+        None,
+    )
+    if (
+        hasattr(algorithm, "foothold_learning_rate")
+        and foothold_param_groups
+        and "lr" in foothold_param_groups[0]
+    ):
+        algorithm.foothold_learning_rate = float(
+            foothold_param_groups[0]["lr"]
+        )
+    return loaded_lr
+
+
+def validate_checkpoint_modes(args_cli: argparse.Namespace) -> None:
+    """Keep strict resume separate from legacy architecture initialization."""
+
+    initialization_path = getattr(
+        args_cli,
+        "initialize_learned_foothold_from",
+        None,
+    )
+    if getattr(args_cli, "resume", False) and initialization_path:
+        raise ValueError(
+            "--resume cannot be combined with "
+            "--initialize_learned_foothold_from."
+        )
+    if initialization_path and not os.path.isabs(initialization_path):
+        raise ValueError(
+            "--initialize_learned_foothold_from requires an absolute path."
+        )
+    if initialization_path and not os.path.isfile(initialization_path):
+        raise ValueError(
+            "Learned foothold base checkpoint does not exist: "
+            f"{initialization_path}"
+        )
+    if initialization_path and not getattr(
+        args_cli,
+        "enable_learned_foothold_planner",
+        False,
+    ):
+        raise ValueError(
+            "Legacy checkpoint initialization requires "
+            "--enable_learned_foothold_planner."
+        )
+
+
 def add_instinct_rl_args(parser: argparse.ArgumentParser):
     """Add INSTINCT-RL arguments to the parser.
 
@@ -26,6 +98,15 @@ def add_instinct_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--resume", default=None, action="store_true", help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
+    arg_group.add_argument(
+        "--initialize_learned_foothold_from",
+        type=str,
+        default=None,
+        help=(
+            "Initialize a new 31-action/two-critic learned foothold run "
+            "from an absolute legacy 29-action checkpoint path."
+        ),
+    )
     arg_group.add_argument("--save_interval", type=int, default=None, help="Checkpoint save interval in iterations.")
     # # -- logger arguments
     # arg_group.add_argument(

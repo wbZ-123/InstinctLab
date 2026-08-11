@@ -10,7 +10,9 @@ import torch
 import isaaclab.sim as sim_utils
 import isaaclab.utils.string as string_utils
 from isaaclab.sensors import SensorBase
+from isaaclab.sensors.ray_caster import RayCaster
 from isaaclab.utils.math import convert_quat
+from isaaclab.utils.warp import raycast_mesh
 from isaacsim.core.simulation_manager import SimulationManager
 from pxr import PhysxSchema
 
@@ -21,12 +23,32 @@ from instinctlab_foothold import (
     GaitState,
     SoleGeometry,
     advance_gait,
+    apply_world_height_to_planner_target,
+    clear_learned_foothold_buffers,
+    ContactEvent,
+    EventResponse,
+    StabilityBounds,
+    StabilitySignals,
+    load_stability_bounds,
+    response_for_event,
+    stability_ready,
+    support_roles_from_contacts,
+    evaluate_safe_foothold_target,
     gait_phase,
     initial_gait_state,
     adjust_apex_for_edge_clearance,
+    learned_foothold_event_masks,
+    learned_foothold_swing_ready,
+    lock_prepared_learned_foothold,
     make_recovery_foothold_target,
+    nominal_foothold_prepare_mask,
+    prepare_learned_foothold_target,
     quintic_swing_reference,
+    reachable_ellipse_usage,
+    reframe_cached_world_foothold,
+    route_nominal_and_learned_footholds,
     sample_flat_targets,
+    store_learned_foothold_preparation,
 )
 
 from .foothold_planner_data import FootholdPlannerData
@@ -56,6 +78,32 @@ def _yaw_from_quat_wxyz(quat_wxyz: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _select_sole_roles(
+    *,
+    left_sole_w: torch.Tensor,
+    right_sole_w: torch.Tensor,
+    swing_side: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return stance and swing soles for the supplied gait-side state."""
+    if left_sole_w.shape != right_sole_w.shape:
+        raise ValueError("left and right sole tensors must share one shape.")
+    if left_sole_w.shape[:-1] != swing_side.shape:
+        raise ValueError("swing_side must match the sole batch shape.")
+
+    swing_is_left = swing_side == 0
+    stance_w = torch.where(
+        swing_is_left.unsqueeze(-1),
+        right_sole_w,
+        left_sole_w,
+    )
+    swing_w = torch.where(
+        swing_is_left.unsqueeze(-1),
+        left_sole_w,
+        right_sole_w,
+    )
+    return stance_w, swing_w
+
+
 def _rotate_vector_yaw(
     vector_f: torch.Tensor,
     yaw_w: torch.Tensor,
@@ -74,6 +122,36 @@ def _compose_world_from_frame(
     yaw_w: torch.Tensor,
 ) -> torch.Tensor:
     return origin_w + _rotate_vector_yaw(vector_f, yaw_w)
+
+
+def _apply_terrain_height_to_target(
+    *,
+    target_foothold_w: torch.Tensor,
+    target_foothold_f: torch.Tensor,
+    stance_pos_w: torch.Tensor,
+    terrain_height_w: torch.Tensor,
+    terrain_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return foothold targets with valid terrain heights applied to z.
+
+    Horizontal foothold selection remains unchanged.  Only valid, finite
+    terrain heights replace the target world z.  The local-frame target z is
+    kept consistent with the corrected world target so observations/debug data
+    do not disagree with the actual reference.
+    """
+    finite_height = torch.isfinite(terrain_height_w)
+    valid = terrain_valid & finite_height
+
+    corrected_w = target_foothold_w.clone()
+    corrected_w[:, 2] = torch.where(
+        valid,
+        terrain_height_w,
+        corrected_w[:, 2],
+    )
+
+    corrected_f = target_foothold_f.clone()
+    corrected_f[:, 2] = corrected_w[:, 2] - stance_pos_w[:, 2]
+    return corrected_w, corrected_f, valid
 
 
 def _make_required_body_paths_glob(
@@ -193,6 +271,8 @@ def _clear_safe_target_event_buffers(
         data.safe_target_candidate_obstacle_safe_count[env_ids] = 0.0
     if data.safe_target_candidate_valid_count is not None:
         data.safe_target_candidate_valid_count[env_ids] = 0.0
+    if data.safe_target_final_max_penetration_depth is not None:
+        data.safe_target_final_max_penetration_depth[env_ids] = 0.0
 
 
 def _clear_foothold_plan_buffers(
@@ -215,6 +295,32 @@ def _clear_foothold_plan_buffers(
         data.swing_start_pos_w[env_ids] = 0.0
     if getattr(data, "raw_unclipped_foothold_f", None) is not None:
         data.raw_unclipped_foothold_f[env_ids] = 0.0
+    if getattr(data, "nominal_foothold_prepared", None) is not None:
+        data.nominal_foothold_prepared[env_ids] = False
+    if getattr(data, "nominal_feasible_velocity_f", None) is not None:
+        data.nominal_feasible_velocity_f[env_ids] = 0.0
+    if getattr(data, "nominal_curriculum_residual_f", None) is not None:
+        data.nominal_curriculum_residual_f[env_ids] = 0.0
+    if getattr(data, "nominal_curriculum_radius_f", None) is not None:
+        data.nominal_curriculum_radius_f[env_ids] = 0.0
+    if getattr(data, "nominal_curriculum_usage", None) is not None:
+        data.nominal_curriculum_usage[env_ids] = 0.0
+    if getattr(data, "nominal_frame_origin_w", None) is not None:
+        data.nominal_frame_origin_w[env_ids] = 0.0
+    if getattr(data, "nominal_frame_yaw_w", None) is not None:
+        data.nominal_frame_yaw_w[env_ids] = 0.0
+    if getattr(data, "nominal_foothold_w", None) is not None:
+        data.nominal_foothold_w[env_ids] = 0.0
+    if getattr(data, "nominal_geometric_valid", None) is not None:
+        data.nominal_geometric_valid[env_ids] = False
+    if getattr(data, "nominal_safety_valid", None) is not None:
+        data.nominal_safety_valid[env_ids] = False
+    if getattr(data, "nominal_safety_score", None) is not None:
+        data.nominal_safety_score[env_ids] = 0.0
+    if getattr(data, "learned_foothold_lock_geometric_valid", None) is not None:
+        data.learned_foothold_lock_geometric_valid[env_ids] = True
+    if getattr(data, "target_terrain_valid", None) is not None:
+        data.target_terrain_valid[env_ids] = True
     if getattr(data, "feasible_velocity_f", None) is not None:
         data.feasible_velocity_f[env_ids] = 0.0
     if getattr(data, "target_delta_f", None) is not None:
@@ -237,6 +343,14 @@ def _clear_foothold_plan_buffers(
         data.swing_clearance_safe[env_ids] = True
     if getattr(data, "swing_clearance_penetration", None) is not None:
         data.swing_clearance_penetration[env_ids] = 0.0
+    if getattr(data, "swing_clearance_deepest_phase", None) is not None:
+        data.swing_clearance_deepest_phase[env_ids] = 0.0
+    if getattr(data, "swing_clearance_start_penetration", None) is not None:
+        data.swing_clearance_start_penetration[env_ids] = 0.0
+    if getattr(data, "swing_clearance_goal_penetration", None) is not None:
+        data.swing_clearance_goal_penetration[env_ids] = 0.0
+    if getattr(data, "swing_clearance_start_escape_safe", None) is not None:
+        data.swing_clearance_start_escape_safe[env_ids] = False
 
 
 def _apply_startup_hold_gate(
@@ -255,7 +369,6 @@ def _apply_startup_hold_gate(
     startup_env_ids = selected_env_ids[startup_hold_mask]
     gait_state.mode[startup_hold_mask] = GaitState.HOLD
     gait_state.elapsed_s[startup_hold_mask] = 0.0
-    gait_state.hold_elapsed_s[startup_hold_mask] = 0.0
     gait_state.hold_required_s[startup_hold_mask] = reset_hold_s
     gait_state.swing_has_lifted[startup_hold_mask] = False
     gait_state.recovery_step_pending[startup_hold_mask] = False
@@ -273,6 +386,7 @@ def _apply_startup_hold_gate(
         data.recovery_step_active[startup_env_ids] = False
 
     _clear_foothold_plan_buffers(data, startup_env_ids)
+    clear_learned_foothold_buffers(data, startup_env_ids)
 
 
 class FootholdPlanner(SensorBase):
@@ -289,6 +403,14 @@ class FootholdPlanner(SensorBase):
         super().__init__(cfg)
         if cfg.startup_hold_s < 0.0:
             raise ValueError("startup_hold_s must be non-negative.")
+        if cfg.target_terrain_raycast_start_height_m <= 0.0:
+            raise ValueError(
+                "target_terrain_raycast_start_height_m must be positive."
+            )
+        if cfg.target_terrain_raycast_max_dist_m <= 0.0:
+            raise ValueError(
+                "target_terrain_raycast_max_dist_m must be positive."
+            )
         self._data = FootholdPlannerData()
         self._flat_target_curriculum_scale: torch.Tensor | None = None
         self._virtual_obstacles: dict[str, object] = {}
@@ -298,6 +420,16 @@ class FootholdPlanner(SensorBase):
             half_width=cfg.sole_half_width,
         )
         self._flat_provider_cfg = _derive_flat_provider_config(cfg)
+        self._stability_bounds: StabilityBounds | None = None
+        if cfg.enable_contact_adaptive_recovery:
+            if not cfg.recovery_stability_calibration_path:
+                raise ValueError(
+                    "contact-adaptive recovery requires "
+                    "recovery_stability_calibration_path"
+                )
+            self._stability_bounds = load_stability_bounds(
+                cfg.recovery_stability_calibration_path
+            )
         self._gait_cfg = GaitMachineConfig(
             reset_hold_s=cfg.reset_hold_s,
             swing_s=cfg.swing_duration_s,
@@ -347,16 +479,28 @@ class FootholdPlanner(SensorBase):
 
         if env_ids is None:
             resolved_env_ids = slice(None)
+            resolved_env_id_tensor = torch.arange(
+                self._num_envs,
+                device=self._device,
+                dtype=torch.long,
+            )
             num_selected_envs = self._num_envs
         elif isinstance(env_ids, slice):
             resolved_env_ids = env_ids
-            num_selected_envs = torch.arange(
+            resolved_env_id_tensor = torch.arange(
                 self._num_envs,
                 device=self._device,
-            )[env_ids].shape[0]
+                dtype=torch.long,
+            )[env_ids]
+            num_selected_envs = resolved_env_id_tensor.shape[0]
         else:
             resolved_env_ids = env_ids
-            num_selected_envs = len(env_ids)
+            resolved_env_id_tensor = torch.as_tensor(
+                env_ids,
+                device=self._device,
+                dtype=torch.long,
+            )
+            num_selected_envs = resolved_env_id_tensor.shape[0]
 
         desired_velocity_f = desired_velocity_f.to(
             device=self._device,
@@ -374,6 +518,10 @@ class FootholdPlanner(SensorBase):
                 f"{tuple(desired_velocity_f.shape)}."
             )
 
+        # A prepared HOLD plan is a transaction for the next swing.  Keep the
+        # live command buffer current, but do not invalidate that transaction
+        # when heading feedback changes the command on every control tick.  A
+        # new snapshot is consumed when the next HOLD plan is prepared.
         self._data.desired_velocity_f[resolved_env_ids] = desired_velocity_f
 
     def set_flat_target_curriculum_scale(
@@ -414,6 +562,319 @@ class FootholdPlanner(SensorBase):
             torch.nan_to_num(scale_tensor, nan=0.0, posinf=1.0, neginf=0.0)
             .clamp(0.0, 1.0)
         )
+
+    @property
+    def flat_target_curriculum_scale(self) -> torch.Tensor | None:
+        """Read-only view of the per-environment flat-target curriculum scale."""
+
+        return self._flat_target_curriculum_scale
+
+    def _query_target_terrain_height_at_xy_w(
+        self,
+        target_xy_w: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Query terrain mesh height at final target XY with one downward ray.
+
+        The planner uses this only when a new target is created, not every
+        control step.  Missing terrain mesh data returns ``None`` so flat-plane
+        unit tests and non-standard scenes keep their existing z fallback.
+        """
+        if not self.cfg.enable_target_terrain_height:
+            return None
+
+        mesh = RayCaster.meshes.get(self.cfg.target_terrain_mesh_prim_path)
+        if mesh is None:
+            return None
+
+        ray_starts = torch.zeros(
+            target_xy_w.shape[0],
+            3,
+            device=target_xy_w.device,
+            dtype=target_xy_w.dtype,
+        )
+        ray_starts[:, :2] = target_xy_w
+        ray_starts[:, 2] = self.cfg.target_terrain_raycast_start_height_m
+        ray_directions = torch.zeros_like(ray_starts)
+        ray_directions[:, 2] = -1.0
+
+        ray_hits_w, ray_distance, _, _ = raycast_mesh(
+            ray_starts=ray_starts.unsqueeze(1),
+            ray_directions=ray_directions.unsqueeze(1),
+            mesh=mesh,
+            max_dist=self.cfg.target_terrain_raycast_max_dist_m,
+            return_distance=True,
+        )
+        assert ray_distance is not None
+        ray_hits_w = ray_hits_w.squeeze(1)
+        ray_distance = ray_distance.squeeze(1)
+        terrain_height_w = (
+            ray_hits_w[:, 2] + self.cfg.target_terrain_height_offset_m
+        )
+        terrain_valid = torch.isfinite(ray_distance) & torch.isfinite(
+            terrain_height_w
+        )
+        return terrain_height_w, terrain_valid
+
+    def _prepare_learned_footholds(
+        self,
+        *,
+        env_ids: torch.Tensor,
+        stance_pos_w: torch.Tensor,
+        base_yaw_w: torch.Tensor,
+    ) -> None:
+        """Evaluate current high-level proposals during confirmed HOLD."""
+
+        if env_ids.numel() == 0:
+            return
+
+        assert self._data.learned_foothold_action_normalized is not None
+        assert self._data.learned_foothold_event_generation is not None
+        self._data.learned_foothold_event_generation[env_ids] += 1
+
+        def terrain_query_w(
+            target_xy_w: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result = self._query_target_terrain_height_at_xy_w(target_xy_w)
+            if result is not None:
+                return result
+            return (
+                torch.full(
+                    (target_xy_w.shape[0],),
+                    float("nan"),
+                    device=target_xy_w.device,
+                    dtype=target_xy_w.dtype,
+                ),
+                torch.zeros(
+                    target_xy_w.shape[0],
+                    device=target_xy_w.device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        preparation = prepare_learned_foothold_target(
+            normalized_action=(
+                self._data.learned_foothold_action_normalized[env_ids]
+            ),
+            origin_w=stance_pos_w,
+            yaw_w=base_yaw_w,
+            radius_x=self._flat_provider_cfg.outer_radius_x,
+            radius_y=self._flat_provider_cfg.outer_radius_y,
+            max_step_height_m=self.cfg.max_foothold_step_height_m,
+            terrain_height_query_w=terrain_query_w,
+        )
+
+        obstacle = self._virtual_obstacles.get("edges")
+        if obstacle is None:
+            safety_valid = torch.ones_like(preparation.geometric_valid)
+            safety_score = torch.ones(
+                env_ids.shape[0],
+                device=self._device,
+                dtype=preparation.target_f.dtype,
+            )
+            penetrating_point_count = torch.zeros_like(safety_score)
+            penetrating_point_ratio = torch.zeros_like(safety_score)
+            total_penetration_depth = torch.zeros_like(safety_score)
+        else:
+            evaluation = evaluate_safe_foothold_target(
+                target_f=preparation.target_f,
+                support_foot_f=torch.zeros_like(preparation.target_f),
+                target_origin_w=stance_pos_w,
+                target_yaw_w=base_yaw_w,
+                obstacle=cast("TargetSearchObstacle", obstacle),
+                ellipse_half_length=(
+                    self._flat_provider_cfg.outer_radius_x
+                ),
+                ellipse_half_width=(
+                    self._flat_provider_cfg.outer_radius_y
+                ),
+                foot_points_xy=self._safe_target_foot_points_xy,
+                safety_margin=self.cfg.safe_target_search_margin_m,
+            )
+            safety_valid = evaluation.obstacle_safe
+            safety_score = evaluation.safety_score
+            penetrating_point_count = (
+                evaluation.penetrating_point_count
+            )
+            penetrating_point_ratio = (
+                evaluation.penetrating_point_ratio
+            )
+            total_penetration_depth = (
+                evaluation.total_penetration_depth
+            )
+
+        store_learned_foothold_preparation(
+            data=self._data,
+            env_ids=env_ids,
+            preparation=preparation,
+            safety_valid=safety_valid,
+            safety_score=safety_score,
+            penetrating_point_count=penetrating_point_count,
+            penetrating_point_ratio=penetrating_point_ratio,
+            total_penetration_depth=total_penetration_depth,
+        )
+
+    def _prepare_nominal_footholds(
+        self,
+        *,
+        env_ids: torch.Tensor,
+        swing_side: torch.Tensor,
+        recovery_step: torch.Tensor,
+        stance_pos_w: torch.Tensor,
+        base_yaw_w: torch.Tensor,
+    ) -> None:
+        """Generate once in HOLD and cache the exact nominal plan seen by policy."""
+
+        if env_ids.numel() == 0:
+            return
+        assert self._data.raw_unclipped_foothold_f is not None
+        assert self._data.nominal_foothold_prepared is not None
+        assert self._data.nominal_feasible_velocity_f is not None
+        assert self._data.nominal_curriculum_residual_f is not None
+        assert self._data.nominal_curriculum_radius_f is not None
+        assert self._data.nominal_curriculum_usage is not None
+        assert self._data.nominal_frame_origin_w is not None
+        assert self._data.nominal_frame_yaw_w is not None
+        assert self._data.nominal_foothold_w is not None
+        assert self._data.nominal_geometric_valid is not None
+        assert self._data.nominal_safety_valid is not None
+        assert self._data.nominal_safety_score is not None
+
+        # This frame remains authoritative until the next nominal is prepared.
+        # It keeps the nominal observation, learned action decoding, safety
+        # evaluation, and cached world target in one coordinate system.
+        self._data.nominal_frame_origin_w[env_ids] = stance_pos_w
+        self._data.nominal_frame_yaw_w[env_ids] = base_yaw_w
+
+        desired_velocity = self._data.desired_velocity_f[env_ids]
+        level = _flat_target_level_from_curriculum_scale(
+            self._flat_target_curriculum_scale[env_ids],
+            num_levels=len(self._flat_provider_cfg.curriculum_radius_x),
+        )
+        stance_xy_f = torch.zeros(
+            env_ids.shape[0],
+            2,
+            device=self._device,
+            dtype=desired_velocity.dtype,
+        )
+        flat_result = sample_flat_targets(
+            stance_xy=stance_xy_f,
+            swing_side=swing_side,
+            desired_velocity=desired_velocity,
+            level=level,
+            generator=self._generator,
+            cfg=self._flat_provider_cfg,
+        )
+
+        target_f = flat_result.position_f.clone()
+        feasible_velocity_f = flat_result.feasible_velocity_f.clone()
+        curriculum_residual_f = flat_result.curriculum_residual_f.clone()
+        curriculum_radius_f = flat_result.curriculum_radius_f.clone()
+        curriculum_usage = flat_result.curriculum_usage.clone()
+
+        if torch.any(recovery_step).item():
+            recovery_target_f = make_recovery_foothold_target(
+                swing_side=swing_side[recovery_step],
+                desired_velocity_f=desired_velocity[recovery_step],
+                step_length_m=self.cfg.recovery_step_length_m,
+                velocity_lookahead_s=(
+                    self.cfg.recovery_step_velocity_lookahead_s
+                ),
+                max_step_length_m=self.cfg.recovery_step_max_length_m,
+                step_width_m=self.cfg.recovery_step_width_m,
+                dtype=target_f.dtype,
+                device=self._device,
+            )
+            target_f[recovery_step] = recovery_target_f
+            feasible_velocity_f[recovery_step] = (
+                self._feasible_velocity_from_target(
+                    target_foothold_f=recovery_target_f,
+                    swing_side=swing_side[recovery_step],
+                    yaw_velocity_f=torch.zeros(
+                        recovery_target_f.shape[0],
+                        device=self._device,
+                        dtype=target_f.dtype,
+                    ),
+                )
+            )
+            curriculum_residual_f[recovery_step] = 0.0
+            curriculum_radius_f[recovery_step] = 0.0
+            curriculum_usage[recovery_step] = 0.0
+
+        def terrain_query_w(
+            target_xy_w: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result = self._query_target_terrain_height_at_xy_w(target_xy_w)
+            if result is not None:
+                return result
+            return (
+                torch.full(
+                    (target_xy_w.shape[0],),
+                    float("nan"),
+                    device=target_xy_w.device,
+                    dtype=target_xy_w.dtype,
+                ),
+                torch.zeros(
+                    target_xy_w.shape[0],
+                    device=target_xy_w.device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        target_f, target_w, height_valid = (
+            apply_world_height_to_planner_target(
+                origin_w=stance_pos_w,
+                target_xy_f=target_f[:, :2],
+                yaw_w=base_yaw_w,
+                terrain_height_query_w=terrain_query_w,
+            )
+        )
+        geometric_valid = height_valid & (
+            torch.abs(target_f[:, 2])
+            <= self.cfg.max_foothold_step_height_m
+        )
+        obstacle = self._virtual_obstacles.get("edges")
+        if obstacle is None:
+            safety_valid = torch.ones_like(geometric_valid)
+            safety_score = torch.ones(
+                env_ids.shape[0],
+                device=self._device,
+                dtype=target_f.dtype,
+            )
+        else:
+            evaluation = evaluate_safe_foothold_target(
+                target_f=target_f,
+                support_foot_f=torch.zeros_like(target_f),
+                target_origin_w=stance_pos_w,
+                target_yaw_w=base_yaw_w,
+                obstacle=cast("TargetSearchObstacle", obstacle),
+                ellipse_half_length=(
+                    self._flat_provider_cfg.outer_radius_x
+                ),
+                ellipse_half_width=(
+                    self._flat_provider_cfg.outer_radius_y
+                ),
+                foot_points_xy=self._safe_target_foot_points_xy,
+                safety_margin=self.cfg.safe_target_search_margin_m,
+            )
+            safety_valid = evaluation.obstacle_safe
+            safety_score = evaluation.safety_score
+
+        self._data.raw_unclipped_foothold_f[env_ids] = target_f
+        self._data.nominal_feasible_velocity_f[env_ids] = (
+            feasible_velocity_f
+        )
+        self._data.nominal_curriculum_residual_f[env_ids] = (
+            curriculum_residual_f
+        )
+        self._data.nominal_curriculum_radius_f[env_ids] = (
+            curriculum_radius_f
+        )
+        self._data.nominal_curriculum_usage[env_ids] = curriculum_usage
+        self._data.nominal_foothold_w[env_ids] = target_w
+        self._data.nominal_geometric_valid[env_ids] = geometric_valid
+        self._data.nominal_safety_valid[env_ids] = safety_valid
+        self._data.nominal_safety_score[env_ids] = safety_score
+        self._data.nominal_foothold_prepared[env_ids] = True
 
     def _feasible_velocity_from_target(
         self,
@@ -495,6 +956,14 @@ class FootholdPlanner(SensorBase):
             self._data.swing_clearance_safe[reset_env_ids] = True
         if self._data.swing_clearance_penetration is not None:
             self._data.swing_clearance_penetration[reset_env_ids] = 0.0
+        if self._data.swing_clearance_deepest_phase is not None:
+            self._data.swing_clearance_deepest_phase[reset_env_ids] = 0.0
+        if self._data.swing_clearance_start_penetration is not None:
+            self._data.swing_clearance_start_penetration[reset_env_ids] = 0.0
+        if self._data.swing_clearance_goal_penetration is not None:
+            self._data.swing_clearance_goal_penetration[reset_env_ids] = 0.0
+        if self._data.swing_clearance_start_escape_safe is not None:
+            self._data.swing_clearance_start_escape_safe[reset_env_ids] = False
         if self._data.touchdown_accepted is not None:
             self._data.touchdown_accepted[reset_env_ids] = False
         if self._data.touchdown_xy_error is not None:
@@ -513,6 +982,25 @@ class FootholdPlanner(SensorBase):
             self._data.swing_has_lifted[reset_env_ids] = False
         if self._data.recovery_step_active is not None:
             self._data.recovery_step_active[reset_env_ids] = False
+        if self._data.confirmed_foot_contact is not None:
+            self._data.confirmed_foot_contact[reset_env_ids] = False
+        for name in (
+            "body_tilt_rad",
+            "body_angular_speed_rad_s",
+            "body_horizontal_speed_m_s",
+            "support_slip_m_s",
+        ):
+            value = getattr(self._data, name, None)
+            if value is not None:
+                value[reset_env_ids] = 0.0
+        if self._data.stabilization_active is not None:
+            self._data.stabilization_active[reset_env_ids] = False
+        if self._data.stabilization_ready is not None:
+            self._data.stabilization_ready[reset_env_ids] = False
+        if self._data.event_response is not None:
+            self._data.event_response[reset_env_ids] = EventResponse.NONE
+        if self._data.planning_failure is not None:
+            self._data.planning_failure[reset_env_ids] = False
         if self._data.planner_valid is not None:
             self._data.planner_valid[reset_env_ids] = True
         if self._data.safe_target_search_performed is not None:
@@ -537,6 +1025,10 @@ class FootholdPlanner(SensorBase):
             self._data.safe_target_candidate_obstacle_safe_count[reset_env_ids] = 0.0
         if self._data.safe_target_candidate_valid_count is not None:
             self._data.safe_target_candidate_valid_count[reset_env_ids] = 0.0
+        if self._data.safe_target_final_max_penetration_depth is not None:
+            self._data.safe_target_final_max_penetration_depth[
+                reset_env_ids
+            ] = 0.0
         if self._data.raw_unclipped_foothold_f is not None:
             self._data.raw_unclipped_foothold_f[reset_env_ids] = 0.0
         if self._data.flat_target_level is not None:
@@ -546,6 +1038,11 @@ class FootholdPlanner(SensorBase):
                 self._flat_provider_cfg.velocity_lookahead_s
             )
         _clear_foothold_plan_buffers(self._data, reset_env_ids)
+        clear_learned_foothold_buffers(self._data, reset_env_ids)
+        if hasattr(self, "_previous_sole_valid"):
+            self._previous_sole_valid[reset_env_ids] = False
+            self._previous_left_sole_pos_w[reset_env_ids] = 0.0
+            self._previous_right_sole_pos_w[reset_env_ids] = 0.0
 
     def _initialize_impl(self):
         super()._initialize_impl()
@@ -793,6 +1290,136 @@ class FootholdPlanner(SensorBase):
             3,
             device=self._device,
         )
+        self._data.learned_foothold_enabled = torch.full(
+            (self._num_envs,),
+            self.cfg.enable_learned_foothold,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_action_normalized = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.learned_foothold_decoded_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.learned_foothold_prepared_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.learned_foothold_prepared_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.learned_foothold_prepared_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_lock_geometric_valid = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.target_terrain_valid = torch.ones(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_locked = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_target_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.learned_foothold_target_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.learned_foothold_used = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_height_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_geometric_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_safety_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_evaluated = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_event_generation = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.int64,
+        )
+        self._data.learned_foothold_route_event = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_route_use_nominal = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_route_use_learned = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_route_initial_executable = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.learned_foothold_safety_score = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.learned_foothold_penetrating_point_count = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.learned_foothold_penetrating_point_ratio = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.learned_foothold_total_penetration_depth = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._safe_target_foot_points_xy = make_sole_perimeter_points_xy(
+            foot_length=self.cfg.safe_target_foot_length_m,
+            foot_width=self.cfg.safe_target_foot_width_m,
+            num_x=self.cfg.safe_target_foot_grid_num_x,
+            num_y=self.cfg.safe_target_foot_grid_num_y,
+            device=self._device,
+            dtype=torch.float,
+        )
         self._data.desired_velocity_f = torch.zeros(
             self._num_envs,
             3,
@@ -853,9 +1480,65 @@ class FootholdPlanner(SensorBase):
             self._num_envs,
             device=self._device,
         )
+        self._data.safe_target_final_max_penetration_depth = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
         self._data.raw_unclipped_foothold_f = torch.zeros(
             self._num_envs,
             3,
+            device=self._device,
+        )
+        self._data.nominal_foothold_prepared = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.nominal_feasible_velocity_f = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.nominal_curriculum_residual_f = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.nominal_curriculum_radius_f = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+        )
+        self._data.nominal_curriculum_usage = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.nominal_frame_origin_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.nominal_frame_yaw_w = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.nominal_foothold_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.nominal_geometric_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.nominal_safety_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.nominal_safety_score = torch.zeros(
+            self._num_envs,
             device=self._device,
         )
         self._data.flat_target_level = torch.zeros(
@@ -922,6 +1605,23 @@ class FootholdPlanner(SensorBase):
             self._num_envs,
             device=self._device,
         )
+        self._data.swing_clearance_deepest_phase = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.swing_clearance_start_penetration = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.swing_clearance_goal_penetration = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.swing_clearance_start_escape_safe = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
         self._data.actual_stance_foot_pos_w = torch.zeros(
             self._num_envs,
             3,
@@ -942,6 +1642,49 @@ class FootholdPlanner(SensorBase):
             2,
             device=self._device,
             dtype=torch.bool,
+        )
+        self._previous_left_sole_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._previous_right_sole_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._previous_sole_valid = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.confirmed_foot_contact = torch.zeros(
+            self._num_envs,
+            2,
+            device=self._device,
+            dtype=torch.bool,
+        )
+        self._data.body_tilt_rad = torch.zeros(self._num_envs, device=self._device)
+        self._data.body_angular_speed_rad_s = torch.zeros(
+            self._num_envs, device=self._device
+        )
+        self._data.body_horizontal_speed_m_s = torch.zeros(
+            self._num_envs, device=self._device
+        )
+        self._data.support_slip_m_s = torch.zeros(
+            self._num_envs, device=self._device
+        )
+        self._data.stabilization_active = torch.zeros(
+            self._num_envs, device=self._device, dtype=torch.bool
+        )
+        self._data.stabilization_ready = torch.zeros(
+            self._num_envs, device=self._device, dtype=torch.bool
+        )
+        self._data.event_response = torch.zeros(
+            self._num_envs, device=self._device, dtype=torch.long
+        )
+        self._data.planning_failure = torch.zeros(
+            self._num_envs, device=self._device, dtype=torch.bool
         )
 
         self._data.touchdown_accepted = torch.zeros(
@@ -1022,6 +1765,21 @@ class FootholdPlanner(SensorBase):
             recovery_step_active=self._gait_state.recovery_step_active[
                 env_ids
             ],
+            stabilization_elapsed_s=(
+                None
+                if self._gait_state.stabilization_elapsed_s is None
+                else self._gait_state.stabilization_elapsed_s[env_ids]
+            ),
+            late_search_elapsed_s=(
+                None
+                if self._gait_state.late_search_elapsed_s is None
+                else self._gait_state.late_search_elapsed_s[env_ids]
+            ),
+            planning_failure=(
+                None
+                if self._gait_state.planning_failure is None
+                else self._gait_state.planning_failure[env_ids]
+            ),
         )
 
     def _write_gait_state(
@@ -1047,6 +1805,25 @@ class FootholdPlanner(SensorBase):
         self._gait_state.recovery_step_active[env_ids] = (
             state.recovery_step_active
         )
+        if (
+            self._gait_state.stabilization_elapsed_s is not None
+            and state.stabilization_elapsed_s is not None
+        ):
+            self._gait_state.stabilization_elapsed_s[env_ids] = (
+                state.stabilization_elapsed_s
+            )
+        if (
+            self._gait_state.late_search_elapsed_s is not None
+            and state.late_search_elapsed_s is not None
+        ):
+            self._gait_state.late_search_elapsed_s[env_ids] = (
+                state.late_search_elapsed_s
+            )
+        if (
+            self._gait_state.planning_failure is not None
+            and state.planning_failure is not None
+        ):
+            self._gait_state.planning_failure[env_ids] = state.planning_failure
 
     def _startup_hold_mask(self, selected_env_ids: torch.Tensor) -> torch.Tensor:
         if self.cfg.startup_hold_s <= 0.0:
@@ -1072,6 +1849,7 @@ class FootholdPlanner(SensorBase):
                 device=self._device,
                 dtype=torch.long,
             )
+        startup_hold_mask = self._startup_hold_mask(selected_env_ids)
 
         assert self._data.planner_valid is not None
         assert self._data.touchdown_accepted is not None
@@ -1097,6 +1875,21 @@ class FootholdPlanner(SensorBase):
         assert self._data.recovery_step_active is not None
 
         self._data.planner_valid[env_ids] = True
+        if self._data.learned_foothold_evaluated is not None:
+            self._data.learned_foothold_evaluated[env_ids] = False
+        if self._data.learned_foothold_route_event is not None:
+            self._data.learned_foothold_route_event[env_ids] = False
+        if self._data.learned_foothold_route_use_nominal is not None:
+            self._data.learned_foothold_route_use_nominal[env_ids] = False
+        if self._data.learned_foothold_route_use_learned is not None:
+            self._data.learned_foothold_route_use_learned[env_ids] = False
+        if (
+            self._data.learned_foothold_route_initial_executable
+            is not None
+        ):
+            self._data.learned_foothold_route_initial_executable[
+                env_ids
+            ] = False
         _clear_safe_target_event_buffers(self._data, env_ids)
 
         robot_body_poses_w = self._robot_body_physx_view.get_transforms().view(
@@ -1138,20 +1931,13 @@ class FootholdPlanner(SensorBase):
             right_ankle_quat_w,
         )
 
-        swing_side = self._data.swing_side[env_ids]
-        swing_is_left = swing_side == 0
-
-        self._data.actual_stance_foot_pos_w[env_ids] = torch.where(
-            swing_is_left.unsqueeze(-1),
-            right_sole_pos_w,
-            left_sole_pos_w,
+        stance_sole_pos_w, swing_sole_pos_w = _select_sole_roles(
+            left_sole_w=left_sole_pos_w,
+            right_sole_w=right_sole_pos_w,
+            swing_side=self._data.swing_side[env_ids],
         )
-
-        self._data.actual_swing_foot_pos_w[env_ids] = torch.where(
-            swing_is_left.unsqueeze(-1),
-            left_sole_pos_w,
-            right_sole_pos_w,
-        )
+        self._data.actual_stance_foot_pos_w[env_ids] = stance_sole_pos_w
+        self._data.actual_swing_foot_pos_w[env_ids] = swing_sole_pos_w
 
         foot_target_error = torch.linalg.norm(
             (
@@ -1185,6 +1971,58 @@ class FootholdPlanner(SensorBase):
         )
         self._data.foot_contact[env_ids] = contact
 
+        # Stability diagnostics use the same reduced PhysX body view as the
+        # planner.  Velocities are world-frame [linear, angular] values, and
+        # the tilt is derived from the pelvis z-axis rather than a guessed
+        # Euler-angle convention.
+        robot_body_vels_w = self._robot_body_physx_view.get_velocities().view(
+            self._num_envs,
+            self._num_robot_bodies,
+            6,
+        )[env_ids]
+        base_vel_w = robot_body_vels_w[:, self._base_body_id]
+        base_quat = base_quat_w
+        pelvis_z_world_z = 1.0 - 2.0 * (
+            base_quat[:, 1].square() + base_quat[:, 2].square()
+        )
+        body_tilt_rad = torch.acos(
+            pelvis_z_world_z.clamp(min=-1.0, max=1.0)
+        )
+        self._data.body_tilt_rad[env_ids] = body_tilt_rad
+        self._data.body_angular_speed_rad_s[env_ids] = torch.linalg.vector_norm(
+            base_vel_w[:, 3:],
+            dim=-1,
+        )
+        self._data.body_horizontal_speed_m_s[env_ids] = torch.linalg.vector_norm(
+            base_vel_w[:, :2],
+            dim=-1,
+        )
+        previous_valid = self._previous_sole_valid[env_ids]
+        left_slip = torch.linalg.vector_norm(
+            left_sole_pos_w[:, :2]
+            - self._previous_left_sole_pos_w[env_ids, :2],
+            dim=-1,
+        ) / self.cfg.control_dt_s
+        right_slip = torch.linalg.vector_norm(
+            right_sole_pos_w[:, :2]
+            - self._previous_right_sole_pos_w[env_ids, :2],
+            dim=-1,
+        ) / self.cfg.control_dt_s
+        support_side_for_slip = 1 - self._gait_state.swing_side[env_ids]
+        support_slip = torch.where(
+            support_side_for_slip == 0,
+            left_slip,
+            right_slip,
+        )
+        self._data.support_slip_m_s[env_ids] = torch.where(
+            previous_valid,
+            support_slip,
+            torch.zeros_like(support_slip),
+        )
+        self._previous_left_sole_pos_w[env_ids] = left_sole_pos_w
+        self._previous_right_sole_pos_w[env_ids] = right_sole_pos_w
+        self._previous_sole_valid[env_ids] = True
+
         selected_env_count = contact.shape[0]
         selected_rows = torch.arange(
             selected_env_count,
@@ -1216,28 +2054,387 @@ class FootholdPlanner(SensorBase):
         self._data.touchdown_accepted[env_ids] = (
             swing_foot_contact
             & current_swing_has_lifted
+            & touchdown_xy_ok
+            & touchdown_z_ok
         )
-        step_hold_s = _adaptive_step_hold_s(
-            self._data.desired_velocity_f[env_ids],
-            base_hold_s=self.cfg.step_hold_s,
-            min_hold_s=self.cfg.step_hold_min_s,
-            velocity_scale_s_per_mps=self.cfg.step_hold_velocity_scale_s_per_mps,
+        previous_gait_state = self._select_gait_state(env_ids)
+        step_hold_s = torch.zeros_like(
+            previous_gait_state.hold_required_s,
+        )
+        next_contact_elapsed_s = torch.where(
+            contact,
+            previous_gait_state.contact_elapsed_s + self.cfg.control_dt_s,
+            torch.zeros_like(previous_gait_state.contact_elapsed_s),
+        )
+        next_no_contact_elapsed_s = torch.where(
+            contact,
+            torch.zeros_like(previous_gait_state.no_contact_elapsed_s),
+            previous_gait_state.no_contact_elapsed_s
+            + self.cfg.control_dt_s,
+        )
+        confirmed_contact = (
+            next_contact_elapsed_s
+            >= self.cfg.contact_confirm_s - 1.0e-6
+        )
+        self._data.confirmed_foot_contact[env_ids] = confirmed_contact
+        both_contacts_confirmed = torch.all(
+            confirmed_contact,
+            dim=-1,
+        )
+        stance_side = 1 - previous_gait_state.swing_side
+        new_support_confirmed = confirmed_contact[
+            selected_rows,
+            stance_side,
+        ]
+        confirmed_contact_lost = (
+            next_no_contact_elapsed_s
+            >= self.cfg.hold_contact_lost_confirm_s - 1.0e-6
+        )
+        any_contact_lost = torch.any(
+            confirmed_contact_lost,
+            dim=-1,
+        )
+        new_support_lost = confirmed_contact_lost[
+            selected_rows,
+            stance_side,
+        ]
+        initial_stabilization_hold = (
+            (previous_gait_state.mode == GaitState.HOLD)
+            & ~previous_gait_state.recovery_step_pending
+            & (
+                (previous_gait_state.hold_required_s < 0.0)
+                | (
+                    previous_gait_state.hold_required_s
+                    >= self.cfg.reset_hold_s - 1.0e-6
+                )
+            )
+        )
+        recovery_mode = previous_gait_state.mode == GaitState.RECOVERY
+        recovery_hold = (
+            recovery_mode
+            | previous_gait_state.recovery_step_pending
+        )
+        strict_double_support = (
+            startup_hold_mask
+            | initial_stabilization_hold
+        )
+        hold_contact_ready = torch.where(
+            strict_double_support,
+            both_contacts_confirmed,
+            torch.where(
+                recovery_hold,
+                torch.any(confirmed_contact, dim=-1),
+                new_support_confirmed,
+            ),
+        )
+        hold_contact_lost = torch.where(
+            strict_double_support,
+            any_contact_lost,
+            # During a recovery step, the non-support foot is expected to be
+            # airborne.  Only the selected support foot may trigger contact
+            # loss; using any_contact_lost here would immediately re-enter
+            # recovery whenever the swing foot stayed lifted.
+            new_support_lost,
         )
 
+        # A support loss invalidates the pending recovery transaction.  Clear
+        # it before reading the cache so the next confirmed support relation
+        # gets a fresh analytic target in the new support frame.  Active
+        # swings keep their locked target until the state machine reports the
+        # failure; only HOLD/recovery planning is cleared here.
+        discard_pending_plan = (
+            (
+                (previous_gait_state.mode == GaitState.HOLD)
+                | (previous_gait_state.mode == GaitState.RECOVERY)
+            )
+            & hold_contact_lost
+        ) | (
+            (previous_gait_state.mode == GaitState.RECOVERY)
+            & ~previous_gait_state.recovery_step_pending
+        )
+        if torch.any(discard_pending_plan).item():
+            discard_env_ids = selected_env_ids[discard_pending_plan]
+            _clear_foothold_plan_buffers(self._data, discard_env_ids)
+            clear_learned_foothold_buffers(self._data, discard_env_ids)
+
+        nominal_ready_before_update = torch.ones_like(
+            both_contacts_confirmed,
+        )
+        if self.cfg.enable_learned_foothold:
+            assert self._data.nominal_foothold_prepared is not None
+            nominal_ready_before_update = (
+                self._data.nominal_foothold_prepared[env_ids].clone()
+            )
+            prepare_nominal = nominal_foothold_prepare_mask(
+                hold=previous_gait_state.mode == GaitState.HOLD,
+                hold_contact_ready=hold_contact_ready,
+                nominal_ready=nominal_ready_before_update,
+                startup_hold=startup_hold_mask,
+            )
+            # In contact-adaptive recovery the motor policy owns recovery.
+            # Do not create an analytic recovery target that can race the
+            # autonomous stabilization behavior.
+            if self.cfg.enable_contact_adaptive_recovery:
+                prepare_nominal &= ~recovery_mode
+            if torch.any(prepare_nominal).item():
+                recovery_step = previous_gait_state.recovery_step_pending[
+                    prepare_nominal
+                ].clone()
+                if self.cfg.enable_contact_adaptive_recovery:
+                    # Keep this as a boolean mask.  Applying Python's ``~``
+                    # to a bool produces an integer (-1/-2), which would be
+                    # interpreted as row indices by torch advanced indexing.
+                    recovery_step.zero_()
+                self._prepare_nominal_footholds(
+                    env_ids=selected_env_ids[prepare_nominal],
+                    swing_side=previous_gait_state.swing_side[
+                        prepare_nominal
+                    ],
+                    recovery_step=recovery_step,
+                    stance_pos_w=self._data.actual_stance_foot_pos_w[
+                        selected_env_ids[prepare_nominal]
+                    ],
+                    base_yaw_w=base_yaw_w[prepare_nominal],
+                )
+        prepare_learned, _ = learned_foothold_event_masks(
+            hold=previous_gait_state.mode == GaitState.HOLD,
+            hold_contact_ready=hold_contact_ready,
+            nominal_ready=nominal_ready_before_update,
+            new_swing=torch.zeros_like(both_contacts_confirmed),
+            enable=self.cfg.enable_learned_foothold,
+        )
+        prepare_learned &= ~startup_hold_mask
+        # Recovery uses only the analytic target.  Do not evaluate a learned
+        # proposal that cannot be executed; it would add an unconsumed PPO
+        # event and waste a control-step terrain/safety computation.
+        prepare_learned &= ~previous_gait_state.recovery_step_pending
+        if self.cfg.enable_contact_adaptive_recovery:
+            prepare_learned &= ~recovery_mode
+        # Once a geometrically usable proposal has been found, keep that
+        # proposal through the remainder of HOLD.  Danger-cylinder safety is
+        # a soft PPO signal during training, so it must not be used here to
+        # keep sampling until a safe proposal appears; doing so would remove
+        # the action's consequences from the learning signal.
+        if self.cfg.enable_learned_foothold:
+            assert self._data.learned_foothold_evaluated is not None
+            assert self._data.learned_foothold_prepared_valid is not None
+            assert self._data.learned_foothold_geometric_valid is not None
+            already_usable = (
+                self._data.learned_foothold_evaluated[selected_env_ids]
+                & self._data.learned_foothold_prepared_valid[selected_env_ids]
+                & self._data.learned_foothold_geometric_valid[selected_env_ids]
+            )
+            prepare_learned &= ~already_usable
+        if torch.any(prepare_learned).item():
+            prepare_env_ids = selected_env_ids[prepare_learned]
+            assert self._data.nominal_frame_origin_w is not None
+            assert self._data.nominal_frame_yaw_w is not None
+            self._prepare_learned_footholds(
+                env_ids=prepare_env_ids,
+                stance_pos_w=self._data.nominal_frame_origin_w[
+                    prepare_env_ids
+                ],
+                base_yaw_w=self._data.nominal_frame_yaw_w[
+                    prepare_env_ids
+                ],
+            )
+
+        swing_ready = torch.ones_like(
+            both_contacts_confirmed,
+            dtype=torch.bool,
+        )
+        plan_wait_expired = torch.zeros_like(swing_ready)
+        if self.cfg.enable_learned_foothold:
+            assert self._data.nominal_foothold_prepared is not None
+            assert self._data.nominal_geometric_valid is not None
+            assert self._data.nominal_safety_valid is not None
+            assert self._data.learned_foothold_evaluated is not None
+            assert self._data.learned_foothold_prepared_valid is not None
+            assert self._data.learned_foothold_geometric_valid is not None
+            recovery_pending = previous_gait_state.recovery_step_pending
+            nominal_route_ready = (
+                self._data.nominal_foothold_prepared[selected_env_ids]
+                & self._data.nominal_geometric_valid[selected_env_ids]
+                & (
+                    self._data.nominal_safety_valid[selected_env_ids]
+                    | recovery_pending
+                )
+            )
+            swing_ready = learned_foothold_swing_ready(
+                nominal_route_ready=nominal_route_ready,
+                learned_evaluated=(
+                    self._data.learned_foothold_evaluated[selected_env_ids]
+                ),
+                learned_prepared_valid=(
+                    self._data.learned_foothold_prepared_valid[
+                        selected_env_ids
+                    ]
+                ),
+                learned_geometric_valid=(
+                    self._data.learned_foothold_geometric_valid[
+                        selected_env_ids
+                    ]
+                ),
+                recovery_step=previous_gait_state.recovery_step_pending,
+            )
+            if self.cfg.enable_contact_adaptive_recovery:
+                swing_ready &= ~recovery_mode
+            plan_wait_expired = (
+                self._data.nominal_foothold_prepared[selected_env_ids]
+                & self._data.learned_foothold_evaluated[selected_env_ids]
+                & ~swing_ready
+            )
+
+        event_response = None
+        stabilization_ready = None
+        late_search_exhausted = None
+        planning_failure = None
+        if self.cfg.enable_contact_adaptive_recovery:
+            assert self._stability_bounds is not None
+            assert self._data.body_tilt_rad is not None
+            assert self._data.body_angular_speed_rad_s is not None
+            assert self._data.body_horizontal_speed_m_s is not None
+            assert self._data.support_slip_m_s is not None
+            stability_signals = StabilitySignals(
+                confirmed_contact=confirmed_contact,
+                body_tilt_rad=self._data.body_tilt_rad[env_ids],
+                body_angular_speed_rad_s=(
+                    self._data.body_angular_speed_rad_s[env_ids]
+                ),
+                body_horizontal_speed_m_s=(
+                    self._data.body_horizontal_speed_m_s[env_ids]
+                ),
+                support_slip_m_s=self._data.support_slip_m_s[env_ids],
+            )
+            stable_now = (
+                torch.any(confirmed_contact, dim=-1)
+                & (stability_signals.body_tilt_rad <= self._stability_bounds.max_tilt_rad)
+                & (
+                    stability_signals.body_angular_speed_rad_s
+                    <= self._stability_bounds.max_angular_speed_rad_s
+                )
+                & (
+                    stability_signals.body_horizontal_speed_m_s
+                    <= self._stability_bounds.max_horizontal_speed_m_s
+                )
+                & (
+                    stability_signals.support_slip_m_s
+                    <= self._stability_bounds.max_support_slip_m_s
+                )
+            )
+            previous_stability_elapsed = (
+                previous_gait_state.stabilization_elapsed_s
+                if previous_gait_state.stabilization_elapsed_s is not None
+                else torch.zeros_like(previous_gait_state.elapsed_s)
+            )
+            stabilization_ready, _ = stability_ready(
+                stability_signals,
+                self._stability_bounds,
+                previous_stability_elapsed,
+                self.cfg.control_dt_s,
+            )
+            event = torch.full_like(
+                previous_gait_state.mode,
+                ContactEvent.NONE,
+            )
+            swing_contact_confirmed = confirmed_contact[
+                selected_rows,
+                previous_gait_state.swing_side,
+            ]
+            event[
+                (previous_gait_state.mode == GaitState.EARLY_CONTACT)
+                & swing_contact_confirmed
+            ] = ContactEvent.EARLY_CONTACT
+            event[previous_gait_state.mode == GaitState.OVERDUE] = (
+                ContactEvent.LATE_CONTACT
+            )
+            event[
+                (previous_gait_state.mode == GaitState.STANCE_LOST)
+                | (previous_gait_state.mode == GaitState.HOLD_CONTACT_LOST)
+            ] = ContactEvent.SUPPORT_LOST
+            event[
+                (previous_gait_state.mode == GaitState.PLAN_INVALID)
+                | (
+                    (previous_gait_state.mode == GaitState.HOLD)
+                    & ~self._data.planner_valid[env_ids]
+                )
+            ] = ContactEvent.PLAN_INVALID
+            late_elapsed = (
+                previous_gait_state.late_search_elapsed_s
+                if previous_gait_state.late_search_elapsed_s is not None
+                else torch.zeros_like(previous_gait_state.elapsed_s)
+            )
+            late_speed = self.cfg.touchdown_z_tolerance_m / self.cfg.overdue_s
+            late_search_exhausted = late_elapsed >= (
+                self.cfg.max_foothold_step_height_m / late_speed
+            )
+            event_response = response_for_event(
+                event,
+                support_stable=stable_now,
+                late_search_available=~late_search_exhausted,
+            )
+            event_response[previous_gait_state.mode == GaitState.RECOVERY] = (
+                EventResponse.STABILIZE
+            )
+            planning_failure = plan_wait_expired & stable_now
+            self._data.event_response[env_ids] = event_response
+            self._data.stabilization_ready[env_ids] = stabilization_ready
+            self._data.planning_failure[env_ids] = planning_failure
+
         gait_state = advance_gait(
-            state=self._select_gait_state(env_ids),
+            state=previous_gait_state,
             contact=contact,
             touchdown_accepted=self._data.touchdown_accepted[env_ids],
             planner_valid=self._data.planner_valid[env_ids],
             dt=self.cfg.control_dt_s,
             cfg=self._gait_cfg,
             step_hold_s=step_hold_s,
+            swing_ready=swing_ready,
+            hold_contact_ready=hold_contact_ready,
+            hold_contact_lost=hold_contact_lost,
+            plan_wait_expired=plan_wait_expired,
+            event_response=event_response,
+            stabilization_ready=stabilization_ready,
+            late_search_exhausted=late_search_exhausted,
+            planning_failure=planning_failure,
         )
+        # ``advance_gait`` swaps ``swing_side`` on touchdown/recovery entry.
+        # Refresh the physical foot roles immediately so every downstream
+        # HOLD cache is anchored to the *new* support foot, not to the support
+        # foot from the just-finished step.
+        stance_sole_pos_w, swing_sole_pos_w = _select_sole_roles(
+            left_sole_w=left_sole_pos_w,
+            right_sole_w=right_sole_pos_w,
+            swing_side=gait_state.swing_side,
+        )
+        self._data.actual_stance_foot_pos_w[env_ids] = stance_sole_pos_w
+        self._data.actual_swing_foot_pos_w[env_ids] = swing_sole_pos_w
+        if self._data.stabilization_active is not None:
+            self._data.stabilization_active[env_ids] = (
+                gait_state.mode == GaitState.RECOVERY
+            )
+        entered_hold = (
+            (gait_state.mode == GaitState.HOLD)
+            & (previous_gait_state.mode != GaitState.HOLD)
+        )
+        entered_hold &= ~startup_hold_mask
+        if self.cfg.enable_learned_foothold and torch.any(
+            entered_hold
+        ).item():
+            entered_hold_env_ids = selected_env_ids[entered_hold]
+            clear_learned_foothold_buffers(
+                self._data,
+                entered_hold_env_ids,
+            )
+            assert self._data.nominal_foothold_prepared is not None
+            self._data.nominal_foothold_prepared[
+                entered_hold_env_ids
+            ] = False
         _apply_startup_hold_gate(
             data=self._data,
             gait_state=gait_state,
             selected_env_ids=selected_env_ids,
-            startup_hold_mask=self._startup_hold_mask(selected_env_ids),
+            startup_hold_mask=startup_hold_mask,
             reset_hold_s=self.cfg.reset_hold_s,
         )
         self._write_gait_state(env_ids, gait_state)
@@ -1260,6 +2457,23 @@ class FootholdPlanner(SensorBase):
             | (gait_state.mode == GaitState.RIGHT_SWING)
         )
         new_swing = active_swing & (gait_state.elapsed_s <= 1.0e-6)
+        learned_use = torch.zeros_like(new_swing)
+        if self.cfg.enable_learned_foothold:
+            _, lock_learned = learned_foothold_event_masks(
+                hold=gait_state.mode == GaitState.HOLD,
+                hold_contact_ready=hold_contact_ready,
+                nominal_ready=torch.ones_like(new_swing),
+                new_swing=new_swing,
+                enable=True,
+            )
+            if torch.any(lock_learned).item():
+                lock_env_ids = selected_env_ids[lock_learned]
+                learned_use[lock_learned] = (
+                    lock_prepared_learned_foothold(
+                        data=self._data,
+                        env_ids=lock_env_ids,
+                    )
+                )
 
         if torch.any(new_swing).item():
             new_swing_env_ids = selected_env_ids[new_swing]
@@ -1281,74 +2495,284 @@ class FootholdPlanner(SensorBase):
                 dtype=new_swing_stance_pos_w.dtype,
             )
 
-            flat_result = sample_flat_targets(
-                stance_xy=stance_xy_f,
-                swing_side=new_swing_side,
-                desired_velocity=desired_velocity,
-                level=level,
-                generator=self._generator,
-                cfg=self._flat_provider_cfg,
-            )
-
             self._data.swing_start_pos_w[new_swing_env_ids] = (
                 self._data.actual_swing_foot_pos_w[env_ids][new_swing]
             )
-
-            target_foothold_f = flat_result.position_f
-            feasible_velocity_f = flat_result.feasible_velocity_f
-            curriculum_residual_f = flat_result.curriculum_residual_f.clone()
-            curriculum_radius_f = flat_result.curriculum_radius_f.clone()
-            curriculum_usage = flat_result.curriculum_usage.clone()
             recovery_step = gait_state.recovery_step_active[new_swing]
-            if torch.any(recovery_step).item():
-                recovery_target_f = make_recovery_foothold_target(
-                    swing_side=new_swing_side[recovery_step],
-                    desired_velocity_f=desired_velocity[recovery_step],
-                    step_length_m=self.cfg.recovery_step_length_m,
-                    velocity_lookahead_s=(
-                        self.cfg.recovery_step_velocity_lookahead_s
-                    ),
-                    max_step_length_m=self.cfg.recovery_step_max_length_m,
-                    step_width_m=self.cfg.recovery_step_width_m,
-                    dtype=target_foothold_f.dtype,
-                    device=self._device,
+            if self.cfg.enable_learned_foothold:
+                assert self._data.nominal_foothold_prepared is not None
+                missing_nominal = ~self._data.nominal_foothold_prepared[
+                    new_swing_env_ids
+                ]
+                if torch.any(missing_nominal).item():
+                    # Startup/reset fallback. Normal HOLD operation publishes
+                    # this cache one policy cycle before it is consumed.
+                    self._prepare_nominal_footholds(
+                        env_ids=new_swing_env_ids[missing_nominal],
+                        swing_side=new_swing_side[missing_nominal],
+                        recovery_step=recovery_step[missing_nominal],
+                        stance_pos_w=new_swing_stance_pos_w[
+                            missing_nominal
+                        ],
+                        base_yaw_w=base_yaw_w[new_swing][
+                            missing_nominal
+                        ],
+                    )
+                assert self._data.raw_unclipped_foothold_f is not None
+                assert self._data.nominal_feasible_velocity_f is not None
+                assert self._data.nominal_curriculum_residual_f is not None
+                assert self._data.nominal_curriculum_radius_f is not None
+                assert self._data.nominal_curriculum_usage is not None
+                target_foothold_f = self._data.raw_unclipped_foothold_f[
+                    new_swing_env_ids
+                ].clone()
+                feasible_velocity_f = (
+                    self._data.nominal_feasible_velocity_f[
+                        new_swing_env_ids
+                    ].clone()
                 )
-                target_foothold_f[recovery_step] = recovery_target_f
-                feasible_velocity_f[recovery_step] = (
-                    self._feasible_velocity_from_target(
-                        target_foothold_f=recovery_target_f,
+                curriculum_residual_f = (
+                    self._data.nominal_curriculum_residual_f[
+                        new_swing_env_ids
+                    ].clone()
+                )
+                curriculum_radius_f = (
+                    self._data.nominal_curriculum_radius_f[
+                        new_swing_env_ids
+                    ].clone()
+                )
+                curriculum_usage = self._data.nominal_curriculum_usage[
+                    new_swing_env_ids
+                ].clone()
+            else:
+                flat_result = sample_flat_targets(
+                    stance_xy=stance_xy_f,
+                    swing_side=new_swing_side,
+                    desired_velocity=desired_velocity,
+                    level=level,
+                    generator=self._generator,
+                    cfg=self._flat_provider_cfg,
+                )
+                target_foothold_f = flat_result.position_f
+                feasible_velocity_f = flat_result.feasible_velocity_f
+                curriculum_residual_f = (
+                    flat_result.curriculum_residual_f.clone()
+                )
+                curriculum_radius_f = (
+                    flat_result.curriculum_radius_f.clone()
+                )
+                curriculum_usage = flat_result.curriculum_usage.clone()
+                if torch.any(recovery_step).item():
+                    recovery_target_f = make_recovery_foothold_target(
                         swing_side=new_swing_side[recovery_step],
-                        yaw_velocity_f=torch.zeros(
-                            recovery_target_f.shape[0],
-                            device=self._device,
-                            dtype=target_foothold_f.dtype,
+                        desired_velocity_f=desired_velocity[recovery_step],
+                        step_length_m=self.cfg.recovery_step_length_m,
+                        velocity_lookahead_s=(
+                            self.cfg.recovery_step_velocity_lookahead_s
+                        ),
+                        max_step_length_m=(
+                            self.cfg.recovery_step_max_length_m
+                        ),
+                        step_width_m=self.cfg.recovery_step_width_m,
+                        dtype=target_foothold_f.dtype,
+                        device=self._device,
+                    )
+                    target_foothold_f[recovery_step] = recovery_target_f
+                    feasible_velocity_f[recovery_step] = (
+                        self._feasible_velocity_from_target(
+                            target_foothold_f=recovery_target_f,
+                            swing_side=new_swing_side[recovery_step],
+                            yaw_velocity_f=torch.zeros(
+                                recovery_target_f.shape[0],
+                                device=self._device,
+                                dtype=target_foothold_f.dtype,
+                            ),
+                        )
+                    )
+                    curriculum_residual_f[recovery_step] = 0.0
+                    curriculum_radius_f[recovery_step] = 0.0
+                    curriculum_usage[recovery_step] = 0.0
+
+                if self._data.raw_unclipped_foothold_f is not None:
+                    self._data.raw_unclipped_foothold_f[
+                        new_swing_env_ids
+                    ] = target_foothold_f
+
+            learned_use_new_swing = learned_use[new_swing]
+            cached_target_w = None
+            if self.cfg.enable_learned_foothold:
+                assert self._data.nominal_geometric_valid is not None
+                assert self._data.nominal_safety_valid is not None
+                assert self._data.nominal_foothold_w is not None
+                assert self._data.learned_foothold_prepared_valid is not None
+                assert self._data.learned_foothold_geometric_valid is not None
+                assert self._data.learned_foothold_target_w is not None
+                assert self._data.learned_foothold_route_event is not None
+                assert self._data.learned_foothold_route_use_nominal is not None
+                assert self._data.learned_foothold_route_use_learned is not None
+                assert (
+                    self._data.learned_foothold_route_initial_executable
+                    is not None
+                )
+                route = route_nominal_and_learned_footholds(
+                    nominal_geometric_valid=(
+                        self._data.nominal_geometric_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    nominal_safety_valid=(
+                        self._data.nominal_safety_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    learned_prepared=(
+                        self._data.learned_foothold_prepared_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    learned_geometric_valid=(
+                        self._data.learned_foothold_geometric_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    recovery_step=recovery_step,
+                )
+                learned_use_new_swing = route.use_learned
+                cached_target_w = self._data.nominal_foothold_w[
+                    new_swing_env_ids
+                ].clone()
+                self._data.learned_foothold_route_event[
+                    new_swing_env_ids
+                ] = True
+                self._data.learned_foothold_route_use_nominal[
+                    new_swing_env_ids
+                ] = route.use_nominal
+                self._data.learned_foothold_route_use_learned[
+                    new_swing_env_ids
+                ] = route.use_learned
+                self._data.learned_foothold_route_initial_executable[
+                    new_swing_env_ids
+                ] = route.executable
+                self._data.planner_valid[new_swing_env_ids] = (
+                    route.executable
+                )
+                self._data.learned_foothold_used[
+                    new_swing_env_ids
+                ] = route.use_learned
+                if torch.any(~route.executable).item():
+                    local_new_swing_ids = torch.nonzero(
+                        new_swing,
+                        as_tuple=False,
+                    ).flatten()
+                    invalid_local_ids = local_new_swing_ids[
+                        ~route.executable
+                    ]
+                    invalid_env_ids = new_swing_env_ids[
+                        ~route.executable
+                    ]
+                    gait_state.mode[invalid_local_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._gait_state.mode[invalid_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._data.gait_mode[invalid_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+            if torch.any(learned_use_new_swing).item():
+                learned_env_ids = new_swing_env_ids[
+                    learned_use_new_swing
+                ]
+                target_foothold_f[learned_use_new_swing] = (
+                    self._data.learned_foothold_target_f[
+                        learned_env_ids
+                    ]
+                )
+                feasible_velocity_f[learned_use_new_swing] = (
+                    self._feasible_velocity_from_target(
+                        target_foothold_f=target_foothold_f[
+                            learned_use_new_swing
+                        ],
+                        swing_side=new_swing_side[
+                            learned_use_new_swing
+                        ],
+                        yaw_velocity_f=feasible_velocity_f[
+                            learned_use_new_swing,
+                            2,
+                        ],
+                    )
+                )
+                assert cached_target_w is not None
+                cached_target_w[learned_use_new_swing] = (
+                    self._data.learned_foothold_target_w[learned_env_ids]
+                )
+
+            if self.cfg.enable_learned_foothold:
+                assert cached_target_w is not None
+                target_foothold_f, lock_geometric_valid = (
+                    reframe_cached_world_foothold(
+                        target_w=cached_target_w,
+                        current_origin_w=new_swing_stance_pos_w,
+                        current_yaw_w=base_yaw_w[new_swing],
+                        radius_x=self._flat_provider_cfg.outer_radius_x,
+                        radius_y=self._flat_provider_cfg.outer_radius_y,
+                        max_step_height_m=(
+                            self.cfg.max_foothold_step_height_m
                         ),
                     )
                 )
-                curriculum_residual_f[recovery_step] = 0.0
-                curriculum_radius_f[recovery_step] = 0.0
-                curriculum_usage[recovery_step] = 0.0
-
-            if self._data.raw_unclipped_foothold_f is not None:
-                self._data.raw_unclipped_foothold_f[new_swing_env_ids] = (
-                    target_foothold_f
+                lock_valid = (
+                    self._data.planner_valid[new_swing_env_ids]
+                    & lock_geometric_valid
                 )
+                if self._data.learned_foothold_lock_geometric_valid is not None:
+                    self._data.learned_foothold_lock_geometric_valid[
+                        new_swing_env_ids
+                    ] = lock_geometric_valid
+                self._data.planner_valid[new_swing_env_ids] = lock_valid
+                feasible_velocity_f = self._feasible_velocity_from_target(
+                    target_foothold_f=target_foothold_f,
+                    swing_side=new_swing_side,
+                    yaw_velocity_f=feasible_velocity_f[:, 2],
+                )
+                if torch.any(~lock_valid).item():
+                    local_new_swing_ids = torch.nonzero(
+                        new_swing,
+                        as_tuple=False,
+                    ).flatten()
+                    invalid_local_ids = local_new_swing_ids[~lock_valid]
+                    invalid_env_ids = new_swing_env_ids[~lock_valid]
+                    gait_state.mode[invalid_local_ids] = GaitState.PLAN_INVALID
+                    self._gait_state.mode[invalid_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._data.gait_mode[invalid_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
 
             target_search_obstacle = self._virtual_obstacles.get("edges")
             if (
                 self.cfg.enable_safe_target_search
+                and not self.cfg.enable_learned_foothold
                 and target_search_obstacle is not None
             ):
                 support_foot_f = torch.zeros_like(target_foothold_f)
 
-                foot_points_xy = make_sole_perimeter_points_xy(
-                    foot_length=self.cfg.safe_target_foot_length_m,
-                    foot_width=self.cfg.safe_target_foot_width_m,
-                    num_x=self.cfg.safe_target_foot_grid_num_x,
-                    num_y=self.cfg.safe_target_foot_grid_num_y,
-                    device=self._device,
+                foot_points_xy = self._safe_target_foot_points_xy.to(
                     dtype=target_foothold_f.dtype,
                 )
+
+                terrain_height_query_w = None
+                if (
+                    self.cfg.enable_target_terrain_height
+                    and RayCaster.meshes.get(
+                        self.cfg.target_terrain_mesh_prim_path
+                    )
+                    is not None
+                ):
+                    terrain_height_query_w = (
+                        self._query_target_terrain_height_at_xy_w
+                    )
 
                 safe_result = search_safe_foothold_target(
                     nominal_target_f=target_foothold_f,
@@ -1375,6 +2799,8 @@ class FootholdPlanner(SensorBase):
                         dtype=target_foothold_f.dtype,
                     ),
                     safety_margin=self.cfg.safe_target_search_margin_m,
+                    terrain_height_query_w=terrain_height_query_w,
+                    max_step_height_m=self.cfg.max_foothold_step_height_m,
                 )
 
                 target_foothold_f = safe_result.target_f
@@ -1451,17 +2877,72 @@ class FootholdPlanner(SensorBase):
                     self._data.safe_target_candidate_valid_count[
                         new_swing_env_ids
                     ] = safe_result.candidate_valid_count
+                if self._data.safe_target_final_max_penetration_depth is not None:
+                    self._data.safe_target_final_max_penetration_depth[
+                        new_swing_env_ids
+                    ] = safe_result.final_max_penetration_depth
             else:
                 if self._data.safe_target_search_performed is not None:
                     self._data.safe_target_search_performed[
                         new_swing_env_ids
                     ] = False
                 if self._data.safe_target_final_valid is not None:
-                    self._data.safe_target_final_valid[new_swing_env_ids] = True
+                    self._data.safe_target_final_valid[
+                        new_swing_env_ids
+                    ] = self._data.planner_valid[new_swing_env_ids]
                 if self._data.safe_target_used_fallback is not None:
                     self._data.safe_target_used_fallback[new_swing_env_ids] = False
                 if self._data.safe_target_score is not None:
                     self._data.safe_target_score[new_swing_env_ids] = 0.0
+                if self._data.safe_target_final_max_penetration_depth is not None:
+                    self._data.safe_target_final_max_penetration_depth[
+                        new_swing_env_ids
+                    ] = 0.0
+
+            if cached_target_w is not None:
+                target_foothold_w = cached_target_w
+            else:
+                target_foothold_w = _compose_world_from_frame(
+                    new_swing_stance_pos_w,
+                    target_foothold_f,
+                    base_yaw_w[new_swing],
+                )
+
+            terrain_query = self._query_target_terrain_height_at_xy_w(
+                target_foothold_w[:, :2]
+            )
+            if terrain_query is not None:
+                terrain_height_w, terrain_valid = terrain_query
+                if self._data.target_terrain_valid is not None:
+                    self._data.target_terrain_valid[new_swing_env_ids] = (
+                        terrain_valid
+                    )
+                target_foothold_w, target_foothold_f, terrain_valid = (
+                    _apply_terrain_height_to_target(
+                        target_foothold_w=target_foothold_w,
+                        target_foothold_f=target_foothold_f,
+                        stance_pos_w=new_swing_stance_pos_w,
+                        terrain_height_w=terrain_height_w,
+                        terrain_valid=terrain_valid,
+                    )
+                )
+                invalid_terrain_env_ids = new_swing_env_ids[~terrain_valid]
+                if invalid_terrain_env_ids.numel() > 0:
+                    local_new_swing_ids = torch.nonzero(
+                        new_swing,
+                        as_tuple=False,
+                    ).flatten()
+                    invalid_local_ids = local_new_swing_ids[~terrain_valid]
+                    gait_state.mode[invalid_local_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._gait_state.mode[invalid_terrain_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._data.gait_mode[invalid_terrain_env_ids] = (
+                        GaitState.PLAN_INVALID
+                    )
+                    self._data.planner_valid[invalid_terrain_env_ids] = False
 
             self._data.target_foothold_f[new_swing_env_ids] = target_foothold_f
             self._data.feasible_velocity_f[new_swing_env_ids] = feasible_velocity_f
@@ -1485,11 +2966,11 @@ class FootholdPlanner(SensorBase):
                     )
                 )
             )
-            target_ellipse_usage = torch.where(
-                target_ellipse_max_x > 1.0e-6,
-                torch.abs(target_delta_f[:, 0]) / target_ellipse_max_x,
-                torch.zeros_like(target_ellipse_max_x),
-            ).clamp(min=0.0)
+            target_ellipse_usage = reachable_ellipse_usage(
+                target_delta_f,
+                radius_x=self._flat_provider_cfg.outer_radius_x,
+                radius_y=self._flat_provider_cfg.outer_radius_y,
+            )
             if self._data.target_delta_f is not None:
                 self._data.target_delta_f[new_swing_env_ids] = target_delta_f
             if self._data.curriculum_residual_f is not None:
@@ -1512,21 +2993,16 @@ class FootholdPlanner(SensorBase):
                 self._data.target_ellipse_usage[new_swing_env_ids] = (
                     target_ellipse_usage
                 )
-            self._data.target_foothold_w[new_swing_env_ids] = (
-                _compose_world_from_frame(
-                    new_swing_stance_pos_w,
-                    target_foothold_f,
-                    base_yaw_w[new_swing],
-                )
-            )
-            self._data.target_foothold_w[new_swing_env_ids, 2] = (
-                new_swing_stance_pos_w[:, 2]
-            )
+            self._data.target_foothold_w[new_swing_env_ids] = target_foothold_w
 
             assert self._data.default_swing_apex_height is not None
             assert self._data.swing_apex_height is not None
             assert self._data.swing_clearance_safe is not None
             assert self._data.swing_clearance_penetration is not None
+            assert self._data.swing_clearance_deepest_phase is not None
+            assert self._data.swing_clearance_start_penetration is not None
+            assert self._data.swing_clearance_goal_penetration is not None
+            assert self._data.swing_clearance_start_escape_safe is not None
 
             new_default_apex_height = torch.full(
                 (new_swing_count,),
@@ -1545,6 +3021,22 @@ class FootholdPlanner(SensorBase):
                 device=self._device,
                 dtype=target_foothold_f.dtype,
             )
+            new_clearance_deepest_phase = torch.zeros(
+                new_swing_count,
+                device=self._device,
+                dtype=target_foothold_f.dtype,
+            )
+            new_clearance_start_penetration = torch.zeros_like(
+                new_clearance_penetration
+            )
+            new_clearance_goal_penetration = torch.zeros_like(
+                new_clearance_penetration
+            )
+            new_clearance_start_escape_safe = torch.zeros(
+                new_swing_count,
+                device=self._device,
+                dtype=torch.bool,
+            )
 
             if self.cfg.enable_edge_clearance:
                 edge_obstacle = self._virtual_obstacles.get("edges")
@@ -1559,11 +3051,26 @@ class FootholdPlanner(SensorBase):
                         apex_step=self.cfg.clearance_apex_step_m,
                         sample_spacing=self.cfg.clearance_sample_spacing_m,
                         swing_duration_s=self.cfg.swing_duration_s,
+                        foot_points_xy=self._safe_target_foot_points_xy,
+                        foot_yaw_w=base_yaw_w[new_swing],
+                        allow_start_penetration_escape=True,
                     )
                     new_apex_height = apex_adjustment.apex_height
                     new_clearance_safe = apex_adjustment.is_safe
                     new_clearance_penetration = (
                         apex_adjustment.penetration.max_penetration_depth
+                    )
+                    new_clearance_deepest_phase = (
+                        apex_adjustment.penetration.deepest_phase
+                    )
+                    new_clearance_start_penetration = (
+                        apex_adjustment.penetration.start_penetration_depth
+                    )
+                    new_clearance_goal_penetration = (
+                        apex_adjustment.penetration.goal_penetration_depth
+                    )
+                    new_clearance_start_escape_safe = (
+                        apex_adjustment.penetration.start_escape_safe
                     )
 
             self._data.default_swing_apex_height[new_swing_env_ids] = (
@@ -1576,6 +3083,18 @@ class FootholdPlanner(SensorBase):
             self._data.swing_clearance_penetration[new_swing_env_ids] = (
                 new_clearance_penetration
             )
+            self._data.swing_clearance_deepest_phase[new_swing_env_ids] = (
+                new_clearance_deepest_phase
+            )
+            self._data.swing_clearance_start_penetration[
+                new_swing_env_ids
+            ] = new_clearance_start_penetration
+            self._data.swing_clearance_goal_penetration[new_swing_env_ids] = (
+                new_clearance_goal_penetration
+            )
+            self._data.swing_clearance_start_escape_safe[
+                new_swing_env_ids
+            ] = new_clearance_start_escape_safe
 
         default_apex_height = torch.full(
             (num_selected_envs,),
@@ -1587,6 +3106,10 @@ class FootholdPlanner(SensorBase):
         assert self._data.swing_apex_height is not None
         assert self._data.swing_clearance_safe is not None
         assert self._data.swing_clearance_penetration is not None
+        assert self._data.swing_clearance_deepest_phase is not None
+        assert self._data.swing_clearance_start_penetration is not None
+        assert self._data.swing_clearance_goal_penetration is not None
+        assert self._data.swing_clearance_start_escape_safe is not None
 
         default_swing_reference = quintic_swing_reference(
             start=self._data.swing_start_pos_w[env_ids],
@@ -1602,6 +3125,18 @@ class FootholdPlanner(SensorBase):
         cached_clearance_penetration = self._data.swing_clearance_penetration[
             env_ids
         ]
+        cached_clearance_deepest_phase = (
+            self._data.swing_clearance_deepest_phase[env_ids]
+        )
+        cached_clearance_start_penetration = (
+            self._data.swing_clearance_start_penetration[env_ids]
+        )
+        cached_clearance_goal_penetration = (
+            self._data.swing_clearance_goal_penetration[env_ids]
+        )
+        cached_clearance_start_escape_safe = (
+            self._data.swing_clearance_start_escape_safe[env_ids]
+        )
         default_apex_height = torch.where(
             active_swing,
             cached_default_apex_height,
@@ -1626,10 +3161,47 @@ class FootholdPlanner(SensorBase):
             num_selected_envs,
             device=self._device,
         )
+        clearance_deepest_phase = torch.zeros(
+            num_selected_envs,
+            device=self._device,
+        )
+        clearance_start_penetration = torch.zeros(
+            num_selected_envs,
+            device=self._device,
+        )
+        clearance_goal_penetration = torch.zeros(
+            num_selected_envs,
+            device=self._device,
+        )
+        clearance_start_escape_safe = torch.zeros(
+            num_selected_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
         clearance_penetration = torch.where(
             active_swing,
             cached_clearance_penetration,
             clearance_penetration,
+        )
+        clearance_deepest_phase = torch.where(
+            active_swing,
+            cached_clearance_deepest_phase,
+            clearance_deepest_phase,
+        )
+        clearance_start_penetration = torch.where(
+            active_swing,
+            cached_clearance_start_penetration,
+            clearance_start_penetration,
+        )
+        clearance_goal_penetration = torch.where(
+            active_swing,
+            cached_clearance_goal_penetration,
+            clearance_goal_penetration,
+        )
+        clearance_start_escape_safe = torch.where(
+            active_swing,
+            cached_clearance_start_escape_safe,
+            clearance_start_escape_safe,
         )
 
         clearance_invalid = active_swing & ~clearance_safe
@@ -1656,3 +3228,15 @@ class FootholdPlanner(SensorBase):
         self._data.swing_apex_height[env_ids] = apex_height
         self._data.swing_clearance_safe[env_ids] = clearance_safe
         self._data.swing_clearance_penetration[env_ids] = clearance_penetration
+        self._data.swing_clearance_deepest_phase[env_ids] = (
+            clearance_deepest_phase
+        )
+        self._data.swing_clearance_start_penetration[env_ids] = (
+            clearance_start_penetration
+        )
+        self._data.swing_clearance_goal_penetration[env_ids] = (
+            clearance_goal_penetration
+        )
+        self._data.swing_clearance_start_escape_safe[env_ids] = (
+            clearance_start_escape_safe
+        )

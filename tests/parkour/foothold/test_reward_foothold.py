@@ -76,11 +76,157 @@ def _assert_locomotion_readiness_curriculum(cfg_text: str):
     assert '"curriculum_end_scale": 1.00' in cfg_text or '"curriculum_end_scale": 1.0' in cfg_text
     assert '"curriculum_ramp_steps": 0' in cfg_text
     assert '"curriculum_gate": "locomotion_readiness"' in cfg_text
-    assert '"curriculum_min_episode_length": 100' in cfg_text
-    assert '"curriculum_full_episode_length": 300' in cfg_text
+    assert (
+        '"curriculum_min_episode_length": '
+        "_FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH"
+    ) in cfg_text
+    assert (
+        '"curriculum_full_episode_length": '
+        "_FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH"
+    ) in cfg_text
+    assert '"curriculum_full_episode_length": 300' not in cfg_text
+    assert '"reward_curriculum_full_episode_length": 300' not in cfg_text
     assert '"curriculum_velocity_command_name": "base_velocity"' in cfg_text
     assert '"curriculum_velocity_start_score": 0.4' in cfg_text
     assert '"curriculum_velocity_full_score": 0.7' in cfg_text
+
+
+def test_foothold_curriculum_length_has_one_reward_source_of_truth():
+    foothold = _load_foothold_reward_module()
+
+    assert foothold.FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH == 100.0
+    assert foothold.FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH == 700.0
+
+
+def test_learned_foothold_safety_reward_is_event_gated_and_bounded():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True, False, True]),
+        learned_foothold_geometric_valid=torch.tensor([True, True, False]),
+        learned_foothold_safety_score=torch.tensor([1.0, -0.5, 0.2]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_safety_event_reward(env)
+
+    torch.testing.assert_close(
+        reward,
+        torch.tensor([1.0, 0.0, -1.0]),
+    )
+
+
+def test_stabilization_mask_prefers_contact_adaptive_flag_and_has_legacy_fallback():
+    foothold = _load_foothold_reward_module()
+
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([1, 1, 1]),
+        stabilization_active=torch.tensor([True, False, False]),
+        recovery_step_active=torch.tensor([False, True, False]),
+    )
+    torch.testing.assert_close(
+        foothold.foothold_stabilization_mask(data),
+        torch.tensor([True, False, False]),
+    )
+
+    legacy_data = SimpleNamespace(
+        gait_mode=torch.tensor([1, 1]),
+        recovery_step_active=torch.tensor([True, False]),
+    )
+    torch.testing.assert_close(
+        foothold.foothold_stabilization_mask(legacy_data),
+        torch.tensor([True, False]),
+    )
+
+
+def test_stabilization_masks_foothold_and_learned_event_rewards():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        gait_mode=torch.tensor([1, 1]),
+        planner_valid=torch.tensor([True, True]),
+        actual_swing_foot_pos_w=torch.tensor([[1.0, 2.0, 0.3], [1.0, 2.0, 0.3]]),
+        swing_reference_pos_w=torch.tensor([[1.0, 2.0, 0.3], [1.0, 2.0, 0.3]]),
+        learned_foothold_evaluated=torch.tensor([True, True]),
+        learned_foothold_geometric_valid=torch.tensor([True, True]),
+        learned_foothold_safety_score=torch.tensor([1.0, 1.0]),
+        stabilization_active=torch.tensor([True, False]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={"foothold_planner": SimpleNamespace(data=planner_data)},
+        )
+    )
+
+    torch.testing.assert_close(
+        foothold.foothold_swing_tracking_exp(env),
+        torch.tensor([0.0, 1.0]),
+    )
+    torch.testing.assert_close(
+        foothold.learned_foothold_safety_event_reward(env),
+        torch.tensor([0.0, 1.0]),
+    )
+
+
+def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor(
+            [True, True, True, True, False]
+        ),
+        learned_foothold_geometric_valid=torch.tensor(
+            [True, True, True, False, True]
+        ),
+        learned_foothold_safety_score=torch.tensor(
+            [0.0, 0.0, -0.4, 0.8, 1.0]
+        ),
+        nominal_geometric_valid=torch.tensor(
+            [True, True, True, True, True]
+        ),
+        nominal_safety_valid=torch.tensor(
+            [True, True, False, False, False]
+        ),
+        raw_unclipped_foothold_f=torch.tensor(
+            [
+                [0.20, 0.10, 0.0],
+                [0.20, 0.10, 0.0],
+                [0.20, 0.10, 0.0],
+                [0.20, 0.10, 0.0],
+                [0.20, 0.10, 0.0],
+            ]
+        ),
+        learned_foothold_decoded_f=torch.tensor(
+            [
+                [0.20, 0.10, 0.0],
+                [0.60, 0.10, 0.0],
+                [0.25, 0.08, 0.0],
+                [0.25, 0.08, 0.0],
+                [0.25, 0.08, 0.0],
+            ]
+        ),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+    )
+
+    torch.testing.assert_close(
+        reward,
+        torch.tensor([1.0, -1.0, -0.4, -1.0, 0.0]),
+    )
 
 
 def test_swing_tracking_rewards_reference_match_and_masks_non_swing():

@@ -77,9 +77,15 @@ def _make_env(
     episode_length_buf: torch.Tensor | None = None,
     command: torch.Tensor | None = None,
     root_lin_vel_b: torch.Tensor | None = None,
+    curriculum_scale: torch.Tensor | None = None,
 ):
-    planner = SimpleNamespace(data=data)
     num_envs = data.gait_mode.shape[0]
+    if curriculum_scale is None:
+        curriculum_scale = torch.zeros(num_envs)
+    planner = SimpleNamespace(
+        data=data,
+        flat_target_curriculum_scale=curriculum_scale,
+    )
     if episode_length_buf is None:
         episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
     if command is None:
@@ -133,6 +139,31 @@ def _make_data(num_envs=2):
         safe_target_candidate_inside_ellipse_count=torch.zeros(num_envs),
         safe_target_candidate_obstacle_safe_count=torch.zeros(num_envs),
         safe_target_candidate_valid_count=torch.zeros(num_envs),
+        learned_foothold_evaluated=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_geometric_valid=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_safety_valid=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_safety_score=torch.zeros(num_envs),
+        learned_foothold_penetrating_point_ratio=torch.zeros(num_envs),
+        learned_foothold_total_penetration_depth=torch.zeros(num_envs),
+        learned_foothold_route_event=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_route_use_nominal=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_route_use_learned=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_route_initial_executable=torch.zeros(
+            num_envs, dtype=torch.bool
+        ),
+        learned_foothold_used=torch.zeros(num_envs, dtype=torch.bool),
         recovery_step_active=torch.zeros(num_envs, dtype=torch.bool),
     )
 
@@ -339,6 +370,103 @@ def test_safe_target_diagnostics_ignore_non_search_steps():
     )
     torch.testing.assert_close(
         log["safe_target_candidate_valid_count_mean"], torch.tensor(0.0)
+    )
+
+
+def test_learned_foothold_metrics_separate_evaluations_from_route_events():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    # A HOLD evaluation is a learning sample, but not an execution route.
+    data.learned_foothold_evaluated[:] = torch.tensor([True, True])
+    data.learned_foothold_geometric_valid[:] = torch.tensor([True, False])
+    data.learned_foothold_safety_valid[:] = torch.tensor([True, False])
+    data.learned_foothold_safety_score[:] = torch.tensor([0.8, -0.6])
+    data.learned_foothold_penetrating_point_ratio[:] = torch.tensor([0.0, 0.5])
+    data.learned_foothold_total_penetration_depth[:] = torch.tensor([0.0, 0.04])
+    monitor.update(dt=0.02)
+
+    # A later new-SWING route uses the learned target for env 0 and rejects
+    # env 1.  Stale evaluation values must not be counted a second time.
+    data.learned_foothold_evaluated[:] = False
+    data.learned_foothold_route_event[:] = True
+    data.learned_foothold_route_use_nominal[:] = False
+    data.learned_foothold_route_use_learned[:] = torch.tensor([True, False])
+    data.learned_foothold_route_initial_executable[:] = torch.tensor(
+        [True, False]
+    )
+    data.learned_foothold_used[:] = torch.tensor([True, False])
+    data.learned_foothold_safety_valid[:] = torch.tensor([True, False])
+    data.planner_valid[:] = torch.tensor([True, False])
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["learned_foothold_evaluation_rate"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_geometric_valid_fraction"],
+        torch.tensor(0.5),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_safety_valid_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_safety_score_mean"], torch.tensor(0.1)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_penetrating_point_ratio_mean"],
+        torch.tensor(0.25),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_total_penetration_depth_mean"],
+        torch.tensor(0.02),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_rate"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_nominal_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_learned_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_invalid_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_postcheck_invalid_fraction"],
+        torch.tensor(0.0),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_routed_safe_fraction"], torch.tensor(1.0)
+    )
+
+
+def test_learned_route_postcheck_failure_does_not_change_route_choice():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=1)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.learned_foothold_route_event[:] = True
+    data.learned_foothold_route_use_nominal[:] = True
+    data.learned_foothold_route_initial_executable[:] = True
+    # A later terrain/trajectory check invalidated an initially selected
+    # nominal route.
+    data.planner_valid[:] = False
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["learned_foothold_route_nominal_fraction"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_invalid_fraction"], torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_postcheck_invalid_fraction"],
+        torch.tensor(1.0),
     )
 
 
@@ -658,56 +786,15 @@ def test_monitor_reports_hold_contact_lost_per_swing_entry():
     )
 
 
-def test_monitor_logs_reward_curriculum_scale_from_readiness_gate():
+def test_monitor_logs_actual_planner_curriculum_scale():
     module = _load_monitor_module()
     data = _make_data(num_envs=2)
     monitor = module.FootholdPlannerMonitorTerm(
-        _make_cfg(
-            reward_curriculum_start_scale=0.0,
-            reward_curriculum_end_scale=1.0,
-            reward_curriculum_ramp_steps=72_000,
-            reward_curriculum_gate="locomotion_readiness",
-            reward_curriculum_min_episode_length=100,
-            reward_curriculum_full_episode_length=300,
-            reward_curriculum_velocity_command_name="base_velocity",
-            reward_curriculum_velocity_std=0.5,
-            reward_curriculum_velocity_start_score=0.4,
-            reward_curriculum_velocity_full_score=0.7,
-        ),
+        _make_cfg(),
         _make_env(
             data,
-            common_step_counter=100_000,
-            episode_length_buf=torch.tensor([320, 360]),
-            command=torch.tensor([[0.6, 0.0, 0.0], [0.6, 0.0, 0.0]]),
-            root_lin_vel_b=torch.tensor(
-                [[0.58, 0.0, 0.0], [0.60, 0.0, 0.0]]
-            ),
-        ),
-    )
-
-    monitor.update(dt=0.02)
-
-    torch.testing.assert_close(
-        monitor.get_log()["reward_curriculum_scale"], torch.tensor(1.0)
-    )
-
-
-def test_monitor_reward_curriculum_scale_is_not_blocked_by_step_ramp():
-    module = _load_monitor_module()
-    data = _make_data(num_envs=2)
-    monitor = module.FootholdPlannerMonitorTerm(
-        _make_cfg(
-            reward_curriculum_start_scale=0.0,
-            reward_curriculum_end_scale=1.0,
-            reward_curriculum_ramp_steps=240_000,
-            reward_curriculum_gate="locomotion_readiness",
-            reward_curriculum_min_episode_length=200,
-            reward_curriculum_full_episode_length=900,
-        ),
-        _make_env(
-            data,
-            common_step_counter=0,
-            episode_length_buf=torch.tensor([50, 950]),
+            episode_length_buf=torch.tensor([10, 999]),
+            curriculum_scale=torch.tensor([0.25, 0.75]),
         ),
     )
 
@@ -718,33 +805,25 @@ def test_monitor_reward_curriculum_scale_is_not_blocked_by_step_ramp():
     )
 
 
-def test_monitor_reward_curriculum_scale_remembers_recent_completed_episode_after_reset():
+def test_monitor_curriculum_scale_survives_episode_reset_without_recomputation():
     module = _load_monitor_module()
     data = _make_data(num_envs=1)
     env = _make_env(
         data,
-        common_step_counter=1,
         episode_length_buf=torch.tensor([950]),
+        curriculum_scale=torch.tensor([0.8]),
     )
     monitor = module.FootholdPlannerMonitorTerm(
-        _make_cfg(
-            reward_curriculum_start_scale=0.0,
-            reward_curriculum_end_scale=1.0,
-            reward_curriculum_ramp_steps=240_000,
-            reward_curriculum_gate="locomotion_readiness",
-            reward_curriculum_min_episode_length=200,
-            reward_curriculum_full_episode_length=900,
-        ),
+        _make_cfg(),
         env,
     )
 
     monitor.update(dt=0.02)
-    env.common_step_counter = 2
     env.episode_length_buf = torch.tensor([3])
     monitor.update(dt=0.02)
 
     torch.testing.assert_close(
-        monitor.get_log()["reward_curriculum_scale"], torch.tensor(1.0)
+        monitor.get_log()["reward_curriculum_scale"], torch.tensor(0.8)
     )
 
 

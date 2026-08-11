@@ -83,6 +83,24 @@ def test_build_report_marks_core_foothold_metrics():
         "Step_Monitor/foothold_planner_recovery_step_fraction": [0.0, 0.01],
         "Step_Monitor/foothold_planner_recovery_step_entry_step_rate": [0.0, 0.005],
         "Train/time/mean_reward_0": [0.1, 0.3, 0.6],
+        "Train/motor_kl": [0.01, 0.02],
+        "Train/foothold_kl": [0.001, 0.003],
+        "Train/foothold_event_count": [10.0, 12.0],
+        "Train/foothold_raw_out_of_range_fraction": [0.3, 0.2],
+        "Train/foothold_ellipse_projection_fraction": [0.2, 0.1],
+        "Train/grad_norm": [0.4, 0.5],
+        "Train/motor_grad_norm": [0.4, 0.5],
+        "Train/foothold_grad_norm": [0.2, 0.3],
+        "Train/motor_learning_rate": [1.0e-3, 7.5e-4],
+        "Train/foothold_learning_rate": [5.0e-4, 3.3e-4],
+        "Train/foothold_kl_skip_count": [0.0, 2.0],
+        "Train/foothold_std_normalized_x": [0.12, 0.08],
+        "Train/foothold_std_normalized_y": [0.20, 0.10],
+        "Train/foothold_std_m_x": [0.05, 0.034],
+        "Train/foothold_std_m_y": [0.05, 0.025],
+        "Loss/learning_rate": [1.0e-3, 7.5e-4],
+        "Train/mean_reward_0": [80.0, 90.0],
+        "Train/mean_reward_1": [0.2, 0.4],
     }
 
     rows = module.build_report_rows(scalars)
@@ -120,6 +138,30 @@ def test_build_report_marks_core_foothold_metrics():
         == "INFO"
     )
     assert by_name["mean_reward_0"].summary.trend == "up"
+    assert by_name["motor_kl"].status == "INFO"
+    assert by_name["foothold_kl"].status == "INFO"
+    assert by_name["foothold_event_count"].status == "OK"
+    assert by_name["foothold_raw_out_of_range_fraction"].status == "INFO"
+    assert by_name["foothold_ellipse_projection_fraction"].status == "INFO"
+    assert by_name["grad_norm"].status == "INFO"
+    assert by_name["motor_grad_norm"].status == "INFO"
+    assert by_name["foothold_grad_norm"].status == "INFO"
+    assert by_name["motor_learning_rate"].status == "INFO"
+    assert by_name["foothold_learning_rate"].status == "INFO"
+    assert by_name["foothold_kl_skip_count"].status == "INFO"
+    assert by_name["foothold_std_m_x"].summary.last == 0.034
+    assert by_name["learning_rate"].status == "INFO"
+    assert by_name["mean_reward_1"].summary.trend == "up"
+
+
+def test_event_gated_training_tag_is_bad_when_no_events_are_observed():
+    module = _load_inspector_module()
+
+    rows = module.build_report_rows(
+        {"Train/foothold_event_count": [0.0, 0.0]}
+    )
+
+    assert rows[0].status == "BAD"
 
 
 def test_candidate_valid_count_zero_is_not_bad_when_no_candidate_search_is_needed():

@@ -38,11 +38,18 @@ from instinctlab.utils.noise import (
     RandomGaussianNoiseCfg,
     RangeBasedGaussianNoiseCfg,
 )
+from instinctlab_foothold import FlatProviderConfig
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 
 _FOOTHOLD_REWARD_WEIGHT_SCALE = float(
     os.environ.get("FOOTHOLD_REWARD_WEIGHT_SCALE", "1.0")
+)
+_FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH = int(
+    instinct_mdp.FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH
+)
+_FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH = int(
+    instinct_mdp.FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH
 )
 
 ##
@@ -349,6 +356,7 @@ class SceneCfg(InteractiveSceneCfg):
         left_contact_body_name="left_ankle_roll_link",
         right_contact_body_name="right_ankle_roll_link",
         startup_hold_s=0.15,
+        reset_hold_s=0.15,
     )
     leg_volume_points = VolumePointsCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_ankle_roll_link",
@@ -460,6 +468,7 @@ class ObservationsCfg:
             },
             noise=None,
         )
+        nominal_foothold: ObsTerm | None = None
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01), history_length=8, flatten_history_dim=True
         )
@@ -470,7 +479,12 @@ class ObservationsCfg:
             history_length=8,
             flatten_history_dim=True,
         )
-        actions = ObsTerm(func=mdp.last_action, history_length=8, flatten_history_dim=True)
+        actions = ObsTerm(
+            func=mdp.last_action,
+            params={"action_name": "joint_pos"},
+            history_length=8,
+            flatten_history_dim=True,
+        )
         depth_image = ObsTerm(
             func=mdp.delayed_visualizable_image,
             params={
@@ -518,9 +532,15 @@ class ObservationsCfg:
             },
             noise=None,
         )
+        nominal_foothold: ObsTerm | None = None
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, history_length=8, flatten_history_dim=True)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, history_length=8, flatten_history_dim=True)
-        actions = ObsTerm(func=mdp.last_action, history_length=8, flatten_history_dim=True)
+        actions = ObsTerm(
+            func=mdp.last_action,
+            params={"action_name": "joint_pos"},
+            history_length=8,
+            flatten_history_dim=True,
+        )
         depth_image = ObsTerm(
             func=mdp.delayed_visualizable_image,
             params={
@@ -645,9 +665,14 @@ class ObservationsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(
+    # Explicit annotation preserves dataclass field order.  Motor actions must
+    # remain dimensions 0..28 so legacy checkpoints and event-gated PPO agree.
+    joint_pos: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
         asset_name="robot", joint_names=[".*"], scale=beyondmimic_action_scale, use_default_offset=True
     )
+    # Disabled by default so existing actor checkpoints keep their original
+    # action dimension. Learned-planner training enables this explicitly.
+    learned_foothold: mdp.LearnedFootholdActionCfg | None = None
 
 
 @configclass
@@ -701,7 +726,8 @@ class G1Rewards:
     )
     heading_error = RewTerm(func=mdp.heading_error, weight=-1.0, params={"command_name": "base_velocity"})
     dont_wait = RewTerm(func=mdp.dont_wait, weight=-0.5, params={"command_name": "base_velocity"})
-    is_alive = RewTerm(func=mdp.is_alive, weight=3.0)
+    is_alive = RewTerm(func=mdp.is_alive, weight=0.1)
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-50.0)
     stand_still = RewTerm(func=mdp.stand_still, weight=-0.3, params={"command_name": "base_velocity", "offset": 4.0})
     foothold_swing_tracking = RewTerm(
         func=mdp.foothold_swing_tracking_exp,
@@ -714,8 +740,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.0,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -733,8 +759,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.0,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -755,8 +781,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -773,8 +799,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -791,8 +817,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -809,8 +835,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -830,8 +856,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -851,8 +877,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -870,8 +896,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -912,8 +938,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -949,8 +975,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -966,8 +992,8 @@ class G1Rewards:
             "curriculum_end_scale": 1.00,
             "curriculum_ramp_steps": 0,
             "curriculum_gate": "locomotion_readiness",
-            "curriculum_min_episode_length": 100,
-            "curriculum_full_episode_length": 300,
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
             "curriculum_velocity_command_name": "base_velocity",
             "curriculum_velocity_std": 0.5,
             "curriculum_velocity_start_score": 0.4,
@@ -1107,9 +1133,34 @@ class G1Rewards:
     )
 
 
+_DEFAULT_FLAT_PROVIDER_CFG = FlatProviderConfig()
+
+
+@configclass
+class LearnedFootholdPlanningRewards:
+    """Sparse high-level reward kept separate from locomotion execution."""
+
+    learned_foothold_planning = RewTerm(
+        func=mdp.learned_foothold_planning_event_reward,
+        weight=1.0,
+        params={
+            "sensor_name": "foothold_planner",
+            "reachability_radius_x": (
+                _DEFAULT_FLAT_PROVIDER_CFG.outer_radius_x
+            ),
+            "reachability_radius_y": (
+                _DEFAULT_FLAT_PROVIDER_CFG.outer_radius_y
+            ),
+        },
+    )
+
+
 @configclass
 class RewardsCfg(MultiRewardCfg):
     rewards: G1Rewards = G1Rewards()
+    # Kept absent in legacy runs so their reward count and critic shape remain
+    # exactly unchanged.
+    foothold_planning: LearnedFootholdPlanningRewards | None = None
 
 
 @configclass
@@ -1218,16 +1269,6 @@ class MonitorCfg:
             "debug_event_max_count": int(
                 os.environ.get("FOOTHOLD_DEBUG_EVENT_MAX_COUNT", "0")
             ),
-            "reward_curriculum_start_scale": 0.0,
-            "reward_curriculum_end_scale": 1.00,
-            "reward_curriculum_ramp_steps": 0,
-            "reward_curriculum_gate": "locomotion_readiness",
-            "reward_curriculum_min_episode_length": 100,
-            "reward_curriculum_full_episode_length": 300,
-            "reward_curriculum_velocity_command_name": "base_velocity",
-            "reward_curriculum_velocity_std": 0.5,
-            "reward_curriculum_velocity_start_score": 0.4,
-            "reward_curriculum_velocity_full_score": 0.7,
         },
     )
 
@@ -1270,3 +1311,74 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
             foothold_control_dt = self.sim.dt * self.decimation
             self.scene.foothold_planner.update_period = foothold_control_dt
             self.scene.foothold_planner.control_dt_s = foothold_control_dt
+            calibration_path = os.environ.get(
+                "FOOTHOLD_RECOVERY_CALIBRATION_PATH",
+                "",
+            ).strip()
+            if calibration_path:
+                self.enable_contact_adaptive_recovery(calibration_path)
+
+    def enable_learned_foothold_planner(self) -> tuple[float, float]:
+        """Opt in to the learned foothold action and nominal-prior observation."""
+
+        if self.scene.foothold_planner is None:
+            raise RuntimeError(
+                "Learned foothold planner requires the foothold planner sensor."
+            )
+        self.scene.foothold_planner.enable_learned_foothold = True
+        self.actions.learned_foothold = mdp.LearnedFootholdActionCfg(
+            asset_name="robot",
+            sensor_name="foothold_planner",
+        )
+        self.observations.policy.nominal_foothold = ObsTerm(
+            func=mdp.nominal_foothold_observation,
+            history_length=1,
+            flatten_history_dim=True,
+            params={
+                "sensor_name": "foothold_planner",
+                "command_name": "base_velocity",
+            },
+            noise=None,
+        )
+        self.observations.critic.nominal_foothold = ObsTerm(
+            func=mdp.nominal_foothold_observation,
+            history_length=1,
+            flatten_history_dim=True,
+            params={
+                "sensor_name": "foothold_planner",
+                "command_name": "base_velocity",
+            },
+            noise=None,
+        )
+        flat_provider_cfg = FlatProviderConfig()
+        self.rewards.foothold_planning = LearnedFootholdPlanningRewards()
+        planning_term = (
+            self.rewards.foothold_planning.learned_foothold_planning
+        )
+        planning_term.params["reachability_radius_x"] = (
+            flat_provider_cfg.outer_radius_x
+        )
+        planning_term.params["reachability_radius_y"] = (
+            flat_provider_cfg.outer_radius_y
+        )
+        return (
+            flat_provider_cfg.outer_radius_x,
+            flat_provider_cfg.outer_radius_y,
+        )
+
+    def enable_contact_adaptive_recovery(
+        self,
+        calibration_path: str,
+    ) -> None:
+        """Opt in to autonomous recovery using calibrated stability bounds."""
+
+        if self.scene.foothold_planner is None:
+            raise RuntimeError(
+                "Contact-adaptive recovery requires the foothold planner sensor."
+            )
+        if not calibration_path:
+            raise ValueError("A stability calibration JSON path is required.")
+        self.scene.foothold_planner.enable_contact_adaptive_recovery = True
+        self.scene.foothold_planner.recovery_stability_calibration_path = (
+            calibration_path
+        )

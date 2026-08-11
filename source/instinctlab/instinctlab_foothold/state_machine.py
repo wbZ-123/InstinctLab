@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .contact_adaptation import EventResponse, support_roles_from_contacts
 from .types import GaitState
 
 
@@ -60,6 +61,9 @@ class GaitMachineState:
     swing_has_lifted: torch.Tensor
     recovery_step_pending: torch.Tensor
     recovery_step_active: torch.Tensor
+    stabilization_elapsed_s: torch.Tensor | None = None
+    late_search_elapsed_s: torch.Tensor | None = None
+    planning_failure: torch.Tensor | None = None
 
 
 def initial_gait_state(
@@ -112,6 +116,13 @@ def initial_gait_state(
             device=device,
             dtype=torch.bool,
         ),
+        stabilization_elapsed_s=torch.zeros(num_envs, device=device),
+        late_search_elapsed_s=torch.zeros(num_envs, device=device),
+        planning_failure=torch.zeros(
+            num_envs,
+            device=device,
+            dtype=torch.bool,
+        ),
     )
 
 
@@ -134,11 +145,71 @@ def advance_gait(
     dt: float,
     cfg: GaitMachineConfig,
     step_hold_s: torch.Tensor | None = None,
+    swing_ready: torch.Tensor | None = None,
+    hold_contact_ready: torch.Tensor | None = None,
+    hold_contact_lost: torch.Tensor | None = None,
+    plan_wait_expired: torch.Tensor | None = None,
+    event_response: torch.Tensor | None = None,
+    stabilization_ready: torch.Tensor | None = None,
+    late_search_exhausted: torch.Tensor | None = None,
+    planning_failure: torch.Tensor | None = None,
 ) -> GaitMachineState:
     if dt <= 0.0:
         raise ValueError(
             "dt must be positive."
         )
+    contact_adaptive = event_response is not None
+    if event_response is not None:
+        event_response = event_response.to(
+            device=state.mode.device,
+            dtype=torch.long,
+        )
+        if event_response.shape != state.mode.shape:
+            raise ValueError(
+                "event_response must match the number of environments."
+            )
+    if stabilization_ready is None:
+        stabilization_ready = torch.zeros_like(
+            state.mode,
+            dtype=torch.bool,
+        )
+    else:
+        stabilization_ready = stabilization_ready.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if stabilization_ready.shape != state.mode.shape:
+            raise ValueError(
+                "stabilization_ready must match the number of environments."
+            )
+    if late_search_exhausted is None:
+        late_search_exhausted = torch.zeros_like(
+            state.mode,
+            dtype=torch.bool,
+        )
+    else:
+        late_search_exhausted = late_search_exhausted.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if late_search_exhausted.shape != state.mode.shape:
+            raise ValueError(
+                "late_search_exhausted must match the number of environments."
+            )
+    if planning_failure is None:
+        planning_failure = torch.zeros_like(
+            state.mode,
+            dtype=torch.bool,
+        )
+    else:
+        planning_failure = planning_failure.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if planning_failure.shape != state.mode.shape:
+            raise ValueError(
+                "planning_failure must match the number of environments."
+            )
     if step_hold_s is None:
         step_hold_s = torch.full_like(
             state.hold_required_s,
@@ -156,6 +227,28 @@ def advance_gait(
         if torch.any(step_hold_s < 0.0):
             raise ValueError(
                 "step_hold_s must be non-negative."
+            )
+    if swing_ready is None:
+        swing_ready = torch.ones_like(state.mode, dtype=torch.bool)
+    else:
+        swing_ready = swing_ready.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if swing_ready.shape != state.mode.shape:
+            raise ValueError(
+                "swing_ready must match the number of environments."
+            )
+    if plan_wait_expired is None:
+        plan_wait_expired = torch.zeros_like(state.mode, dtype=torch.bool)
+    else:
+        plan_wait_expired = plan_wait_expired.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if plan_wait_expired.shape != state.mode.shape:
+            raise ValueError(
+                "plan_wait_expired must match the number of environments."
             )
 
     mode = state.mode.clone()
@@ -175,6 +268,25 @@ def advance_gait(
     swing_has_lifted = state.swing_has_lifted.clone()
     recovery_step_pending = state.recovery_step_pending.clone()
     recovery_step_active = state.recovery_step_active.clone()
+    stabilization_elapsed_s = (
+        state.stabilization_elapsed_s
+        if state.stabilization_elapsed_s is not None
+        else torch.zeros_like(state.elapsed_s)
+    ).clone()
+    late_search_elapsed_s = (
+        state.late_search_elapsed_s
+        if state.late_search_elapsed_s is not None
+        else torch.zeros_like(state.elapsed_s)
+    ).clone()
+    planning_failure_state = (
+        state.planning_failure
+        if state.planning_failure is not None
+        else torch.zeros_like(state.mode, dtype=torch.bool)
+    ).clone()
+
+    confirmed_contact = contact_elapsed_s >= cfg.contact_confirm_s - 1.0e-6
+    any_confirmed_contact = torch.any(confirmed_contact, dim=-1)
+    both_contacts_confirmed = torch.all(confirmed_contact, dim=-1)
 
     was_touchdown_confirm = (
         (state.mode == GaitState.TOUCHDOWN_CONFIRM)
@@ -189,15 +301,23 @@ def advance_gait(
     hold_required_s[was_touchdown_confirm] = step_hold_s[
         was_touchdown_confirm
     ]
-    contact_elapsed_s[was_touchdown_confirm] = 0.0
-    no_contact_elapsed_s[was_touchdown_confirm] = 0.0
     swing_has_lifted[was_touchdown_confirm] = False
     recovery_step_pending[was_touchdown_confirm] = False
     recovery_step_active[was_touchdown_confirm] = False
 
+    accepted_early_touchdown = (
+        (state.mode == GaitState.EARLY_CONTACT)
+        & touchdown_accepted
+        & planner_valid
+    )
+    mode[accepted_early_touchdown] = GaitState.TOUCHDOWN_CONFIRM
+
     was_failure_reason = (
         (state.mode == GaitState.PLAN_INVALID)
-        | (state.mode == GaitState.EARLY_CONTACT)
+        | (
+            (state.mode == GaitState.EARLY_CONTACT)
+            & ~accepted_early_touchdown
+        )
         | (state.mode == GaitState.OVERDUE)
         | (state.mode == GaitState.STANCE_LOST)
         | (state.mode == GaitState.HOLD_CONTACT_LOST)
@@ -205,23 +325,43 @@ def advance_gait(
     mode[was_failure_reason] = GaitState.RECOVERY
 
     was_recovery = state.mode == GaitState.RECOVERY
-    recovery_counting = (
-        was_recovery
-        & planner_valid
-    )
+    # Recovery is a physical-contact phase.  Its dwell timer must continue
+    # independently of planner_valid; a recovery plan is prepared only after
+    # a support foot has been identified.
+    recovery_counting = was_recovery
     recovery_ready = recovery_counting & (
-        state.hold_elapsed_s + dt >= cfg.recovery_hold_s - 1.0e-6
+        any_confirmed_contact
+        & (
+            state.hold_elapsed_s + dt >= cfg.recovery_hold_s - 1.0e-6
+        )
     )
     mode[was_recovery] = GaitState.RECOVERY
     mode[recovery_ready] = GaitState.HOLD
-    swing_side[recovery_ready] = 1 - swing_side[recovery_ready]
+
+    # Select the next swing from the actual confirmed support.  A single
+    # confirmed contact is sufficient for a recovery step; when both feet are
+    # down, preserve the normal alternating gait relation.
+    only_left_support = confirmed_contact[:, 0] & ~confirmed_contact[:, 1]
+    only_right_support = confirmed_contact[:, 1] & ~confirmed_contact[:, 0]
+    both_support = both_contacts_confirmed
+    swing_side[recovery_ready & only_left_support] = 1
+    swing_side[recovery_ready & only_right_support] = 0
+    swing_side[recovery_ready & both_support] = 1 - state.swing_side[
+        recovery_ready & both_support
+    ]
     elapsed_s[recovery_ready] = 0.0
     hold_required_s[recovery_ready] = cfg.reset_hold_s
     swing_has_lifted[recovery_ready] = False
     recovery_step_pending[recovery_ready] = True
     recovery_step_active[recovery_ready] = False
 
-    invalid_during_hold = (state.mode == GaitState.HOLD) & ~planner_valid
+    # A recovery HOLD is allowed to wait for the newly prepared planner
+    # proposal.  A normal HOLD with an invalid plan remains a failure.
+    invalid_during_hold = (
+        (state.mode == GaitState.HOLD)
+        & ~planner_valid
+        & ~state.recovery_step_pending
+    )
     mode[invalid_during_hold] = GaitState.PLAN_INVALID
 
     valid_hold = (
@@ -245,25 +385,61 @@ def advance_gait(
     ]
     hold_required_s[recovery_ready] = cfg.reset_hold_s
 
-    confirmed_hold_contact = torch.all(
-        contact_elapsed_s >= cfg.contact_confirm_s - 1.0e-6,
-        dim=-1,
-    )
+    if hold_contact_ready is None:
+        hold_contact_ready = torch.where(
+            state.recovery_step_pending,
+            any_confirmed_contact,
+            both_contacts_confirmed,
+        )
+    else:
+        hold_contact_ready = hold_contact_ready.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if hold_contact_ready.shape != state.mode.shape:
+            raise ValueError(
+                "hold_contact_ready must match the number of environments."
+            )
+    if hold_contact_lost is None:
+        hold_contact_lost = (
+            ~hold_contact_ready
+            & (
+                hold_elapsed_s
+                >= hold_required_s
+                + cfg.hold_contact_lost_confirm_s
+                - 1.0e-6
+            )
+        )
+    else:
+        hold_contact_lost = hold_contact_lost.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if hold_contact_lost.shape != state.mode.shape:
+            raise ValueError(
+                "hold_contact_lost must match the number of environments."
+            )
 
     start_swing = (
         valid_hold
-        & confirmed_hold_contact
+        & hold_contact_ready
         & (hold_elapsed_s >= hold_required_s - 1.0e-6)
+        & swing_ready
     )
 
-    hold_contact_lost = (
+    # Do not start a swing before the required plan has been prepared.  During
+    # normal training, a geometrically valid learned proposal may be unsafe
+    # according to the soft danger-cylinder score so PPO can learn from its
+    # consequences.  Recovery uses the prepared analytic target instead.
+    hold_plan_timeout = (
         valid_hold
-        & ~confirmed_hold_contact
-        & (
-            hold_elapsed_s
-            >= hold_required_s + cfg.hold_contact_lost_confirm_s - 1.0e-6
-        )
+        & hold_contact_ready
+        & (hold_elapsed_s >= hold_required_s - 1.0e-6)
+        & ~swing_ready
+        & plan_wait_expired
     )
+
+    hold_contact_lost = valid_hold & hold_contact_lost
 
     mode[hold_contact_lost] = GaitState.HOLD_CONTACT_LOST
 
@@ -278,6 +454,7 @@ def advance_gait(
             GaitState.RIGHT_SWING,
         ),
     )
+    mode[hold_plan_timeout] = GaitState.RECOVERY
     elapsed_s[start_swing] = 0.0
     hold_required_s[start_swing] = cfg.reset_hold_s
     recovery_step_active[start_swing] = recovery_step_pending[start_swing]
@@ -364,6 +541,69 @@ def advance_gait(
 
     mode[invalid_during_active_step] = GaitState.PLAN_INVALID
 
+    if contact_adaptive:
+        # Event responses are applied after the legacy timer arithmetic so
+        # older callers remain source-compatible while the planner migrates.
+        response = event_response
+        assert response is not None
+        retry_plan = response == EventResponse.RETRY_PLAN
+        accept_touchdown = response == EventResponse.ACCEPT_TOUCHDOWN
+        search_down = response == EventResponse.SEARCH_DOWN
+        reassign_support = response == EventResponse.REASSIGN_SUPPORT
+        stabilize = response == EventResponse.STABILIZE
+
+        mode[retry_plan] = GaitState.HOLD
+        elapsed_s[retry_plan] = 0.0
+        hold_elapsed_s[retry_plan] = 0.0
+        recovery_step_pending[retry_plan] = False
+        recovery_step_active[retry_plan] = False
+
+        mode[accept_touchdown] = GaitState.TOUCHDOWN_CONFIRM
+        mode[search_down & ~late_search_exhausted] = GaitState.OVERDUE
+        late_search_elapsed_s[search_down] += dt
+        mode[search_down & late_search_exhausted] = GaitState.RECOVERY
+        mode[reassign_support] = GaitState.HOLD
+
+        if torch.any(reassign_support).item():
+            _, next_swing = support_roles_from_contacts(
+                confirmed_contact,
+                swing_side,
+            )
+            valid_next_swing = reassign_support & (next_swing >= 0)
+            swing_side[valid_next_swing] = next_swing[valid_next_swing]
+            elapsed_s[reassign_support] = 0.0
+            hold_elapsed_s[reassign_support] = 0.0
+
+        mode[stabilize] = GaitState.RECOVERY
+        stabilization_elapsed_s[stabilize] += dt
+        stabilization_elapsed_s[~stabilize] = 0.0
+        mode[state.mode == GaitState.RECOVERY] = GaitState.RECOVERY
+        # Recovery is owned by the motor policy in contact-adaptive mode.
+        # Legacy recovery-step flags must not leak into the next frame and
+        # cause the planner to synthesize an analytic foothold concurrently.
+        recovery_step_pending[state.mode == GaitState.RECOVERY] = False
+        recovery_step_active[state.mode == GaitState.RECOVERY] = False
+        exited_recovery = (
+            (state.mode == GaitState.RECOVERY)
+            & stabilization_ready
+        )
+        if torch.any(exited_recovery).item():
+            _, next_swing = support_roles_from_contacts(
+                confirmed_contact,
+                swing_side,
+            )
+            valid_next_swing = exited_recovery & (next_swing >= 0)
+            mode[exited_recovery] = GaitState.HOLD
+            swing_side[valid_next_swing] = next_swing[valid_next_swing]
+            elapsed_s[exited_recovery] = 0.0
+            hold_elapsed_s[exited_recovery] = 0.0
+            stabilization_elapsed_s[exited_recovery] = 0.0
+            recovery_step_pending[exited_recovery] = False
+            recovery_step_active[exited_recovery] = False
+
+        planning_failure_state |= planning_failure
+        mode[planning_failure] = GaitState.PLAN_INVALID
+
     return GaitMachineState(
         mode=mode,
         swing_side=swing_side,
@@ -375,4 +615,7 @@ def advance_gait(
         swing_has_lifted=swing_has_lifted,
         recovery_step_pending=recovery_step_pending,
         recovery_step_active=recovery_step_active,
+        stabilization_elapsed_s=stabilization_elapsed_s,
+        late_search_elapsed_s=late_search_elapsed_s,
+        planning_failure=planning_failure_state,
     )

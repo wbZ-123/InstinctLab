@@ -39,6 +39,11 @@ class FakeVerticalCylinderObstacle:
         return offset
 
 
+class FakeNonFiniteObstacle:
+    def get_points_penetration_offset(self, points: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(points, float("nan"))
+
+
 def test_sample_swing_centerline_uses_spacing_with_bounds():
     start = torch.tensor([[0.0, 0.0, 0.0]])
     goal = torch.tensor([[0.30, 0.0, 0.0]])
@@ -104,6 +109,52 @@ def test_swing_centerline_penetration_detects_centerline_entering_edge_cylinder(
     assert result.collides.tolist() == [True]
     assert result.max_penetration_depth.item() > 0.0
     torch.testing.assert_close(result.deepest_phase, torch.tensor([0.5]))
+
+
+def test_swing_clearance_checks_sole_perimeter_not_only_centerline():
+    start = torch.tensor([[0.0, 0.0, 0.10]])
+    goal = torch.tensor([[0.40, 0.0, 0.10]])
+    obstacle = FakeVerticalCylinderObstacle(
+        center_xy=(0.20, 0.04),
+        z_min=0.0,
+        z_max=0.20,
+        radius=0.02,
+    )
+
+    center_only = check_swing_centerline_penetration(
+        obstacle=obstacle,
+        start=start,
+        goal=goal,
+        apex_height=torch.tensor([0.0]),
+        swing_duration_s=0.8,
+        sample_spacing=0.05,
+    )
+    sole_sweep = check_swing_centerline_penetration(
+        obstacle=obstacle,
+        start=start,
+        goal=goal,
+        apex_height=torch.tensor([0.0]),
+        swing_duration_s=0.8,
+        sample_spacing=0.05,
+        foot_points_xy=torch.tensor([[0.0, 0.04]]),
+        foot_yaw_w=torch.tensor([0.0]),
+    )
+
+    assert center_only.collides.tolist() == [False]
+    assert sole_sweep.collides.tolist() == [True]
+
+
+def test_swing_clearance_treats_nonfinite_penetration_as_unsafe():
+    result = check_swing_centerline_penetration(
+        obstacle=FakeNonFiniteObstacle(),
+        start=torch.tensor([[0.0, 0.0, 0.10]]),
+        goal=torch.tensor([[0.40, 0.0, 0.10]]),
+        apex_height=torch.tensor([0.0]),
+        swing_duration_s=0.8,
+    )
+
+    assert result.collides.tolist() == [True]
+    assert torch.isinf(result.max_penetration_depth).tolist() == [True]
 
 
 def test_swing_centerline_penetration_can_be_removed_by_higher_apex():
@@ -182,3 +233,56 @@ def test_adjust_apex_for_edge_clearance_reports_unsafe_at_max_apex():
     assert result.is_safe.tolist() == [False]
     torch.testing.assert_close(result.apex_height, torch.tensor([0.20]))
     assert result.penetration.max_penetration_depth.item() > 0.0
+
+
+def test_clearance_allows_an_existing_start_overlap_when_the_foot_exits():
+    start = torch.tensor([[0.20, 0.0, 0.10]])
+    goal = torch.tensor([[0.50, 0.0, 0.10]])
+    obstacle = FakeVerticalCylinderObstacle(
+        center_xy=(0.20, 0.0),
+        z_min=0.0,
+        z_max=0.20,
+        radius=0.08,
+    )
+
+    result = adjust_apex_for_edge_clearance(
+        obstacle=obstacle,
+        start=start,
+        goal=goal,
+        default_apex_height=torch.tensor([0.0]),
+        swing_duration_s=0.8,
+        apex_step=0.05,
+        max_apex_height=torch.tensor([0.30]),
+        sample_spacing=0.03,
+        allow_start_penetration_escape=True,
+    )
+
+    assert result.penetration.start_penetration_depth.item() > 0.0
+    assert result.penetration.goal_penetration_depth.item() == 0.0
+    assert result.is_safe.tolist() == [True]
+
+
+def test_clearance_does_not_hide_a_penetrating_goal():
+    start = torch.tensor([[0.0, 0.0, 0.10]])
+    goal = torch.tensor([[0.20, 0.0, 0.10]])
+    obstacle = FakeVerticalCylinderObstacle(
+        center_xy=(0.20, 0.0),
+        z_min=0.0,
+        z_max=0.20,
+        radius=0.08,
+    )
+
+    result = adjust_apex_for_edge_clearance(
+        obstacle=obstacle,
+        start=start,
+        goal=goal,
+        default_apex_height=torch.tensor([0.0]),
+        swing_duration_s=0.8,
+        apex_step=0.05,
+        max_apex_height=torch.tensor([0.30]),
+        sample_spacing=0.03,
+        allow_start_penetration_escape=True,
+    )
+
+    assert result.penetration.goal_penetration_depth.item() > 0.0
+    assert result.is_safe.tolist() == [False]

@@ -84,6 +84,18 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_safe_target_candidate_inside_ellipse_count_sum",
         "_safe_target_candidate_obstacle_safe_count_sum",
         "_safe_target_candidate_valid_count_sum",
+        "_learned_foothold_evaluation_count",
+        "_learned_foothold_geometric_valid_count",
+        "_learned_foothold_safety_valid_count",
+        "_learned_foothold_safety_score_sum",
+        "_learned_foothold_penetrating_point_ratio_sum",
+        "_learned_foothold_total_penetration_depth_sum",
+        "_learned_foothold_route_count",
+        "_learned_foothold_route_nominal_count",
+        "_learned_foothold_route_learned_count",
+        "_learned_foothold_route_invalid_count",
+        "_learned_foothold_route_postcheck_invalid_count",
+        "_learned_foothold_routed_safe_count",
     )
     _MAX_BUFFER_NAMES = (
         "_penetration_max",
@@ -100,39 +112,6 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         )
         self._debug_event_max_count = int(
             cfg.params.get("debug_event_max_count", 0)
-        )
-        self._reward_curriculum_start_scale = float(
-            cfg.params.get("reward_curriculum_start_scale", 0.0)
-        )
-        self._reward_curriculum_end_scale = float(
-            cfg.params.get("reward_curriculum_end_scale", 1.0)
-        )
-        self._reward_curriculum_ramp_steps = int(
-            cfg.params.get("reward_curriculum_ramp_steps", 1)
-        )
-        self._reward_curriculum_gate = cfg.params.get(
-            "reward_curriculum_gate", "none"
-        )
-        self._reward_curriculum_min_episode_length = float(
-            cfg.params.get("reward_curriculum_min_episode_length", 0.0)
-        )
-        self._reward_curriculum_full_episode_length = float(
-            cfg.params.get("reward_curriculum_full_episode_length", 1.0)
-        )
-        self._reward_curriculum_velocity_command_name = cfg.params.get(
-            "reward_curriculum_velocity_command_name", "base_velocity"
-        )
-        self._reward_curriculum_velocity_std = float(
-            cfg.params.get("reward_curriculum_velocity_std", 0.5)
-        )
-        self._reward_curriculum_velocity_start_score = float(
-            cfg.params.get("reward_curriculum_velocity_start_score", 0.0)
-        )
-        self._reward_curriculum_velocity_full_score = float(
-            cfg.params.get("reward_curriculum_velocity_full_score", 1.0)
-        )
-        self._reward_curriculum_asset_name = cfg.params.get(
-            "reward_curriculum_asset_name", "robot"
         )
         self._debug_event_count = 0
         try:
@@ -167,22 +146,6 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             dtype=torch.long,
             device=self.device,
         )
-        self._curriculum_previous_episode_length = torch.zeros(
-            shape,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self._curriculum_completed_episode_length_ema = torch.zeros(
-            shape,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self._curriculum_has_completed_episode_length_ema = torch.zeros(
-            shape,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self._curriculum_episode_length_initialized = False
         self._last_episode_log: dict[str, torch.Tensor] = {}
 
     @staticmethod
@@ -202,75 +165,28 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         )
 
     def _compute_reward_curriculum_scale(self) -> torch.Tensor:
-        if self._reward_curriculum_gate != "locomotion_readiness":
-            if self._reward_curriculum_ramp_steps <= 0:
-                step_scale = self._reward_curriculum_end_scale
-            else:
-                ramp_steps = max(self._reward_curriculum_ramp_steps, 1)
-                step_fraction = min(
-                    max(float(getattr(self._env, "common_step_counter", 0)) / ramp_steps, 0.0),
-                    1.0,
-                )
-                step_scale = (
-                    self._reward_curriculum_start_scale
-                    + (
-                        self._reward_curriculum_end_scale
-                        - self._reward_curriculum_start_scale
-                    )
-                    * step_fraction
-                )
-            return torch.full(
-                (self._env.num_envs,),
-                float(step_scale),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-        episode_length = getattr(self._env, "episode_length_buf", None)
-        if episode_length is None:
+        scale = getattr(
+            self._planner,
+            "flat_target_curriculum_scale",
+            None,
+        )
+        if scale is None:
             return self._zero_reward_curriculum_scale()
-
-        episode_length = episode_length.to(device=self.device, dtype=torch.float32)
-        if not self._curriculum_episode_length_initialized:
-            self._curriculum_previous_episode_length[:] = episode_length
-            self._curriculum_episode_length_initialized = True
-
-        reset_mask = episode_length < self._curriculum_previous_episode_length
-        if torch.any(reset_mask):
-            completed_length = self._curriculum_previous_episode_length
-            updated_ema = torch.where(
-                self._curriculum_has_completed_episode_length_ema,
-                0.80 * self._curriculum_completed_episode_length_ema
-                + 0.20 * completed_length,
-                completed_length,
-            )
-            self._curriculum_completed_episode_length_ema = torch.where(
-                reset_mask,
-                updated_ema,
-                self._curriculum_completed_episode_length_ema,
-            )
-            self._curriculum_has_completed_episode_length_ema |= reset_mask
-
-        self._curriculum_previous_episode_length[:] = episode_length
-
-        ema_or_current = torch.where(
-            self._curriculum_has_completed_episode_length_ema,
-            self._curriculum_completed_episode_length_ema,
-            episode_length,
+        scale = torch.as_tensor(
+            scale,
+            device=self.device,
+            dtype=torch.float32,
         )
-        readiness_length = torch.maximum(episode_length, ema_or_current)
-
-        episode_denominator = max(
-            self._reward_curriculum_full_episode_length
-            - self._reward_curriculum_min_episode_length,
-            1.0,
-        )
-        episode_score = (
-            (readiness_length - self._reward_curriculum_min_episode_length)
-            / episode_denominator
+        if scale.ndim == 0:
+            scale = scale.expand(self._env.num_envs)
+        if scale.shape != (self._env.num_envs,):
+            return self._zero_reward_curriculum_scale()
+        return torch.nan_to_num(
+            scale,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
         ).clamp(0.0, 1.0)
-
-        return episode_score * float(self._reward_curriculum_end_scale)
 
     @torch.no_grad()
     def update(self, dt: float):
@@ -319,6 +235,36 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         safe_target_candidate_valid_count_raw = self._require(
             data, "safe_target_candidate_valid_count"
         )
+        learned_foothold_evaluated = self._require(
+            data, "learned_foothold_evaluated"
+        ).bool()
+        learned_foothold_geometric_valid = self._require(
+            data, "learned_foothold_geometric_valid"
+        ).bool()
+        learned_foothold_safety_valid = self._require(
+            data, "learned_foothold_safety_valid"
+        ).bool()
+        learned_foothold_safety_score_raw = self._require(
+            data, "learned_foothold_safety_score"
+        )
+        learned_foothold_penetrating_point_ratio_raw = self._require(
+            data, "learned_foothold_penetrating_point_ratio"
+        )
+        learned_foothold_total_penetration_depth_raw = self._require(
+            data, "learned_foothold_total_penetration_depth"
+        )
+        learned_foothold_route_event = self._require(
+            data, "learned_foothold_route_event"
+        ).bool()
+        learned_foothold_route_use_nominal = self._require(
+            data, "learned_foothold_route_use_nominal"
+        ).bool()
+        learned_foothold_route_use_learned = self._require(
+            data, "learned_foothold_route_use_learned"
+        ).bool()
+        learned_foothold_route_initial_executable = self._require(
+            data, "learned_foothold_route_initial_executable"
+        ).bool()
         recovery_step_active = self._require(
             data, "recovery_step_active"
         ).bool()
@@ -384,6 +330,24 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         ).clamp_min(0.0)
         safe_target_candidate_valid_count = torch.nan_to_num(
             safe_target_candidate_valid_count_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        learned_foothold_safety_score = torch.nan_to_num(
+            learned_foothold_safety_score_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(-1.0, 1.0)
+        learned_foothold_penetrating_point_ratio = torch.nan_to_num(
+            learned_foothold_penetrating_point_ratio_raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        learned_foothold_total_penetration_depth = torch.nan_to_num(
+            learned_foothold_total_penetration_depth_raw,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
@@ -516,6 +480,58 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         self._safe_target_candidate_valid_count_sum += (
             safe_target_candidate_valid_count * search_sample
         )
+        # HOLD proposal evaluations and new-SWING execution routes have
+        # different event frequencies. Keep separate denominators so repeated
+        # proposal learning samples never masquerade as repeated foot plans.
+        learned_evaluation_sample = learned_foothold_evaluated.float()
+        self._learned_foothold_evaluation_count += (
+            learned_evaluation_sample
+        )
+        self._learned_foothold_geometric_valid_count += (
+            learned_foothold_evaluated
+            & learned_foothold_geometric_valid
+        ).float()
+        self._learned_foothold_safety_valid_count += (
+            learned_foothold_evaluated & learned_foothold_safety_valid
+        ).float()
+        self._learned_foothold_safety_score_sum += (
+            learned_foothold_safety_score * learned_evaluation_sample
+        )
+        self._learned_foothold_penetrating_point_ratio_sum += (
+            learned_foothold_penetrating_point_ratio
+            * learned_evaluation_sample
+        )
+        self._learned_foothold_total_penetration_depth_sum += (
+            learned_foothold_total_penetration_depth
+            * learned_evaluation_sample
+        )
+
+        learned_route_sample = learned_foothold_route_event.float()
+        route_learned = (
+            learned_foothold_route_event
+            & learned_foothold_route_use_learned
+        )
+        route_nominal = (
+            learned_foothold_route_event
+            & learned_foothold_route_use_nominal
+        )
+        route_initial_executable = (
+            learned_foothold_route_event
+            & learned_foothold_route_initial_executable
+        )
+        self._learned_foothold_route_count += learned_route_sample
+        self._learned_foothold_route_learned_count += route_learned.float()
+        self._learned_foothold_route_nominal_count += route_nominal.float()
+        self._learned_foothold_route_invalid_count += (
+            learned_foothold_route_event
+            & ~learned_foothold_route_initial_executable
+        ).float()
+        self._learned_foothold_route_postcheck_invalid_count += (
+            route_initial_executable & ~planner_valid
+        ).float()
+        self._learned_foothold_routed_safe_count += (
+            route_learned & learned_foothold_safety_valid
+        ).float()
 
         self._previous_touchdown_accepted.copy_(touchdown_accepted)
         self._previous_touchdown_confirm.copy_(touchdown_confirm)
@@ -774,6 +790,18 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                     "safe_target_candidate_inside_ellipse_count_mean",
                     "safe_target_candidate_obstacle_safe_count_mean",
                     "safe_target_candidate_valid_count_mean",
+                    "learned_foothold_evaluation_rate",
+                    "learned_foothold_geometric_valid_fraction",
+                    "learned_foothold_safety_valid_fraction",
+                    "learned_foothold_safety_score_mean",
+                    "learned_foothold_penetrating_point_ratio_mean",
+                    "learned_foothold_total_penetration_depth_mean",
+                    "learned_foothold_route_rate",
+                    "learned_foothold_route_nominal_fraction",
+                    "learned_foothold_route_learned_fraction",
+                    "learned_foothold_route_invalid_fraction",
+                    "learned_foothold_route_postcheck_invalid_fraction",
+                    "learned_foothold_routed_safe_fraction",
                 )
             }
 
@@ -787,6 +815,15 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         total_right_swing_entry_count = right_swing_entry_count.sum()
         safe_target_search_count = self._safe_target_search_count[env_ids]
         total_safe_target_search_count = safe_target_search_count.sum()
+        learned_evaluation_count = (
+            self._learned_foothold_evaluation_count[env_ids]
+        )
+        total_learned_evaluation_count = learned_evaluation_count.sum()
+        learned_route_count = self._learned_foothold_route_count[env_ids]
+        total_learned_route_count = learned_route_count.sum()
+        total_learned_route_used_count = (
+            self._learned_foothold_route_learned_count[env_ids].sum()
+        )
         values = {
             "swing_fraction": self._safe_ratio(
                 self._swing_step_count[env_ids], step_count
@@ -998,6 +1035,64 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "safe_target_candidate_valid_count_mean": self._safe_ratio(
                 self._safe_target_candidate_valid_count_sum[env_ids].sum(),
                 total_safe_target_search_count,
+            ),
+            # HOLD proposal quality, divided by proposal evaluation events.
+            "learned_foothold_evaluation_rate": self._safe_ratio(
+                learned_evaluation_count, step_count
+            ).mean(),
+            "learned_foothold_geometric_valid_fraction": self._safe_ratio(
+                self._learned_foothold_geometric_valid_count[
+                    env_ids
+                ].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_safety_valid_fraction": self._safe_ratio(
+                self._learned_foothold_safety_valid_count[env_ids].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_safety_score_mean": self._safe_ratio(
+                self._learned_foothold_safety_score_sum[env_ids].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_penetrating_point_ratio_mean": self._safe_ratio(
+                self._learned_foothold_penetrating_point_ratio_sum[
+                    env_ids
+                ].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_total_penetration_depth_mean": self._safe_ratio(
+                self._learned_foothold_total_penetration_depth_sum[
+                    env_ids
+                ].sum(),
+                total_learned_evaluation_count,
+            ),
+            # New-SWING route outcomes, divided by committed route events.
+            "learned_foothold_route_rate": self._safe_ratio(
+                learned_route_count, step_count
+            ).mean(),
+            "learned_foothold_route_nominal_fraction": self._safe_ratio(
+                self._learned_foothold_route_nominal_count[env_ids].sum(),
+                total_learned_route_count,
+            ),
+            "learned_foothold_route_learned_fraction": self._safe_ratio(
+                total_learned_route_used_count,
+                total_learned_route_count,
+            ),
+            "learned_foothold_route_invalid_fraction": self._safe_ratio(
+                self._learned_foothold_route_invalid_count[env_ids].sum(),
+                total_learned_route_count,
+            ),
+            "learned_foothold_route_postcheck_invalid_fraction": (
+                self._safe_ratio(
+                    self._learned_foothold_route_postcheck_invalid_count[
+                        env_ids
+                    ].sum(),
+                    total_learned_route_count,
+                )
+            ),
+            "learned_foothold_routed_safe_fraction": self._safe_ratio(
+                self._learned_foothold_routed_safe_count[env_ids].sum(),
+                total_learned_route_used_count,
             ),
         }
         return {
