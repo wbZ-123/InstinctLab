@@ -45,6 +45,152 @@ def _mask_stabilization_reward(value: torch.Tensor, data) -> torch.Tensor:
     )
 
 
+def mask_recovery_reward(value: torch.Tensor, data) -> torch.Tensor:
+    """Pause task-pressure rewards while the motor policy self-stabilizes.
+
+    This is deliberately a project-local wrapper.  The upstream locomotion
+    reward functions remain unchanged; only their contribution is suppressed
+    for environments whose foothold sensor reports autonomous RECOVERY.
+    """
+
+    return _mask_stabilization_reward(value, data)
+
+
+def _recovery_masked_upstream_reward(
+    env,
+    upstream_name: str,
+    *,
+    sensor_name: str,
+    module_name: str = "isaaclab.envs.mdp",
+    **kwargs,
+) -> torch.Tensor:
+    # Import lazily so unit tests of this lightweight module do not need to
+    # initialize the full Isaac Sim/PXR stack.
+    if module_name == "isaaclab.envs.mdp":
+        from isaaclab.envs import mdp as upstream_mdp
+    elif module_name == "instinctlab.tasks.parkour.mdp":
+        from instinctlab.tasks.parkour import mdp as upstream_mdp
+    else:
+        raise ValueError(f"Unsupported recovery reward module: {module_name}")
+
+    upstream = getattr(upstream_mdp, upstream_name)
+    value = upstream(env, **kwargs)
+    data = _foothold_planner_data(env, sensor_name)
+    return mask_recovery_reward(value, data)
+
+
+def track_lin_vel_xy_exp_recovery_masked(
+    env,
+    std: float,
+    command_name: str,
+    sensor_name: str = "foothold_planner",
+    asset_cfg=None,
+) -> torch.Tensor:
+    kwargs = {"std": std, "command_name": command_name}
+    if asset_cfg is not None:
+        kwargs["asset_cfg"] = asset_cfg
+    return _recovery_masked_upstream_reward(
+        env,
+        "track_lin_vel_xy_exp",
+        sensor_name=sensor_name,
+        **kwargs,
+    )
+
+
+def feet_air_time_recovery_masked(
+    env,
+    command_name: str,
+    vel_threshold: float,
+    sensor_cfg,
+    sensor_name: str = "foothold_planner",
+) -> torch.Tensor:
+    # ``feet_air_time`` is the project's parkour reward (it is not exported
+    # by IsaacLab's base mdp module), so delegate to the parkour namespace.
+    return _recovery_masked_upstream_reward(
+        env,
+        "feet_air_time",
+        sensor_name=sensor_name,
+        module_name="instinctlab.tasks.parkour.mdp",
+        command_name=command_name,
+        vel_threshold=vel_threshold,
+        sensor_cfg=sensor_cfg,
+    )
+
+
+def track_ang_vel_z_exp_recovery_masked(
+    env,
+    std: float,
+    command_name: str,
+    sensor_name: str = "foothold_planner",
+    asset_cfg=None,
+) -> torch.Tensor:
+    kwargs = {"std": std, "command_name": command_name}
+    if asset_cfg is not None:
+        kwargs["asset_cfg"] = asset_cfg
+    return _recovery_masked_upstream_reward(
+        env,
+        "track_ang_vel_z_exp",
+        sensor_name=sensor_name,
+        **kwargs,
+    )
+
+
+def heading_error_recovery_masked(
+    env,
+    command_name: str,
+    sensor_name: str = "foothold_planner",
+) -> torch.Tensor:
+    return _recovery_masked_upstream_reward(
+        env,
+        "heading_error",
+        sensor_name=sensor_name,
+        module_name="instinctlab.tasks.parkour.mdp",
+        command_name=command_name,
+    )
+
+
+def dont_wait_recovery_masked(
+    env,
+    command_name: str,
+    sensor_name: str = "foothold_planner",
+    asset_cfg=None,
+) -> torch.Tensor:
+    kwargs = {"command_name": command_name}
+    if asset_cfg is not None:
+        kwargs["asset_cfg"] = asset_cfg
+    return _recovery_masked_upstream_reward(
+        env,
+        "dont_wait",
+        sensor_name=sensor_name,
+        module_name="instinctlab.tasks.parkour.mdp",
+        **kwargs,
+    )
+
+
+def stand_still_recovery_masked(
+    env,
+    command_name: str,
+    sensor_name: str = "foothold_planner",
+    asset_cfg=None,
+    threshold: float = 0.15,
+    offset: float = 1.0,
+) -> torch.Tensor:
+    kwargs = {
+        "command_name": command_name,
+        "threshold": threshold,
+        "offset": offset,
+    }
+    if asset_cfg is not None:
+        kwargs["asset_cfg"] = asset_cfg
+    return _recovery_masked_upstream_reward(
+        env,
+        "stand_still",
+        sensor_name=sensor_name,
+        module_name="instinctlab.tasks.parkour.mdp",
+        **kwargs,
+    )
+
+
 def _sync_desired_velocity_command(
     env,
     sensor_name: str,
@@ -115,6 +261,9 @@ def learned_foothold_planning_event_reward(
     sensor_name: str = "foothold_planner",
     reachability_radius_x: float = 0.42,
     reachability_radius_y: float = 0.25,
+    velocity_lookahead_s: float = 0.10,
+    nominal_step_width_m: float = 0.18,
+    velocity_std: float = 0.5,
 ) -> torch.Tensor:
     """Train identity on safe nominals and safety correction otherwise.
 
@@ -122,16 +271,17 @@ def learned_foothold_planning_event_reward(
     decodes the learned action, avoiding a second arbitrary meter threshold.
     """
 
-    if reachability_radius_x <= 0.0 or reachability_radius_y <= 0.0:
+    if (
+        reachability_radius_x <= 0.0
+        or reachability_radius_y <= 0.0
+        or velocity_lookahead_s <= 0.0
+        or nominal_step_width_m < 0.0
+        or velocity_std <= 0.0
+    ):
         raise ValueError("reachability radii must be positive.")
 
     data = _foothold_planner_data(env, sensor_name)
     event = data.learned_foothold_evaluated.bool()
-    nominal_safe = (
-        data.nominal_geometric_valid.bool()
-        & data.nominal_safety_valid.bool()
-    )
-
     delta_xy = (
         data.learned_foothold_decoded_f[:, :2]
         - data.raw_unclipped_foothold_f[:, :2]
@@ -145,6 +295,32 @@ def learned_foothold_planning_event_reward(
     ).clamp(0.0, 1.0)
     nominal_closeness = 1.0 - 2.0 * normalized_distance
 
+    side_sign = torch.where(
+        data.swing_side == 0,
+        torch.ones_like(data.swing_side, dtype=delta_xy.dtype),
+        -torch.ones_like(data.swing_side, dtype=delta_xy.dtype),
+    )
+    learned_velocity = torch.stack(
+        (
+            data.learned_foothold_decoded_f[:, 0] / velocity_lookahead_s,
+            (
+                data.learned_foothold_decoded_f[:, 1]
+                - side_sign * nominal_step_width_m
+            )
+            / velocity_lookahead_s,
+        ),
+        dim=-1,
+    )
+    command_error = torch.sum(
+        torch.square(
+            learned_velocity
+            - data.nominal_feasible_velocity_f[:, :2]
+        ),
+        dim=-1,
+    )
+    command_consistency = torch.exp(-command_error / velocity_std**2)
+    safe_score = nominal_closeness.clamp(0.0, 1.0) * command_consistency
+
     learned_safety = data.learned_foothold_safety_score.clamp(
         -1.0,
         1.0,
@@ -154,10 +330,29 @@ def learned_foothold_planning_event_reward(
         learned_safety,
         torch.full_like(learned_safety, -1.0),
     )
+    preflight_known = getattr(
+        data,
+        "swing_preflight_ready",
+        torch.zeros_like(event),
+    ).bool()
+    preflight_safe = getattr(
+        data,
+        "swing_preflight_safe",
+        torch.ones_like(event),
+    ).bool()
+    execution_safe = ~preflight_known | preflight_safe
     score = torch.where(
-        nominal_safe,
-        nominal_closeness,
-        learned_safety,
+        (
+            data.learned_foothold_safety_valid.bool()
+            & data.learned_foothold_geometric_valid.bool()
+            & execution_safe
+        ),
+        safe_score,
+        torch.where(
+            execution_safe,
+            learned_safety,
+            torch.full_like(learned_safety, -1.0),
+        ),
     )
     return _mask_stabilization_reward(
         torch.where(event, score, torch.zeros_like(score)),

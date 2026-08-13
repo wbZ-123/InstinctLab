@@ -32,6 +32,13 @@ def test_calibration_uses_successful_hold_samples_only():
     assert result["dwell_s"] == pytest.approx(0.10)
 
 
+def test_calibration_default_dwell_matches_recovery_seed():
+    values = torch.tensor([[0.10, 0.20, 0.10, 0.01]])
+    result = calibrate_stability_bounds(values, torch.tensor([True]))
+
+    assert result["dwell_s"] == pytest.approx(0.04)
+
+
 def test_calibration_rejects_empty_or_nonfinite_samples():
     values = torch.tensor([[float("nan"), 0.2, 0.1, 0.01]])
     valid = torch.tensor([True])

@@ -7,6 +7,7 @@ from .learned_target import (
     decode_normalized_foothold,
     learned_foothold_event_masks,
     learned_foothold_swing_ready,
+    learned_foothold_transaction_ready,
     nominal_foothold_prepare_mask,
     lock_prepared_learned_foothold,
     prepare_learned_foothold_target,
@@ -53,7 +54,11 @@ from .terrain_query import (
     TerrainQueryResult,
 )
 
-from .trajectory import SwingReference, quintic_swing_reference
+from .trajectory import (
+    SwingReference,
+    apply_late_touchdown_descent,
+    quintic_swing_reference,
+)
 
 from .terrain_provider import lift_flat_targets_to_terrain
 
@@ -86,6 +91,7 @@ __all__ = [
     "decode_normalized_foothold",
     "learned_foothold_event_masks",
     "learned_foothold_swing_ready",
+    "learned_foothold_transaction_ready",
     "nominal_foothold_prepare_mask",
     "lock_prepared_learned_foothold",
     "prepare_learned_foothold_target",
@@ -106,6 +112,7 @@ __all__ = [
     "GaitMachineConfig",
     "GaitMachineState",
     "SwingReference",
+    "apply_late_touchdown_descent",
     "advance_gait",
     "gait_phase",
     "initial_gait_state",

@@ -51,21 +51,10 @@ def sample_flat_targets(
     level: torch.Tensor,
     generator: torch.Generator,
     cfg: FlatProviderConfig,
+    *,
+    enable_curriculum_residual: bool = True,
 ) -> FlatTargetBatch:
     num_envs = stance_xy.shape[0]
-
-    random_values = torch.rand(
-        (num_envs, 2),
-        generator=generator,
-        device=stance_xy.device,
-        dtype=stance_xy.dtype,
-    )
-
-    disk_radius = torch.sqrt(random_values[:, 0])
-    disk_angle = 2.0 * torch.pi * random_values[:, 1]
-
-    unit_x = disk_radius * torch.cos(disk_angle)
-    unit_y = disk_radius * torch.sin(disk_angle)
 
     radius_x_by_level = torch.as_tensor(
         cfg.curriculum_radius_x,
@@ -83,8 +72,6 @@ def sample_flat_targets(
         max=len(cfg.curriculum_radius_x) - 1,
     )
 
-    residual_x = unit_x * radius_x_by_level[level_index]
-    residual_y = unit_y * radius_y_by_level[level_index]
     curriculum_radius_f = torch.stack(
         (
             radius_x_by_level[level_index],
@@ -92,6 +79,28 @@ def sample_flat_targets(
         ),
         dim=-1,
     )
+    if enable_curriculum_residual:
+        random_values = torch.rand(
+            (num_envs, 2),
+            generator=generator,
+            device=stance_xy.device,
+            dtype=stance_xy.dtype,
+        )
+        disk_radius = torch.sqrt(random_values[:, 0])
+        disk_angle = 2.0 * torch.pi * random_values[:, 1]
+        residual_x = (
+            disk_radius * torch.cos(disk_angle) * curriculum_radius_f[:, 0]
+        )
+        residual_y = (
+            disk_radius * torch.sin(disk_angle) * curriculum_radius_f[:, 1]
+        )
+    else:
+        residual_x = torch.zeros(
+            num_envs,
+            device=stance_xy.device,
+            dtype=stance_xy.dtype,
+        )
+        residual_y = torch.zeros_like(residual_x)
     curriculum_residual_f = torch.stack(
         (residual_x, residual_y),
         dim=-1,

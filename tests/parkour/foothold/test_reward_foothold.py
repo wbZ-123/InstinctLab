@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,6 +146,92 @@ def test_stabilization_mask_prefers_contact_adaptive_flag_and_has_legacy_fallbac
     )
 
 
+def test_recovery_reward_mask_pauses_task_pressure_only_for_active_envs():
+    foothold = _load_foothold_reward_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([8, 8, 1]),
+        stabilization_active=torch.tensor([True, False, False]),
+    )
+
+    torch.testing.assert_close(
+        foothold.mask_recovery_reward(
+            torch.tensor([2.0, 3.0, 4.0]),
+            data,
+        ),
+        torch.tensor([0.0, 3.0, 4.0]),
+    )
+
+
+def test_recovery_masked_velocity_wrapper_preserves_upstream_values(monkeypatch):
+    foothold = _load_foothold_reward_module()
+    upstream_mdp = types.ModuleType("isaaclab.envs.mdp")
+    upstream_mdp.track_lin_vel_xy_exp = lambda env, **kwargs: torch.tensor(
+        [1.0, 2.0]
+    )
+    isaaclab_envs = types.ModuleType("isaaclab.envs")
+    isaaclab_envs.mdp = upstream_mdp
+    isaaclab = types.ModuleType("isaaclab")
+    isaaclab.envs = isaaclab_envs
+    monkeypatch.setitem(sys.modules, "isaaclab", isaaclab)
+    monkeypatch.setitem(sys.modules, "isaaclab.envs", isaaclab_envs)
+    monkeypatch.setitem(sys.modules, "isaaclab.envs.mdp", upstream_mdp)
+
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([8, 1]),
+        stabilization_active=torch.tensor([True, False]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={"foothold_planner": SimpleNamespace(data=data)},
+        )
+    )
+
+    torch.testing.assert_close(
+        foothold.track_lin_vel_xy_exp_recovery_masked(
+            env,
+            std=0.5,
+            command_name="base_velocity",
+        ),
+        torch.tensor([0.0, 2.0]),
+    )
+
+
+def test_recovery_masked_feet_air_time_uses_project_parkour_reward(monkeypatch):
+    foothold = _load_foothold_reward_module()
+    upstream_mdp = types.ModuleType("instinctlab.tasks.parkour.mdp")
+    upstream_mdp.feet_air_time = lambda env, **kwargs: torch.tensor([1.5, 2.5])
+    parkour_tasks = types.ModuleType("instinctlab.tasks.parkour")
+    parkour_tasks.mdp = upstream_mdp
+    instinctlab_tasks = types.ModuleType("instinctlab.tasks")
+    instinctlab_tasks.parkour = parkour_tasks
+    instinctlab = types.ModuleType("instinctlab")
+    instinctlab.tasks = instinctlab_tasks
+    monkeypatch.setitem(sys.modules, "instinctlab", instinctlab)
+    monkeypatch.setitem(sys.modules, "instinctlab.tasks", instinctlab_tasks)
+    monkeypatch.setitem(sys.modules, "instinctlab.tasks.parkour", parkour_tasks)
+    monkeypatch.setitem(sys.modules, "instinctlab.tasks.parkour.mdp", upstream_mdp)
+
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([8, 1]),
+        stabilization_active=torch.tensor([True, False]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={"foothold_planner": SimpleNamespace(data=data)},
+        )
+    )
+
+    torch.testing.assert_close(
+        foothold.feet_air_time_recovery_masked(
+            env,
+            command_name="base_velocity",
+            vel_threshold=0.15,
+            sensor_cfg=object(),
+        ),
+        torch.tensor([0.0, 2.5]),
+    )
+
+
 def test_stabilization_masks_foothold_and_learned_event_rewards():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(
@@ -181,6 +269,9 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
         learned_foothold_geometric_valid=torch.tensor(
             [True, True, True, False, True]
         ),
+        learned_foothold_safety_valid=torch.tensor(
+            [True, True, False, False, True]
+        ),
         learned_foothold_safety_score=torch.tensor(
             [0.0, 0.0, -0.4, 0.8, 1.0]
         ),
@@ -192,22 +283,35 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
         ),
         raw_unclipped_foothold_f=torch.tensor(
             [
-                [0.20, 0.10, 0.0],
-                [0.20, 0.10, 0.0],
-                [0.20, 0.10, 0.0],
-                [0.20, 0.10, 0.0],
-                [0.20, 0.10, 0.0],
+                    [0.20, 0.18, 0.0],
+                    [0.20, 0.18, 0.0],
+                    [0.20, 0.18, 0.0],
+                    [0.20, 0.18, 0.0],
+                    [0.20, 0.18, 0.0],
             ]
         ),
         learned_foothold_decoded_f=torch.tensor(
             [
-                [0.20, 0.10, 0.0],
-                [0.60, 0.10, 0.0],
-                [0.25, 0.08, 0.0],
-                [0.25, 0.08, 0.0],
-                [0.25, 0.08, 0.0],
+                    [0.20, 0.18, 0.0],
+                    [0.60, 0.18, 0.0],
+                    [0.25, 0.08, 0.0],
+                    [0.25, 0.08, 0.0],
+                    [0.25, 0.08, 0.0],
             ]
         ),
+        nominal_feasible_velocity_f=torch.tensor(
+            [
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ]
+        ),
+        swing_side=torch.tensor([0, 0, 0, 0, 0]),
+        swing_preflight_ready=torch.tensor([False, False, False, True, False]),
+        swing_preflight_safe=torch.tensor([True, True, True, False, True]),
+        stabilization_active=torch.zeros(5, dtype=torch.bool),
     )
     env = SimpleNamespace(
         scene=SimpleNamespace(
@@ -221,12 +325,16 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
         env,
         reachability_radius_x=0.4,
         reachability_radius_y=0.2,
+        velocity_lookahead_s=0.10,
+        nominal_step_width_m=0.18,
+        velocity_std=0.5,
     )
 
-    torch.testing.assert_close(
-        reward,
-        torch.tensor([1.0, -1.0, -0.4, -1.0, 0.0]),
-    )
+    assert reward[0].item() == 1.0
+    assert 0.0 <= reward[1].item() < 0.01
+    torch.testing.assert_close(reward[2], torch.tensor(-0.4))
+    assert reward[3].item() == -1.0
+    assert reward[4].item() == 0.0
 
 
 def test_swing_tracking_rewards_reference_match_and_masks_non_swing():

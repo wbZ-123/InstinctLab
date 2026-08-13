@@ -110,16 +110,17 @@ def stability_ready(
         _require_batch_shape(getattr(signals, name), (num_envs,), name)
     _require_batch_shape(elapsed_s, (num_envs,), "elapsed_s")
 
+    # Support slip remains part of the sampled signal for diagnostics and
+    # calibration, but it is not a hard Recovery-exit gate: contact handoff
+    # and stair edges can produce short slip spikes after the body is stable.
     stable = (
         torch.any(signals.confirmed_contact.bool(), dim=-1)
         & torch.isfinite(signals.body_tilt_rad)
         & torch.isfinite(signals.body_angular_speed_rad_s)
         & torch.isfinite(signals.body_horizontal_speed_m_s)
-        & torch.isfinite(signals.support_slip_m_s)
         & (signals.body_tilt_rad <= bounds.max_tilt_rad)
         & (signals.body_angular_speed_rad_s <= bounds.max_angular_speed_rad_s)
         & (signals.body_horizontal_speed_m_s <= bounds.max_horizontal_speed_m_s)
-        & (signals.support_slip_m_s <= bounds.max_support_slip_m_s)
     )
     next_elapsed_s = torch.where(
         stable,
@@ -134,6 +135,7 @@ def response_for_event(
     event: torch.Tensor,
     support_stable: torch.Tensor,
     late_search_available: torch.Tensor,
+    late_touchdown_confirmed: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map a contact event to a bounded response without changing frames."""
     if event.ndim != 1:
@@ -143,6 +145,17 @@ def response_for_event(
         ("late_search_available", late_search_available),
     ):
         _require_batch_shape(value, tuple(event.shape), name)
+    if late_touchdown_confirmed is None:
+        late_touchdown_confirmed = torch.zeros_like(
+            late_search_available,
+            dtype=torch.bool,
+        )
+    else:
+        _require_batch_shape(
+            late_touchdown_confirmed,
+            tuple(event.shape),
+            "late_touchdown_confirmed",
+        )
     if torch.any((event < ContactEvent.NONE) | (event > ContactEvent.PLAN_INVALID)):
         raise ValueError("event contains an unknown ContactEvent value")
 
@@ -155,8 +168,15 @@ def response_for_event(
     response[plan_invalid] = EventResponse.RETRY_PLAN
     response[early & support_stable.bool()] = EventResponse.ACCEPT_TOUCHDOWN
     response[early & ~support_stable.bool()] = EventResponse.STABILIZE
-    response[late & late_search_available.bool()] = EventResponse.SEARCH_DOWN
-    response[late & ~late_search_available.bool()] = EventResponse.STABILIZE
+    response[late & late_touchdown_confirmed.bool()] = (
+        EventResponse.ACCEPT_TOUCHDOWN
+    )
+    response[
+        late & ~late_touchdown_confirmed.bool() & late_search_available.bool()
+    ] = EventResponse.SEARCH_DOWN
+    response[
+        late & ~late_touchdown_confirmed.bool() & ~late_search_available.bool()
+    ] = EventResponse.STABILIZE
     response[support_lost & support_stable.bool()] = EventResponse.REASSIGN_SUPPORT
     response[support_lost & ~support_stable.bool()] = EventResponse.STABILIZE
     return response

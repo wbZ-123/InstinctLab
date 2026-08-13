@@ -3,5 +3,5 @@
   "max_angular_speed_rad_s": 1.5,
   "max_horizontal_speed_m_s": 0.35,
   "max_support_slip_m_s": 0.05,
-  "dwell_s": 0.1
+  "dwell_s": 0.04
 }

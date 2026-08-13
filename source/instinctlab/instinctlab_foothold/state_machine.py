@@ -151,6 +151,7 @@ def advance_gait(
     plan_wait_expired: torch.Tensor | None = None,
     event_response: torch.Tensor | None = None,
     stabilization_ready: torch.Tensor | None = None,
+    stability_current: torch.Tensor | None = None,
     late_search_exhausted: torch.Tensor | None = None,
     planning_failure: torch.Tensor | None = None,
 ) -> GaitMachineState:
@@ -181,6 +182,17 @@ def advance_gait(
         if stabilization_ready.shape != state.mode.shape:
             raise ValueError(
                 "stabilization_ready must match the number of environments."
+            )
+    if stability_current is None:
+        stability_current = stabilization_ready.clone()
+    else:
+        stability_current = stability_current.to(
+            device=state.mode.device,
+            dtype=torch.bool,
+        )
+        if stability_current.shape != state.mode.shape:
+            raise ValueError(
+                "stability_current must match the number of environments."
             )
     if late_search_exhausted is None:
         late_search_exhausted = torch.zeros_like(
@@ -312,16 +324,33 @@ def advance_gait(
     )
     mode[accepted_early_touchdown] = GaitState.TOUCHDOWN_CONFIRM
 
-    was_failure_reason = (
-        (state.mode == GaitState.PLAN_INVALID)
-        | (
-            (state.mode == GaitState.EARLY_CONTACT)
-            & ~accepted_early_touchdown
+    if contact_adaptive:
+        # In the event-driven path PLAN_INVALID and OVERDUE are transient
+        # planner events.  RETRY_PLAN/SEARCH_DOWN below owns their routing;
+        # they must not first become a long-lived RECOVERY state.  Recovery
+        # is reserved for a physical contact failure (unstable early contact,
+        # confirmed stance loss, or loss of the HOLD support contact).
+        was_failure_reason = (
+            (
+                (state.mode == GaitState.EARLY_CONTACT)
+                & ~accepted_early_touchdown
+            )
+            | (state.mode == GaitState.STANCE_LOST)
+            | (state.mode == GaitState.HOLD_CONTACT_LOST)
         )
-        | (state.mode == GaitState.OVERDUE)
-        | (state.mode == GaitState.STANCE_LOST)
-        | (state.mode == GaitState.HOLD_CONTACT_LOST)
-    )
+    else:
+        # Preserve the legacy non-adaptive state-machine behavior for old
+        # callers and checkpoints that do not provide event responses.
+        was_failure_reason = (
+            (state.mode == GaitState.PLAN_INVALID)
+            | (
+                (state.mode == GaitState.EARLY_CONTACT)
+                & ~accepted_early_touchdown
+            )
+            | (state.mode == GaitState.OVERDUE)
+            | (state.mode == GaitState.STANCE_LOST)
+            | (state.mode == GaitState.HOLD_CONTACT_LOST)
+        )
     mode[was_failure_reason] = GaitState.RECOVERY
 
     was_recovery = state.mode == GaitState.RECOVERY
@@ -427,10 +456,9 @@ def advance_gait(
         & swing_ready
     )
 
-    # Do not start a swing before the required plan has been prepared.  During
-    # normal training, a geometrically valid learned proposal may be unsafe
-    # according to the soft danger-cylinder score so PPO can learn from its
-    # consequences.  Recovery uses the prepared analytic target instead.
+    # Do not start a swing before the complete plan transaction is ready.  An
+    # unsafe proposal is retained as a PPO event, but it never becomes an
+    # executable swing trajectory.
     hold_plan_timeout = (
         valid_hold
         & hold_contact_ready
@@ -454,7 +482,14 @@ def advance_gait(
             GaitState.RIGHT_SWING,
         ),
     )
-    mode[hold_plan_timeout] = GaitState.RECOVERY
+    # Missing a planning deadline is not a physical failure.  Keep the robot
+    # in stable HOLD and let the next planning event replace the proposal;
+    # entering RECOVERY here used to create a PLAN_INVALID -> RECOVERY loop.
+    mode[hold_plan_timeout] = GaitState.HOLD
+    elapsed_s[hold_plan_timeout] = 0.0
+    hold_elapsed_s[hold_plan_timeout] = 0.0
+    recovery_step_pending[hold_plan_timeout] = False
+    recovery_step_active[hold_plan_timeout] = False
     elapsed_s[start_swing] = 0.0
     hold_required_s[start_swing] = cfg.reset_hold_s
     recovery_step_active[start_swing] = recovery_step_pending[start_swing]
@@ -539,7 +574,12 @@ def advance_gait(
         active_swing | (state.mode == GaitState.TOUCHDOWN_CONFIRM)
     ) & ~planner_valid
 
-    mode[invalid_during_active_step] = GaitState.PLAN_INVALID
+    # A plan is fully preflighted before SWING starts.  In the adaptive path
+    # the target/frame are locked for the whole motion, so a later planner
+    # validity flag cannot rewrite an already-running swing.  Keep the legacy
+    # behavior for non-adaptive callers that still use PLAN_INVALID directly.
+    if not contact_adaptive:
+        mode[invalid_during_active_step] = GaitState.PLAN_INVALID
 
     if contact_adaptive:
         # Event responses are applied after the legacy timer arithmetic so
@@ -575,8 +615,11 @@ def advance_gait(
             hold_elapsed_s[reassign_support] = 0.0
 
         mode[stabilize] = GaitState.RECOVERY
-        stabilization_elapsed_s[stabilize] += dt
-        stabilization_elapsed_s[~stabilize] = 0.0
+        stabilization_elapsed_s = torch.where(
+            stabilize & stability_current,
+            stabilization_elapsed_s + dt,
+            torch.zeros_like(stabilization_elapsed_s),
+        )
         mode[state.mode == GaitState.RECOVERY] = GaitState.RECOVERY
         # Recovery is owned by the motor policy in contact-adaptive mode.
         # Legacy recovery-step flags must not leak into the next frame and
@@ -601,8 +644,22 @@ def advance_gait(
             recovery_step_pending[exited_recovery] = False
             recovery_step_active[exited_recovery] = False
 
-        planning_failure_state |= planning_failure
-        mode[planning_failure] = GaitState.PLAN_INVALID
+    planning_failure_state |= planning_failure
+    # A failed preflight is a planning transaction failure, not a physical
+    # contact failure.  Stay in HOLD and let the planner propose again.
+    mode[planning_failure] = GaitState.HOLD
+    elapsed_s[planning_failure] = 0.0
+    hold_elapsed_s[planning_failure] = 0.0
+    recovery_step_pending[planning_failure] = False
+    recovery_step_active[planning_failure] = False
+
+    # The late-contact timer belongs to one locked swing only.  It must never
+    # leak through touchdown, recovery, or a fresh HOLD transaction.
+    late_search_elapsed_s = torch.where(
+        mode == GaitState.OVERDUE,
+        late_search_elapsed_s,
+        torch.zeros_like(late_search_elapsed_s),
+    )
 
     return GaitMachineState(
         mode=mode,

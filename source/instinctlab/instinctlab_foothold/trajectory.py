@@ -10,6 +10,49 @@ class SwingReference:
     acceleration: torch.Tensor
 
 
+def apply_late_touchdown_descent(
+    *,
+    reference: SwingReference,
+    late_search_elapsed_s: torch.Tensor,
+    max_descent_m: float,
+    search_duration_s: float,
+) -> SwingReference:
+    """Lower an overdue swing reference in world Z without changing XY.
+
+    The target and support frame remain locked.  This is not a re-plan: it is
+    only the bounded final contact search after nominal swing time has ended.
+    """
+    if max_descent_m <= 0.0:
+        raise ValueError("max_descent_m must be positive.")
+    if search_duration_s <= 0.0:
+        raise ValueError("search_duration_s must be positive.")
+    if late_search_elapsed_s.shape != reference.position.shape[:-1]:
+        raise ValueError("late_search_elapsed_s must match the reference batch.")
+
+    descent_speed = max_descent_m / search_duration_s
+    descent_m = torch.clamp(
+        late_search_elapsed_s * descent_speed,
+        min=0.0,
+        max=max_descent_m,
+    )
+    moving_down = descent_m < max_descent_m - 1.0e-6
+    position = reference.position.clone()
+    velocity = reference.velocity.clone()
+    acceleration = reference.acceleration.clone()
+    position[:, 2] -= descent_m
+    velocity[:, 2] = torch.where(
+        moving_down,
+        torch.full_like(descent_m, -descent_speed),
+        torch.zeros_like(descent_m),
+    )
+    acceleration[:, 2] = 0.0
+    return SwingReference(
+        position=position,
+        velocity=velocity,
+        acceleration=acceleration,
+    )
+
+
 def quintic_swing_reference(
     start: torch.Tensor,
     goal: torch.Tensor,

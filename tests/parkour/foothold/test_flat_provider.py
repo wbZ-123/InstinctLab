@@ -279,6 +279,43 @@ def test_yaw_intent_is_limited_by_curriculum_level():
     )
 
 
+def test_learned_mode_can_disable_nominal_curriculum_residual_without_changing_command_intent():
+    """The learned policy needs one deterministic analytic prior per HOLD."""
+    cfg = FlatProviderConfig(
+        outer_radius_x=0.50,
+        outer_radius_y=0.40,
+        nominal_step_width=0.18,
+        velocity_lookahead_s=0.20,
+        curriculum_radius_x=(0.04, 0.08, 0.12),
+        curriculum_radius_y=(0.02, 0.04, 0.06),
+    )
+    kwargs = {
+        "stance_xy": torch.zeros((2, 2)),
+        "swing_side": torch.tensor([0, 1]),
+        "desired_velocity": torch.tensor([[0.30, 0.10, 0.0]]).expand(2, -1),
+        "level": torch.tensor([2, 2]),
+        "cfg": cfg,
+        "enable_curriculum_residual": False,
+    }
+
+    first = sample_flat_targets(
+        generator=torch.Generator().manual_seed(3),
+        **kwargs,
+    )
+    second = sample_flat_targets(
+        generator=torch.Generator().manual_seed(4),
+        **kwargs,
+    )
+
+    torch.testing.assert_close(first.curriculum_residual_f, torch.zeros((2, 2)))
+    torch.testing.assert_close(first.curriculum_usage, torch.zeros(2))
+    torch.testing.assert_close(first.position_f, second.position_f)
+    torch.testing.assert_close(
+        first.position_f,
+        torch.tensor([[0.06, 0.20, 0.0], [0.06, -0.16, 0.0]]),
+    )
+
+
 def test_flat_provider_exports_curriculum_residual_radius_and_usage():
     cfg = FlatProviderConfig(
         curriculum_radius_x=(0.04, 0.08, 0.12),

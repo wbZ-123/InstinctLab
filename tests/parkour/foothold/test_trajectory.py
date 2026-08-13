@@ -4,6 +4,42 @@ import torch
 from instinctlab_foothold.trajectory import quintic_swing_reference
 
 
+def test_late_touchdown_search_descends_only_world_z_and_stops_at_tolerance():
+    from instinctlab_foothold.trajectory import apply_late_touchdown_descent
+
+    reference = quintic_swing_reference(
+        start=torch.tensor([[1.0, 2.0, 0.30]]),
+        goal=torch.tensor([[1.40, 2.20, 0.10]]),
+        phase=torch.tensor([1.0]),
+        apex_height=torch.tensor([0.08]),
+        swing_duration_s=0.32,
+    )
+
+    descended = apply_late_touchdown_descent(
+        reference=reference,
+        late_search_elapsed_s=torch.tensor([0.06]),
+        max_descent_m=0.06,
+        search_duration_s=0.12,
+    )
+
+    torch.testing.assert_close(descended.position[:, :2], reference.position[:, :2])
+    torch.testing.assert_close(
+        descended.position[:, 2], reference.position[:, 2] - 0.03
+    )
+    torch.testing.assert_close(descended.velocity[:, 2], torch.tensor([-0.5]))
+
+    capped = apply_late_touchdown_descent(
+        reference=reference,
+        late_search_elapsed_s=torch.tensor([0.24]),
+        max_descent_m=0.06,
+        search_duration_s=0.12,
+    )
+    torch.testing.assert_close(
+        capped.position[:, 2], reference.position[:, 2] - 0.06
+    )
+    torch.testing.assert_close(capped.velocity[:, 2], torch.zeros(1))
+
+
 def test_reference_matches_endpoints_with_zero_derivatives():
     start = torch.tensor(
         [

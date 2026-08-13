@@ -316,6 +316,64 @@ def test_build_foothold_debug_payload_reads_command_and_planner_data():
     assert "td_z_err=0.05" in line
 
 
+def test_build_foothold_debug_payload_reports_recovery_stability_diagnostics():
+    module = _load_play_debug_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([8]),
+        swing_side=torch.tensor([0]),
+        phase=torch.tensor([0.0]),
+        foot_contact=torch.tensor([[True, True]]),
+        confirmed_foot_contact=torch.tensor([[True, True]]),
+        body_tilt_rad=torch.tensor([0.40]),
+        body_angular_speed_rad_s=torch.tensor([0.8]),
+        body_horizontal_speed_m_s=torch.tensor([0.10]),
+        support_slip_m_s=torch.tensor([0.01]),
+        stabilization_active=torch.tensor([True]),
+        stabilization_ready=torch.tensor([False]),
+        event_response=torch.tensor([5]),
+    )
+    gait_state = SimpleNamespace(
+        hold_elapsed_s=torch.tensor([0.0]),
+        hold_required_s=torch.tensor([0.2]),
+        contact_elapsed_s=torch.tensor([[0.2, 0.2]]),
+        no_contact_elapsed_s=torch.tensor([[0.0, 0.0]]),
+        stabilization_elapsed_s=torch.tensor([0.06]),
+    )
+    sensor = SimpleNamespace(
+        data=data,
+        _gait_state=gait_state,
+        _stability_bounds=SimpleNamespace(
+            max_tilt_rad=0.35,
+            max_angular_speed_rad_s=1.5,
+            max_horizontal_speed_m_s=0.35,
+            max_support_slip_m_s=0.05,
+            dwell_s=0.1,
+        ),
+    )
+    env = SimpleNamespace(
+        command_manager=FakeCommandManager(torch.tensor([[0.0, 0.0, 0.0]])),
+        scene=SimpleNamespace(sensors={"foothold_planner": sensor}),
+    )
+
+    payload = module.build_foothold_debug_payload(env)
+    line = module.format_foothold_debug_line(12, payload)
+
+    assert payload["confirmed_foot_contact"] == [True, True]
+    assert payload["body_tilt_rad"] == 0.4
+    assert payload["body_angular_speed_rad_s"] == 0.8
+    assert payload["body_horizontal_speed_m_s"] == 0.1
+    assert payload["support_slip_m_s"] == 0.01
+    assert payload["stabilization_active"] is True
+    assert payload["stabilization_ready"] is False
+    assert payload["stabilization_elapsed_s"] == 0.06
+    assert payload["event_response"] == "STABILIZE"
+    assert payload["stability_current"] is False
+    assert payload["stability_gate"] is False
+    assert payload["stability_fail_reasons"] == ["tilt"]
+    assert "stability_gate=False" in line
+    assert "event_response=STABILIZE" in line
+
+
 def test_is_foothold_debug_plan_event_detects_safe_search_frame():
     module = _load_play_debug_module()
 

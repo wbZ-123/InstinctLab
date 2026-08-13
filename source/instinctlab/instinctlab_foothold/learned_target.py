@@ -11,6 +11,34 @@ from .frame_transform import (
 from .geometry import make_frozen_stance_frame, world_to_frozen
 
 
+def _swing_side_valid(
+    target_y_f: torch.Tensor,
+    swing_side: torch.Tensor | None,
+    min_lateral_separation: float | None,
+) -> torch.Tensor:
+    """Check that a learned target stays on the selected foot's side."""
+
+    if swing_side is None and min_lateral_separation is None:
+        return torch.ones_like(target_y_f, dtype=torch.bool)
+    if swing_side is None or min_lateral_separation is None:
+        raise ValueError(
+            "swing_side and min_lateral_separation must be provided together."
+        )
+    if min_lateral_separation < 0.0:
+        raise ValueError("min_lateral_separation must be non-negative.")
+    if swing_side.shape != target_y_f.shape:
+        raise ValueError("swing_side must match the target batch shape.")
+    side_sign = torch.where(
+        swing_side == 0,
+        torch.ones_like(target_y_f),
+        -torch.ones_like(target_y_f),
+    )
+    valid_side = (swing_side == 0) | (swing_side == 1)
+    return valid_side & (
+        side_sign * target_y_f >= min_lateral_separation - 1.0e-6
+    )
+
+
 @dataclass
 class LearnedFootholdPreparation:
     decoded_f: torch.Tensor
@@ -53,6 +81,8 @@ def reframe_cached_world_foothold(
     radius_x: float,
     radius_y: float,
     max_step_height_m: float,
+    swing_side: torch.Tensor | None = None,
+    min_lateral_separation: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Express a frozen world target in the current support frame and validate it."""
 
@@ -80,6 +110,11 @@ def reframe_cached_world_foothold(
         finite
         & (normalized_radius <= 1.0 + 1.0e-6)
         & (torch.abs(target_f[:, 2]) <= max_step_height_m)
+        & _swing_side_valid(
+            target_f[:, 1],
+            swing_side,
+            min_lateral_separation,
+        )
     )
     return target_f, geometric_valid
 
@@ -90,15 +125,15 @@ def route_nominal_and_learned_footholds(
     nominal_safety_valid: torch.Tensor,
     learned_prepared: torch.Tensor,
     learned_geometric_valid: torch.Tensor,
+    learned_safety_valid: torch.Tensor | None = None,
     recovery_step: torch.Tensor | None = None,
 ) -> LearnedFootholdRoute:
     """Route privileged training targets without invoking candidate search.
 
-    During normal walking, a prepared and geometrically valid learned proposal
-    is executed even when the nominal target is safe.  This closes the PPO
-    control loop while keeping danger-cylinder safety as a soft learning signal.
-    A safe nominal target is only the fallback when the learned proposal is not
-    executable.  Recovery steps remain analytic and nominal-only.
+    During normal walking, a learned proposal must pass both geometry and
+    danger-cylinder safety before it can be executed. A safe nominal target is
+    the fallback when the learned proposal is not executable. Recovery steps
+    remain analytic and nominal-only, but still require the same safety gate.
     """
 
     if not (
@@ -119,15 +154,23 @@ def route_nominal_and_learned_footholds(
         if recovery_mask.shape != nominal_geometric_valid.shape:
             raise ValueError("recovery_step must match the route mask shape.")
 
-    learned_available = learned_prepared.bool() & learned_geometric_valid.bool()
+    if learned_safety_valid is None:
+        learned_safety_valid = torch.ones_like(learned_geometric_valid)
+    if learned_safety_valid.shape != learned_geometric_valid.shape:
+        raise ValueError("learned_safety_valid must match the route masks.")
+    learned_available = (
+        learned_prepared.bool()
+        & learned_geometric_valid.bool()
+        & learned_safety_valid.bool()
+    )
     use_learned = ~recovery_mask & learned_available
 
-    # During normal walking the nominal target is a safe fallback only.  A
-    # recovery step instead uses its analytic target whenever geometry permits,
-    # even when the virtual danger-cylinder score is negative; otherwise the
-    # state machine could reject the very step intended to restore contact.
+    # Both normal walking and legacy analytic recovery require the same safety
+    # gate. A target that reaches SWING must already be safe; a failed
+    # preflight stays in HOLD for a fresh proposal rather than being accepted
+    # here and rejected later by the trajectory checker.
     safe_nominal = nominal_geometric_valid.bool() & nominal_safety_valid.bool()
-    use_nominal = (recovery_mask & nominal_geometric_valid.bool()) | (
+    use_nominal = (recovery_mask & safe_nominal) | (
         ~recovery_mask & ~use_learned & safe_nominal
     )
     return LearnedFootholdRoute(
@@ -182,10 +225,15 @@ def lock_prepared_learned_foothold(
     *,
     data: object,
     env_ids: torch.Tensor,
+    safety_valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Lock geometrically valid prepared targets and return their use mask."""
+    """Lock prepared targets that have passed the execution safety gate."""
 
     use = data.learned_foothold_prepared_valid[env_ids].clone()
+    if safety_valid is not None:
+        if safety_valid.shape != use.shape:
+            raise ValueError("safety_valid must match selected environments.")
+        use &= safety_valid.bool()
     data.learned_foothold_locked[env_ids] = False
     data.learned_foothold_used[env_ids] = False
     if torch.any(use):
@@ -276,6 +324,8 @@ def prepare_learned_foothold_target(
     radius_y: float,
     max_step_height_m: float,
     terrain_height_query_w: TerrainHeightQuery,
+    swing_side: torch.Tensor | None = None,
+    min_lateral_separation: float | None = None,
 ) -> LearnedFootholdPreparation:
     """Decode XY, query world-frame terrain height, and apply hard geometry."""
 
@@ -304,6 +354,10 @@ def prepare_learned_foothold_target(
     )
     geometric_valid = height_valid & (
         torch.abs(target_f[:, 2]) <= max_step_height_m
+    ) & _swing_side_valid(
+        target_f[:, 1],
+        swing_side,
+        min_lateral_separation,
     )
     return LearnedFootholdPreparation(
         decoded_f=decoded_f,
@@ -351,13 +405,15 @@ def learned_foothold_swing_ready(
     learned_evaluated: torch.Tensor,
     learned_prepared_valid: torch.Tensor,
     learned_geometric_valid: torch.Tensor,
+    learned_safety_valid: torch.Tensor,
     recovery_step: torch.Tensor,
 ) -> torch.Tensor:
     """Gate swing start until the normal learned route has been evaluated.
 
     Normal walking gets one control cycle to evaluate the learned proposal.
-    A valid learned proposal is preferred; an evaluated but geometrically
-    invalid proposal may fall back to a safe nominal route.  Recovery uses the
+    A cached learned proposal that has passed the execution gate remains ready
+    for the rest of the HOLD transaction. An unsafe proposal may fall back to a
+    safe nominal route only after it has been evaluated. Recovery uses the
     analytic nominal route immediately and never waits for learned output.
     """
 
@@ -366,6 +422,7 @@ def learned_foothold_swing_ready(
         == learned_evaluated.shape
         == learned_prepared_valid.shape
         == learned_geometric_valid.shape
+        == learned_safety_valid.shape
         == recovery_step.shape
     ):
         raise ValueError("learned foothold swing masks must share one shape.")
@@ -373,14 +430,58 @@ def learned_foothold_swing_ready(
     nominal_ready = nominal_route_ready.bool()
     recovery = recovery_step.bool()
     learned_ready = (
-        learned_evaluated.bool()
-        & learned_prepared_valid.bool()
+        learned_prepared_valid.bool()
         & learned_geometric_valid.bool()
+        & learned_safety_valid.bool()
     )
-    normal_ready = learned_evaluated.bool() & (
-        learned_ready | nominal_ready
+    normal_ready = learned_ready | (
+        learned_evaluated.bool() & nominal_ready
     )
     return torch.where(recovery, nominal_ready, normal_ready)
+
+
+def learned_foothold_transaction_ready(
+    *,
+    nominal_route_ready: torch.Tensor,
+    learned_evaluated: torch.Tensor,
+    learned_prepared_valid: torch.Tensor,
+    learned_geometric_valid: torch.Tensor,
+    learned_safety_valid: torch.Tensor,
+    preflight_retry_required: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return whether one HOLD proposal can be committed without resampling.
+
+    A safe nominal fallback is an executable result of the current learned
+    action, even if that action is unsafe.  The unsafe action remains latched
+    for its PPO penalty; sampling another one in the same HOLD would make the
+    policy's action-to-result relationship non-causal.
+    """
+    masks = (
+        nominal_route_ready,
+        learned_evaluated,
+        learned_prepared_valid,
+        learned_geometric_valid,
+        learned_safety_valid,
+    )
+    if any(mask.shape != nominal_route_ready.shape for mask in masks[1:]):
+        raise ValueError("learned foothold transaction masks must share one shape.")
+    if preflight_retry_required is None:
+        preflight_retry_required = torch.zeros_like(
+            nominal_route_ready,
+            dtype=torch.bool,
+        )
+    elif preflight_retry_required.shape != nominal_route_ready.shape:
+        raise ValueError(
+            "preflight_retry_required must match learned foothold transaction masks."
+        )
+    learned_safe = (
+        learned_prepared_valid.bool()
+        & learned_geometric_valid.bool()
+        & learned_safety_valid.bool()
+    )
+    return ~preflight_retry_required.bool() & (learned_safe | (
+        learned_evaluated.bool() & nominal_route_ready.bool()
+    ))
 
 
 def nominal_foothold_prepare_mask(

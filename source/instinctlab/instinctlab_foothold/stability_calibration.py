@@ -21,7 +21,7 @@ def calibrate_stability_bounds(
     valid: torch.Tensor,
     *,
     quantile: float = 0.99,
-    dwell_s: float = 0.10,
+    dwell_s: float = 0.04,
 ) -> dict[str, float]:
     """Calibrate recovery-exit bounds from successful normal-HOLD samples."""
     if values.ndim != 2 or values.shape[-1] != len(_BOUND_NAMES):

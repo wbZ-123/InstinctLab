@@ -83,6 +83,10 @@ class FootholdPlannerData:
     swing_clearance_start_penetration: torch.Tensor | None = None
     swing_clearance_goal_penetration: torch.Tensor | None = None
     swing_clearance_start_escape_safe: torch.Tensor | None = None
+    # HOLD-time preflight result.  This is the gate used before entering a
+    # new SWING; it is not recomputed from a moving support frame afterwards.
+    swing_preflight_safe: torch.Tensor | None = None
+    swing_preflight_ready: torch.Tensor | None = None
     actual_stance_foot_pos_w: torch.Tensor | None = None
     actual_swing_foot_pos_w: torch.Tensor | None = None
     swing_start_pos_w: torch.Tensor | None = None

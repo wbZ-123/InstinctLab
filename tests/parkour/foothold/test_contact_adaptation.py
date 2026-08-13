@@ -51,6 +51,39 @@ def test_stability_requires_all_bounds_for_full_dwell():
     torch.testing.assert_close(next_elapsed, torch.tensor([0.10, 0.0]))
 
 
+def test_stability_exit_gate_does_not_block_on_support_slip():
+    """Support slip remains observable but is not a recovery exit gate."""
+    bounds = StabilityBounds(
+        max_tilt_rad=0.35,
+        max_angular_speed_rad_s=1.5,
+        max_horizontal_speed_m_s=0.35,
+        max_support_slip_m_s=0.05,
+        dwell_s=0.04,
+    )
+    signals = StabilitySignals(
+        confirmed_contact=torch.tensor([[True, False]]),
+        body_tilt_rad=torch.tensor([0.10]),
+        body_angular_speed_rad_s=torch.tensor([0.20]),
+        body_horizontal_speed_m_s=torch.tensor([0.10]),
+        # Large slip is kept in the signal for diagnostics, but does not
+        # prevent the autonomous recovery policy from returning to HOLD.
+        support_slip_m_s=torch.tensor([0.50]),
+    )
+
+    ready, elapsed = stability_ready(
+        signals,
+        bounds,
+        torch.zeros(1),
+        dt=0.02,
+    )
+    torch.testing.assert_close(ready, torch.tensor([False]))
+    torch.testing.assert_close(elapsed, torch.tensor([0.02]))
+
+    ready, elapsed = stability_ready(signals, bounds, elapsed, dt=0.02)
+    torch.testing.assert_close(ready, torch.tensor([True]))
+    torch.testing.assert_close(elapsed, torch.tensor([0.04]))
+
+
 def test_event_response_keeps_invalid_plan_in_hold_and_searches_late_contact():
     retry = response_for_event(
         event=torch.tensor([ContactEvent.PLAN_INVALID]),
@@ -65,6 +98,17 @@ def test_event_response_keeps_invalid_plan_in_hold_and_searches_late_contact():
 
     assert retry.item() == EventResponse.RETRY_PLAN
     assert search.item() == EventResponse.SEARCH_DOWN
+
+
+def test_confirmed_contact_during_late_search_finishes_the_locked_swing():
+    response = response_for_event(
+        event=torch.tensor([ContactEvent.LATE_CONTACT]),
+        support_stable=torch.tensor([True]),
+        late_search_available=torch.tensor([True]),
+        late_touchdown_confirmed=torch.tensor([True]),
+    )
+
+    assert response.item() == EventResponse.ACCEPT_TOUCHDOWN
 
 
 def test_unstable_contact_event_enters_autonomous_stabilization():

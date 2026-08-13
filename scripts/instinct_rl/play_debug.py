@@ -19,6 +19,15 @@ GAIT_MODE_NAMES = {
     9: "HOLD_CONTACT_LOST",
 }
 
+EVENT_RESPONSE_NAMES = {
+    0: "NONE",
+    1: "ACCEPT_TOUCHDOWN",
+    2: "SEARCH_DOWN",
+    3: "REASSIGN_SUPPORT",
+    4: "RETRY_PLAN",
+    5: "STABILIZE",
+}
+
 STARTUP_DIAGNOSTIC_JOINT_NAMES = [
     "left_ankle_pitch_joint",
     "left_ankle_roll_joint",
@@ -563,6 +572,126 @@ def _is_reference_error_meaningful(gait_mode_int: int | None) -> bool:
     }
 
 
+def _recovery_stability_diagnostics(
+    sensor: Any,
+    data: Any,
+    gait_state: Any,
+    env_id: int,
+) -> dict[str, Any]:
+    """Expose the existing recovery gate inputs without changing behavior."""
+    fields = {
+        "confirmed_foot_contact": _select_env_value(
+            _safe_getattr(data, "confirmed_foot_contact"), env_id
+        ),
+        "body_tilt_rad": _select_env_value(
+            _safe_getattr(data, "body_tilt_rad"), env_id
+        ),
+        "body_angular_speed_rad_s": _select_env_value(
+            _safe_getattr(data, "body_angular_speed_rad_s"), env_id
+        ),
+        "body_horizontal_speed_m_s": _select_env_value(
+            _safe_getattr(data, "body_horizontal_speed_m_s"), env_id
+        ),
+        "support_slip_m_s": _select_env_value(
+            _safe_getattr(data, "support_slip_m_s"), env_id
+        ),
+        "stabilization_active": _select_env_value(
+            _safe_getattr(data, "stabilization_active"), env_id
+        ),
+        "stabilization_ready": _select_env_value(
+            _safe_getattr(data, "stabilization_ready"), env_id
+        ),
+        "stabilization_elapsed_s": _select_env_value(
+            _safe_getattr(gait_state, "stabilization_elapsed_s"), env_id
+        ),
+    }
+    response = _select_env_value(_safe_getattr(data, "event_response"), env_id)
+    fields["event_response"] = EVENT_RESPONSE_NAMES.get(response, response)
+
+    bounds = _safe_getattr(sensor, "_stability_bounds")
+    bound_names = (
+        "max_tilt_rad",
+        "max_angular_speed_rad_s",
+        "max_horizontal_speed_m_s",
+        "max_support_slip_m_s",
+        "dwell_s",
+    )
+    bounds_available = bounds is not None and all(
+        _safe_getattr(bounds, name) is not None for name in bound_names
+    )
+    if bounds_available:
+        fields.update(
+            {
+                "stability_max_tilt_rad": float(bounds.max_tilt_rad),
+                "stability_max_angular_speed_rad_s": float(
+                    bounds.max_angular_speed_rad_s
+                ),
+                "stability_max_horizontal_speed_m_s": float(
+                    bounds.max_horizontal_speed_m_s
+                ),
+                "stability_max_support_slip_m_s": float(
+                    bounds.max_support_slip_m_s
+                ),
+                "stability_dwell_s": float(bounds.dwell_s),
+            }
+        )
+    else:
+        fields.update(
+            {
+                "stability_max_tilt_rad": None,
+                "stability_max_angular_speed_rad_s": None,
+                "stability_max_horizontal_speed_m_s": None,
+                "stability_max_support_slip_m_s": None,
+                "stability_dwell_s": None,
+            }
+        )
+
+    values = (
+        fields["confirmed_foot_contact"],
+        fields["body_tilt_rad"],
+        fields["body_angular_speed_rad_s"],
+        fields["body_horizontal_speed_m_s"],
+        fields["support_slip_m_s"],
+    )
+    if not bounds_available or any(value is None for value in values):
+        fields["stability_current"] = None
+        fields["stability_gate"] = fields["stabilization_ready"]
+        fields["stability_fail_reasons"] = None
+        return fields
+
+    reason_pairs = (
+        (
+            "contact",
+            isinstance(values[0], list)
+            and not any(bool(item) for item in values[0]),
+        ),
+        (
+            "tilt",
+            not math.isfinite(float(values[1]))
+            or float(values[1]) > fields["stability_max_tilt_rad"],
+        ),
+        (
+            "angular_speed",
+            not math.isfinite(float(values[2]))
+            or float(values[2]) > fields["stability_max_angular_speed_rad_s"],
+        ),
+        (
+            "horizontal_speed",
+            not math.isfinite(float(values[3]))
+            or float(values[3]) > fields["stability_max_horizontal_speed_m_s"],
+        ),
+    )
+    immediate_fail_reasons = [
+        name for name, failed in reason_pairs if failed
+    ]
+    fields["stability_current"] = not immediate_fail_reasons
+    fields["stability_fail_reasons"] = immediate_fail_reasons
+    if not immediate_fail_reasons and fields["stabilization_ready"] is False:
+        fields["stability_fail_reasons"] = ["dwell"]
+    fields["stability_gate"] = fields["stabilization_ready"]
+    return fields
+
+
 def build_foothold_debug_payload(
     base_env: Any,
     *,
@@ -574,6 +703,12 @@ def build_foothold_debug_payload(
     sensor = _get_sensor(base_env, sensor_name)
     data = _get_sensor_data(base_env, sensor_name)
     gait_state = _safe_getattr(sensor, "_gait_state")
+    stability = _recovery_stability_diagnostics(
+        sensor,
+        data,
+        gait_state,
+        env_id,
+    )
     gait_mode = _select_env_value(_safe_getattr(data, "gait_mode"), env_id)
     gait_mode_int = int(gait_mode) if isinstance(gait_mode, int) else None
     actual_swing_w = _select_env_value(
@@ -681,6 +816,7 @@ def build_foothold_debug_payload(
         "contact_body_ids": contact_body_ids,
         "contact_body_names": contact_body_names,
         "swing_air_time_s": swing_air_time_s,
+        **stability,
         "foot_contact": _select_env_value(_safe_getattr(data, "foot_contact"), env_id),
         "planner_valid": _select_env_value(_safe_getattr(data, "planner_valid"), env_id),
         "learned_prepared_valid": _select_env_value(
@@ -952,6 +1088,23 @@ def format_foothold_debug_line(
         f"contact_body_ids={payload['contact_body_ids']} "
         f"swing_air_time_s={payload['swing_air_time_s']} "
         f"contact={payload['foot_contact']} "
+        f"confirmed_contact={payload['confirmed_foot_contact']} "
+        f"stability_active={payload['stabilization_active']} "
+        f"stability_ready={payload['stabilization_ready']} "
+        f"stability_elapsed_s={payload['stabilization_elapsed_s']} "
+        f"stability_current={payload['stability_current']} "
+        f"stability_gate={payload['stability_gate']} "
+        f"stability_fail={payload['stability_fail_reasons']} "
+        f"tilt_rad={payload['body_tilt_rad']} "
+        f"angular_speed_rad_s={payload['body_angular_speed_rad_s']} "
+        f"horizontal_speed_m_s={payload['body_horizontal_speed_m_s']} "
+        f"support_slip_m_s={payload['support_slip_m_s']} "
+        f"stability_bounds=({payload['stability_max_tilt_rad']},"
+        f"{payload['stability_max_angular_speed_rad_s']},"
+        f"{payload['stability_max_horizontal_speed_m_s']},"
+        f"{payload['stability_max_support_slip_m_s']},"
+        f"{payload['stability_dwell_s']}) "
+        f"event_response={payload['event_response']} "
         f"planner_valid={payload['planner_valid']} "
         f"learned_prepared={payload['learned_prepared_valid']} "
         f"learned_geom={payload['learned_geometric_valid']} "

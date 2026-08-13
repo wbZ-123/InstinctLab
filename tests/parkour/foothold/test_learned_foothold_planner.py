@@ -11,6 +11,7 @@ from instinctlab_foothold.learned_target import (
     decode_normalized_foothold,
     learned_foothold_event_masks,
     learned_foothold_swing_ready,
+    learned_foothold_transaction_ready,
     nominal_foothold_prepare_mask,
     lock_prepared_learned_foothold,
     prepare_learned_foothold_target,
@@ -38,6 +39,23 @@ def test_reachable_ellipse_usage_reports_lateral_overflow():
         radius_y=0.25,
     )
     assert usage.item() > 1.0
+
+
+def test_safe_nominal_locks_one_unsafe_learned_proposal_for_the_hold_transaction():
+    ready = learned_foothold_transaction_ready(
+        nominal_route_ready=torch.tensor([True, True, False]),
+        learned_evaluated=torch.tensor([True, True, True]),
+        learned_prepared_valid=torch.tensor([True, True, True]),
+        learned_geometric_valid=torch.tensor([True, True, True]),
+        learned_safety_valid=torch.tensor([False, True, False]),
+        preflight_retry_required=torch.tensor([False, True, False]),
+    )
+
+    # First row keeps the unsafe action's PPO penalty but uses the safe
+    # nominal instead of replacing the action again in the same HOLD.
+    # The second row had its *trajectory* rejected, so it must re-propose
+    # even though a safe nominal endpoint exists.
+    assert ready.tolist() == [True, False, False]
 
 
 def _load_foothold_planner_data_class():
@@ -109,6 +127,35 @@ def test_learned_planner_config_is_opt_in_without_duplicate_meter_limits():
     assert "learned_foothold_step_height_limit_m" not in cfg_text
 
 
+def test_learned_planner_enables_the_existing_autonomous_recovery_baseline():
+    cfg_text = _parkour_env_cfg_source_path().read_text()
+    learned_enable = cfg_text.index("    def enable_learned_foothold_planner(self)")
+    recovery_enable = cfg_text.index("    def enable_contact_adaptive_recovery(")
+    learned_block = cfg_text[learned_enable:recovery_enable]
+
+    assert "_FOOTHOLD_RECOVERY_STABILITY_SEED_PATH" in cfg_text
+    assert "if not self.scene.foothold_planner.enable_contact_adaptive_recovery:" in learned_block
+    assert "self.enable_contact_adaptive_recovery(" in learned_block
+
+
+def test_late_touchdown_search_is_limited_to_existing_touchdown_z_tolerance():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+
+    assert "late_search_exhausted = late_elapsed >= self.cfg.overdue_s" in planner_text
+    assert "self.cfg.max_foothold_step_height_m / late_speed" not in planner_text
+
+
+def test_learned_recovery_cannot_create_or_execute_an_analytic_recovery_step():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    learned_block = planner_text[
+        planner_text.index("if self.cfg.enable_learned_foothold:") :
+        planner_text.index("else:\n                flat_result = sample_flat_targets", planner_text.index("if self.cfg.enable_learned_foothold:"))
+    ]
+
+    assert "make_recovery_foothold_target" not in learned_block
+    assert "recovery_step.zero_()" in planner_text
+
+
 def test_environment_enables_nominal_observation_only_with_learned_action():
     cfg_text = _parkour_env_cfg_source_path().read_text()
 
@@ -167,6 +214,53 @@ def test_planner_initializes_and_clears_learned_target_buffers():
     assert "clear_learned_foothold_buffers(self._data, reset_env_ids)" in planner_text
 
 
+def test_preflight_world_target_is_not_recomputed_after_swing_starts():
+    """A HOLD-approved transaction must preserve its exact world target."""
+
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    terrain_block = planner_text[
+        planner_text.index("terrain_query = self._query_target_terrain_height_at_xy_w(") :
+        planner_text.index(
+            "self._data.target_foothold_f[new_swing_env_ids] = target_foothold_f"
+        )
+    ]
+
+    # The cached target already had its world-frame height queried and its
+    # clearance trajectory accepted during HOLD.  A duplicate query after the
+    # state transition could change a locked target if the ray result changes.
+    assert "apply_terrain_mask = ~use_preflight" in terrain_block
+    assert "if torch.any(apply_terrain_mask).item():" in terrain_block
+
+
+def test_preflight_is_run_when_a_hold_proposal_is_available_not_at_timeout():
+    """The proposal and its clearance result must share one PPO event."""
+
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    preflight_block = planner_text[
+        planner_text.index("# Preflight the complete swing transaction") :
+        planner_text.index("if self.cfg.enable_learned_foothold:\n            # A failed HOLD preflight")
+    ]
+
+    assert "preflight_window = (" in preflight_block
+    assert "& hold_contact_ready" in preflight_block
+    assert "hold_elapsed_s" not in preflight_block
+
+
+def test_preflight_is_cached_until_a_new_hold_proposal_replaces_it():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    preflight_block = planner_text[
+        planner_text.index("# Preflight the complete swing transaction") :
+        planner_text.index("if self.cfg.enable_learned_foothold:\n            # A failed HOLD preflight")
+    ]
+
+    assert "& ~self._data.swing_preflight_ready[selected_env_ids]" in preflight_block
+    preparation_block = planner_text[
+        planner_text.index("if torch.any(prepare_learned).item():") :
+        planner_text.index("swing_ready = torch.ones_like")
+    ]
+    assert "self._data.swing_preflight_ready[prepare_env_ids] = False" in preparation_block
+
+
 def test_planner_data_declares_prepared_and_locked_learned_target_buffers():
     data_class = _load_foothold_planner_data_class()
     field_names = {field.name for field in fields(data_class)}
@@ -203,6 +297,8 @@ def test_planner_data_declares_prepared_and_locked_learned_target_buffers():
         "nominal_geometric_valid",
         "nominal_safety_valid",
         "nominal_safety_score",
+        "swing_preflight_safe",
+        "swing_preflight_ready",
     }.issubset(field_names)
 
 
@@ -375,10 +471,24 @@ def test_normal_swing_waits_for_learned_evaluation_before_using_safe_nominal():
         learned_evaluated=torch.tensor([False, True, True]),
         learned_prepared_valid=torch.tensor([False, False, True]),
         learned_geometric_valid=torch.tensor([False, False, True]),
+        learned_safety_valid=torch.tensor([False, False, True]),
         recovery_step=torch.tensor([False, False, False]),
     )
 
     assert ready.tolist() == [False, True, True]
+
+
+def test_safe_learned_proposal_remains_swing_ready_after_event_flag_clears():
+    ready = learned_foothold_swing_ready(
+        nominal_route_ready=torch.tensor([False]),
+        learned_evaluated=torch.tensor([False]),
+        learned_prepared_valid=torch.tensor([True]),
+        learned_geometric_valid=torch.tensor([True]),
+        learned_safety_valid=torch.tensor([True]),
+        recovery_step=torch.tensor([False]),
+    )
+
+    assert ready.tolist() == [True]
 
 
 def test_recovery_swing_does_not_wait_for_or_use_learned_evaluation():
@@ -387,6 +497,7 @@ def test_recovery_swing_does_not_wait_for_or_use_learned_evaluation():
         learned_evaluated=torch.tensor([False, True]),
         learned_prepared_valid=torch.tensor([False, True]),
         learned_geometric_valid=torch.tensor([False, True]),
+        learned_safety_valid=torch.tensor([False, True]),
         recovery_step=torch.tensor([True, True]),
     )
 
@@ -399,15 +510,36 @@ def test_execution_route_executes_geometric_unsafe_learned_but_blocks_recovery()
         nominal_safety_valid=torch.tensor([False, False]),
         learned_prepared=torch.tensor([True, True]),
         learned_geometric_valid=torch.tensor([True, True]),
+        learned_safety_valid=torch.tensor([False, False]),
         recovery_step=torch.tensor([False, True]),
     )
 
-    # Danger-cylinder safety is a soft training signal.  A geometrically
-    # valid learned proposal is executed so PPO observes its consequences;
-    # recovery still keeps the learned route disabled.
+    # Danger-cylinder safety remains a PPO event signal, but an unsafe target
+    # cannot enter a locked swing transaction.
     assert route.use_nominal.tolist() == [False, False]
-    assert route.use_learned.tolist() == [True, False]
-    assert route.executable.tolist() == [True, False]
+    assert route.use_learned.tolist() == [False, False]
+    assert route.executable.tolist() == [False, False]
+
+
+def test_lock_requires_execution_safety_even_when_geometry_is_valid():
+    data = SimpleNamespace(
+        learned_foothold_prepared_valid=torch.tensor([True, True]),
+        learned_foothold_locked=torch.tensor([False, False]),
+        learned_foothold_used=torch.tensor([False, False]),
+        learned_foothold_target_f=torch.zeros(2, 3),
+        learned_foothold_target_w=torch.zeros(2, 3),
+        learned_foothold_prepared_f=torch.ones(2, 3),
+        learned_foothold_prepared_w=torch.ones(2, 3),
+    )
+
+    use = lock_prepared_learned_foothold(
+        data=data,
+        env_ids=torch.tensor([0, 1]),
+        safety_valid=torch.tensor([True, False]),
+    )
+
+    assert use.tolist() == [True, False]
+    assert data.learned_foothold_locked.tolist() == [True, False]
 
 
 def test_recovery_route_uses_geometric_analytic_target_even_if_soft_unsafe():
@@ -416,15 +548,13 @@ def test_recovery_route_uses_geometric_analytic_target_even_if_soft_unsafe():
         nominal_safety_valid=torch.tensor([False]),
         learned_prepared=torch.tensor([True]),
         learned_geometric_valid=torch.tensor([True]),
+        learned_safety_valid=torch.tensor([False]),
         recovery_step=torch.tensor([True]),
     )
 
-    # Recovery must make progress with the analytic target.  The danger
-    # score remains observable, but it cannot send a valid recovery target
-    # back through RECOVERY before the step begins.
-    assert route.use_nominal.tolist() == [True]
+    assert route.use_nominal.tolist() == [False]
     assert route.use_learned.tolist() == [False]
-    assert route.executable.tolist() == [True]
+    assert route.executable.tolist() == [False]
 
 
 def test_prepare_target_queries_world_xy_and_applies_existing_height_limit():
@@ -490,7 +620,43 @@ def test_cached_world_target_is_rejected_after_support_frame_drift_makes_it_unre
     assert geometric_valid.tolist() == [False]
 
 
-def test_soft_unsafe_but_geometrically_valid_target_can_be_locked_for_learning():
+def test_learned_target_rejects_crossed_or_too_narrow_swing_side():
+    def terrain_query(points_xy_w):
+        return torch.zeros(points_xy_w.shape[0]), torch.ones(
+            points_xy_w.shape[0], dtype=torch.bool
+        )
+
+    result = prepare_learned_foothold_target(
+        normalized_action=torch.tensor([[0.2, -0.2], [0.2, 0.2]]),
+        origin_w=torch.zeros(2, 3),
+        yaw_w=torch.zeros(2),
+        radius_x=0.42,
+        radius_y=0.25,
+        max_step_height_m=0.25,
+        terrain_height_query_w=terrain_query,
+        swing_side=torch.tensor([0, 1]),
+        min_lateral_separation=0.06,
+    )
+
+    assert result.geometric_valid.tolist() == [False, False]
+
+
+def test_cached_world_target_rechecks_swing_side_after_frame_reframing():
+    _, geometric_valid = reframe_cached_world_foothold(
+        target_w=torch.tensor([[0.20, -0.08, 0.0]]),
+        current_origin_w=torch.zeros(1, 3),
+        current_yaw_w=torch.zeros(1),
+        radius_x=0.42,
+        radius_y=0.25,
+        max_step_height_m=0.25,
+        swing_side=torch.tensor([0]),
+        min_lateral_separation=0.06,
+    )
+
+    assert geometric_valid.tolist() == [False]
+
+
+def test_soft_unsafe_target_is_recorded_for_learning_but_not_locked():
     data = SimpleNamespace(
         learned_foothold_decoded_f=torch.zeros(2, 3),
         learned_foothold_prepared_f=torch.zeros(2, 3),
@@ -530,23 +696,24 @@ def test_soft_unsafe_but_geometrically_valid_target_can_be_locked_for_learning()
     used = lock_prepared_learned_foothold(
         data=data,
         env_ids=torch.tensor([0, 1]),
+        safety_valid=data.learned_foothold_safety_valid,
     )
 
-    assert used.tolist() == [True, True]
+    assert used.tolist() == [True, False]
     assert data.learned_foothold_prepared_valid.tolist() == [True, True]
-    assert data.learned_foothold_locked.tolist() == [True, True]
-    assert data.learned_foothold_used.tolist() == [True, True]
+    assert data.learned_foothold_locked.tolist() == [True, False]
+    assert data.learned_foothold_used.tolist() == [True, False]
     torch.testing.assert_close(
         data.learned_foothold_target_f[0],
         preparation.target_f[0],
     )
-    # Soft danger safety remains observable for reward and does not silently
-    # become a second hard execution gate.
+    # The unsafe proposal is still kept for its PPO penalty, but it is never
+    # permitted to enter the locked swing transaction.
     torch.testing.assert_close(
         data.learned_foothold_prepared_f[1],
         preparation.target_f[1],
     )
     torch.testing.assert_close(
         data.learned_foothold_target_f[1],
-        preparation.target_f[1],
+        torch.zeros_like(data.learned_foothold_target_f[1]),
     )
