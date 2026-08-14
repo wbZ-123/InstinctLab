@@ -193,7 +193,7 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
             },
         ),
         "pyramid_stairs_inv": terrain_gen.PerlinInvertedPyramidStairsTerrainCfg(
-            proportion=0.15,
+            proportion=0.35,
             step_height_range=(0.05, 0.23),
             step_width=0.3,
             platform_width=2.5,
@@ -246,49 +246,49 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
                 ),
             },
         ),
-        "boxes": terrain_gen.PerlinDiscreteObstaclesTerrainCfg(
-            proportion=0.10,
-            num_obstacles=20,
-            obstacle_height_mode="fixed",
-            obstacle_width_range=(0.8, 1.5),
-            obstacle_height_range=(0.05, 0.45),
-            platform_width=1.5,
-            border_width=0.0,
-            wall_prob=[0.3, 0.3, 0.3, 0.3],
-            wall_height=5.0,
-            wall_thickness=0.05,
-            perlin_cfg=terrain_gen.PerlinPlaneTerrainCfg(
-                noise_scale=0.05,
-                noise_frequency=20,
-                fractal_octaves=2,
-                fractal_lacunarity=2.0,
-                fractal_gain=0.25,
-                centering=True,
-            ),
-            flat_patch_sampling={
-                "target": FlatPatchSamplingCfg(
-                    num_patches=50, patch_radius=[0.05, 0.10, 0.15, 0.20], max_height_diff=0.05
-                ),
-            },
-        ),
-        "mesh_boxes": terrain_gen.PerlinMeshRandomMultiBoxTerrainCfg(
-            proportion=0.10,
-            box_height_mean=[0.1, 0.4],
-            box_height_range=0.05,
-            box_length_mean=0.4,
-            box_length_range=0.1,
-            box_width_mean=0.4,
-            box_width_range=0.1,
-            platform_width=1.5,
-            generation_ratio=0.3,
-            no_perlin_at_obstacle=True,
-            wall_prob=[0.3, 0.3, 0.3, 0.3],
-            wall_height=5.0,
-            wall_thickness=0.05,
-            flat_patch_sampling={
-                "target": FlatPatchSamplingCfg(num_patches=50, patch_radius=[0.05, 0.10, 0.15], max_height_diff=0.05),
-            },
-        ),
+        # "boxes": terrain_gen.PerlinDiscreteObstaclesTerrainCfg(
+        #     proportion=0.10,
+        #     num_obstacles=20,
+        #     obstacle_height_mode="fixed",
+        #     obstacle_width_range=(0.8, 1.5),
+        #     obstacle_height_range=(0.05, 0.45),
+        #     platform_width=1.5,
+        #     border_width=0.0,
+        #     wall_prob=[0.3, 0.3, 0.3, 0.3],
+        #     wall_height=5.0,
+        #     wall_thickness=0.05,
+        #     perlin_cfg=terrain_gen.PerlinPlaneTerrainCfg(
+        #         noise_scale=0.05,
+        #         noise_frequency=20,
+        #         fractal_octaves=2,
+        #         fractal_lacunarity=2.0,
+        #         fractal_gain=0.25,
+        #         centering=True,
+        #     ),
+        #     flat_patch_sampling={
+        #         "target": FlatPatchSamplingCfg(
+        #             num_patches=50, patch_radius=[0.05, 0.10, 0.15, 0.20], max_height_diff=0.05
+        #         ),
+        #     },
+        # ),
+        # "mesh_boxes": terrain_gen.PerlinMeshRandomMultiBoxTerrainCfg(
+        #     proportion=0.10,
+        #     box_height_mean=[0.1, 0.4],
+        #     box_height_range=0.05,
+        #     box_length_mean=0.4,
+        #     box_length_range=0.1,
+        #     box_width_mean=0.4,
+        #     box_width_range=0.1,
+        #     platform_width=1.5,
+        #     generation_ratio=0.3,
+        #     no_perlin_at_obstacle=True,
+        #     wall_prob=[0.3, 0.3, 0.3, 0.3],
+        #     wall_height=5.0,
+        #     wall_thickness=0.05,
+        #     flat_patch_sampling={
+        #         "target": FlatPatchSamplingCfg(num_patches=50, patch_radius=[0.05, 0.10, 0.15], max_height_diff=0.05),
+        #     },
+        # ),
         "hf_pyramid_slope_inv": terrain_gen.PerlinInvertedPyramidSlopedTerrainCfg(
             proportion=0.10,
             slope_range=(0.0, 0.7),
@@ -718,8 +718,8 @@ class CommandsCfg:
                 "lin_vel_y": (0.0, 0.0),
                 "ang_vel_z": (-1.0, 1.0),
             },
-            "boxes": {"lin_vel_x": (0.45, 0.8), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
-            "mesh_boxes": {"lin_vel_x": (0.45, 0.8), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
+            # "boxes": {"lin_vel_x": (0.45, 0.8), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
+            # "mesh_boxes": {"lin_vel_x": (0.45, 0.8), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
             "hf_pyramid_slope_inv": {"lin_vel_x": (0.45, 0.8), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
         },
         only_positive_lin_vel_x=True,
@@ -762,13 +762,13 @@ class G1Rewards:
     )
     dont_wait = RewTerm(
         func=instinct_mdp.dont_wait_recovery_masked,
-        weight=-0.5,
+        weight=-2.0,
         params={
             "command_name": "base_velocity",
             "sensor_name": "foothold_planner",
         },
     )
-    is_alive = RewTerm(func=mdp.is_alive, weight=0.1)
+    is_alive = RewTerm(func=mdp.is_alive, weight=0.03)
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-50.0)
     stand_still = RewTerm(
         func=instinct_mdp.stand_still_recovery_masked,

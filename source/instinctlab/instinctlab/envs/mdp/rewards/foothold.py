@@ -351,7 +351,7 @@ def learned_foothold_planning_event_reward(
         torch.where(
             execution_safe,
             learned_safety,
-            torch.full_like(learned_safety, -1.0),
+            torch.full_like(learned_safety, -2.0),
         ),
     )
     return _mask_stabilization_reward(
