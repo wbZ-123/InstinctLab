@@ -79,3 +79,30 @@ def test_sole_corners_form_expected_rectangle():
         ]
     )
     torch.testing.assert_close(corners_w, expected_w)
+
+
+def test_sole_center_velocity_includes_angular_velocity_about_ankle_offset():
+    geometry = SoleGeometry(
+        center_offset_b=torch.tensor([0.0, 0.0, -0.1]),
+        half_length=0.12,
+        half_width=0.055,
+    )
+    ankle_pos_w = torch.zeros((1, 3))
+    ankle_quat_w = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    ankle_linear_vel_w = torch.tensor([[1.0, 0.0, 0.0]])
+    ankle_angular_vel_w = torch.tensor([[0.0, 1.0, 0.0]])
+
+    sole_velocity_w = geometry.center_velocity_world(
+        ankle_linear_vel_w,
+        ankle_angular_vel_w,
+        ankle_quat_w,
+    )
+
+    # v_center = v_ankle + omega x R(offset), so the y-axis rotation
+    # contributes -0.1 m/s in x for the -0.1 m offset.
+    torch.testing.assert_close(
+        sole_velocity_w,
+        torch.tensor([[0.9, 0.0, 0.0]]),
+        atol=1.0e-6,
+        rtol=0.0,
+    )

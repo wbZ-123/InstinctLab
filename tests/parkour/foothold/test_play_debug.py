@@ -329,7 +329,7 @@ def test_build_foothold_debug_payload_reports_recovery_stability_diagnostics():
         body_horizontal_speed_m_s=torch.tensor([0.10]),
         support_slip_m_s=torch.tensor([0.01]),
         stabilization_active=torch.tensor([True]),
-        stabilization_ready=torch.tensor([False]),
+        stabilization_ready=torch.tensor([True]),
         event_response=torch.tensor([5]),
     )
     gait_state = SimpleNamespace(
@@ -364,14 +364,60 @@ def test_build_foothold_debug_payload_reports_recovery_stability_diagnostics():
     assert payload["body_horizontal_speed_m_s"] == 0.1
     assert payload["support_slip_m_s"] == 0.01
     assert payload["stabilization_active"] is True
-    assert payload["stabilization_ready"] is False
+    assert payload["stabilization_ready"] is True
     assert payload["stabilization_elapsed_s"] == 0.06
     assert payload["event_response"] == "STABILIZE"
+    assert payload["stability_current"] is True
+    assert payload["stability_gate"] is True
+    assert payload["stability_fail_reasons"] == []
+    assert "stability_gate=True" in line
+    assert "event_response=STABILIZE" in line
+
+
+def test_build_foothold_debug_payload_reports_missing_second_contact_as_gate():
+    module = _load_play_debug_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([8]),
+        swing_side=torch.tensor([0]),
+        phase=torch.tensor([0.0]),
+        foot_contact=torch.tensor([[True, False]]),
+        confirmed_foot_contact=torch.tensor([[True, False]]),
+        body_tilt_rad=torch.tensor([0.10]),
+        body_angular_speed_rad_s=torch.tensor([0.2]),
+        body_horizontal_speed_m_s=torch.tensor([0.10]),
+        support_slip_m_s=torch.tensor([0.01]),
+        stabilization_active=torch.tensor([True]),
+        stabilization_ready=torch.tensor([False]),
+        event_response=torch.tensor([5]),
+    )
+    gait_state = SimpleNamespace(
+        hold_elapsed_s=torch.tensor([0.0]),
+        hold_required_s=torch.tensor([0.2]),
+        contact_elapsed_s=torch.tensor([[0.2, 0.0]]),
+        no_contact_elapsed_s=torch.tensor([[0.0, 0.2]]),
+        stabilization_elapsed_s=torch.tensor([0.0]),
+    )
+    sensor = SimpleNamespace(
+        data=data,
+        _gait_state=gait_state,
+        _stability_bounds=SimpleNamespace(
+            max_tilt_rad=0.35,
+            max_angular_speed_rad_s=1.5,
+            max_horizontal_speed_m_s=0.35,
+            max_support_slip_m_s=0.05,
+            dwell_s=0.1,
+        ),
+    )
+    env = SimpleNamespace(
+        command_manager=FakeCommandManager(torch.tensor([[0.0, 0.0, 0.0]])),
+        scene=SimpleNamespace(sensors={"foothold_planner": sensor}),
+    )
+
+    payload = module.build_foothold_debug_payload(env)
+
     assert payload["stability_current"] is False
     assert payload["stability_gate"] is False
-    assert payload["stability_fail_reasons"] == ["tilt"]
-    assert "stability_gate=False" in line
-    assert "event_response=STABILIZE" in line
+    assert payload["stability_fail_reasons"] == ["contact"]
 
 
 def test_is_foothold_debug_plan_event_detects_safe_search_frame():
@@ -651,6 +697,94 @@ def test_format_foothold_debug_line_can_mark_zero_action_warmup():
     )
 
     assert "zero_act_active=True" in line
+
+
+def test_is_learned_foothold_debug_event_selects_only_evaluation_or_route():
+    module = _load_play_debug_module()
+
+    assert (
+        module.is_learned_foothold_debug_event(
+            {"learned_evaluated": True, "route_event": False}
+        )
+        is True
+    )
+    assert (
+        module.is_learned_foothold_debug_event(
+            {"learned_evaluated": False, "route_event": True}
+        )
+        is True
+    )
+    assert (
+        module.is_learned_foothold_debug_event(
+            {"learned_evaluated": False, "route_event": False}
+        )
+        is False
+    )
+
+
+def test_learned_foothold_debug_reports_nominal_deviation_without_side_gate():
+    module = _load_play_debug_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([0]),
+        swing_side=torch.tensor([0]),
+        phase=torch.tensor([0.0]),
+        foot_contact=torch.tensor([[True, True]]),
+        learned_foothold_action_normalized=torch.tensor([[0.4, -0.2]]),
+        learned_foothold_decoded_f=torch.tensor([[0.168, -0.05, 0.0]]),
+        raw_unclipped_foothold_f=torch.tensor([[0.168, 0.05, 0.0]]),
+        learned_foothold_prepared_f=torch.tensor([[0.168, -0.05, 0.10]]),
+        learned_foothold_prepared_w=torch.tensor([[1.168, 1.95, 0.40]]),
+        learned_foothold_height_valid=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([False]),
+        learned_foothold_prepared_valid=torch.tensor([False]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_event_generation=torch.tensor([7]),
+        learned_foothold_penetrating_point_count=torch.tensor([2.0]),
+        learned_foothold_penetrating_point_ratio=torch.tensor([0.07692]),
+        learned_foothold_total_penetration_depth=torch.tensor([0.012]),
+        learned_foothold_safety_score=torch.tensor([-0.2]),
+        learned_foothold_route_event=torch.tensor([False]),
+        learned_foothold_route_use_nominal=torch.tensor([False]),
+        learned_foothold_route_use_learned=torch.tensor([False]),
+        learned_foothold_route_initial_executable=torch.tensor([False]),
+        learned_foothold_route_outcome=torch.tensor([3]),
+    )
+    sensor = SimpleNamespace(
+        data=data,
+        cfg=SimpleNamespace(max_foothold_step_height_m=0.25),
+        _flat_provider_cfg=SimpleNamespace(
+            outer_radius_x=0.42,
+            outer_radius_y=0.25,
+        ),
+    )
+    env = SimpleNamespace(
+        command_manager=FakeCommandManager(torch.tensor([[0.5, 0.0, 0.0]])),
+        scene=SimpleNamespace(sensors={"foothold_planner": sensor}),
+    )
+
+    payload = module.build_foothold_debug_payload(env)
+    line = module.format_learned_foothold_debug_line(12, payload)
+
+    assert payload["learned_action_normalized"] == [0.4, -0.2]
+    assert payload["learned_decoded_f"] == [0.168, -0.05, 0.0]
+    assert payload["learned_prepared_f"] == [0.168, -0.05, 0.1]
+    assert payload["learned_prepared_w"] == [1.168, 1.95, 0.4]
+    assert payload["learned_relative_height_m"] == 0.1
+    assert payload["learned_step_height_valid"] is True
+    assert payload["learned_max_step_height_m"] == 0.25
+    assert payload["nominal_delta_f"] == [0.0, -0.1]
+    assert payload["nominal_deviation_cost"] == 0.2
+    assert payload["reward_branch"] == "geometry_invalid"
+    assert payload["learned_event_generation"] == 7
+    assert "[LEARNED_FOOTHOLD_DEBUG]" in line
+    assert "step_height_valid=True" in line
+    assert "nominal_deviation_cost=0.2" in line
+    assert "reward_branch=geometry_invalid" in line
+    assert "route_learned=False" in line
+    assert payload["route_outcome"] == 3
+    assert payload["route_outcome_name"] == "geometric_invalid"
+    assert "route_outcome=geometric_invalid" in line
 
 
 def test_build_foothold_debug_payload_hides_reference_and_touchdown_error_in_hold():

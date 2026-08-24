@@ -7,6 +7,30 @@ def _foothold_planner_data(env, sensor_name: str):
     return env.scene.sensors[sensor_name].data
 
 
+def _world_vector_to_planner_frame(
+    vector_w: torch.Tensor,
+    frame_yaw_w: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate a world vector into the frozen planner/support frame.
+
+    The planner publishes ``*_f`` quantities in the support-foot frame whose
+    yaw is captured when the HOLD transaction is prepared.  Position errors
+    are translations, so only the yaw rotation is applied; the vertical
+    component is intentionally preserved instead of being mixed by roll or
+    pitch.
+    """
+    cos_yaw = torch.cos(frame_yaw_w)
+    sin_yaw = torch.sin(frame_yaw_w)
+    vector_f = vector_w.clone()
+    vector_f[..., 0] = (
+        cos_yaw * vector_w[..., 0] + sin_yaw * vector_w[..., 1]
+    )
+    vector_f[..., 1] = (
+        -sin_yaw * vector_w[..., 0] + cos_yaw * vector_w[..., 1]
+    )
+    return vector_f
+
+
 def _sync_desired_velocity_command(
     env,
     sensor_name: str,
@@ -52,6 +76,20 @@ def foothold_planner_observation(
     swing_clearance_penetration = data.swing_clearance_penetration.unsqueeze(-1)
     reference_error_w = data.swing_reference_pos_w - data.actual_swing_foot_pos_w
     target_error_w = data.target_foothold_w - data.actual_swing_foot_pos_w
+    planner_frame_yaw_w = getattr(data, "nominal_frame_yaw_w", None)
+    if planner_frame_yaw_w is None:
+        raise RuntimeError(
+            "Foothold planner observations require nominal_frame_yaw_w "
+            "to express world position errors in the frozen planner frame."
+        )
+    reference_error_f = _world_vector_to_planner_frame(
+        reference_error_w,
+        planner_frame_yaw_w,
+    )
+    target_error_f = _world_vector_to_planner_frame(
+        target_error_w,
+        planner_frame_yaw_w,
+    )
     stabilization_column = stabilization_active.to(dtype=data.phase.dtype).unsqueeze(-1)
     target_foothold_f = torch.where(
         stabilization_column.bool(),
@@ -63,15 +101,15 @@ def foothold_planner_observation(
         torch.zeros_like(data.feasible_velocity_f),
         data.feasible_velocity_f,
     )
-    reference_error_w = torch.where(
+    reference_error_f = torch.where(
         stabilization_column.bool(),
-        torch.zeros_like(reference_error_w),
-        reference_error_w,
+        torch.zeros_like(reference_error_f),
+        reference_error_f,
     )
-    target_error_w = torch.where(
+    target_error_f = torch.where(
         stabilization_column.bool(),
-        torch.zeros_like(target_error_w),
-        target_error_w,
+        torch.zeros_like(target_error_f),
+        target_error_f,
     )
 
     env_ids = torch.arange(
@@ -95,8 +133,8 @@ def foothold_planner_observation(
             swing_apex_delta,
             swing_clearance_safe,
             swing_clearance_penetration,
-            reference_error_w,
-            target_error_w,
+            reference_error_f,
+            target_error_f,
             swing_foot_contact,
             swing_has_lifted,
             stabilization_column,

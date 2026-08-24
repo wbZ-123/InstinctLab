@@ -151,6 +151,12 @@ def _make_data(num_envs=2):
         learned_foothold_safety_score=torch.zeros(num_envs),
         learned_foothold_penetrating_point_ratio=torch.zeros(num_envs),
         learned_foothold_total_penetration_depth=torch.zeros(num_envs),
+        learned_foothold_decoded_f=torch.zeros(num_envs, 3),
+        raw_unclipped_foothold_f=torch.zeros(num_envs, 3),
+        nominal_geometric_valid=torch.ones(
+            num_envs, dtype=torch.bool
+        ),
+        nominal_safety_valid=torch.ones(num_envs, dtype=torch.bool),
         learned_foothold_route_event=torch.zeros(
             num_envs, dtype=torch.bool
         ),
@@ -162,6 +168,9 @@ def _make_data(num_envs=2):
         ),
         learned_foothold_route_initial_executable=torch.zeros(
             num_envs, dtype=torch.bool
+        ),
+        learned_foothold_route_outcome=torch.zeros(
+            num_envs, dtype=torch.long
         ),
         learned_foothold_used=torch.zeros(num_envs, dtype=torch.bool),
         recovery_step_active=torch.zeros(num_envs, dtype=torch.bool),
@@ -396,6 +405,7 @@ def test_learned_foothold_metrics_separate_evaluations_from_route_events():
     data.learned_foothold_route_initial_executable[:] = torch.tensor(
         [True, False]
     )
+    data.learned_foothold_route_outcome[:] = torch.tensor([0, 3])
     data.learned_foothold_used[:] = torch.tensor([True, False])
     data.learned_foothold_safety_valid[:] = torch.tensor([True, False])
     data.planner_valid[:] = torch.tensor([True, False])
@@ -406,11 +416,20 @@ def test_learned_foothold_metrics_separate_evaluations_from_route_events():
         log["learned_foothold_evaluation_rate"], torch.tensor(0.5)
     )
     torch.testing.assert_close(
+        log["learned_foothold_evaluation_count"], torch.tensor(2.0)
+    )
+    torch.testing.assert_close(
         log["learned_foothold_geometric_valid_fraction"],
         torch.tensor(0.5),
     )
     torch.testing.assert_close(
+        log["learned_foothold_geometric_valid_count"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
         log["learned_foothold_safety_valid_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_safety_valid_count"], torch.tensor(1.0)
     )
     torch.testing.assert_close(
         log["learned_foothold_safety_score_mean"], torch.tensor(0.1)
@@ -427,6 +446,9 @@ def test_learned_foothold_metrics_separate_evaluations_from_route_events():
         log["learned_foothold_route_rate"], torch.tensor(0.5)
     )
     torch.testing.assert_close(
+        log["learned_foothold_route_count"], torch.tensor(2.0)
+    )
+    torch.testing.assert_close(
         log["learned_foothold_route_nominal_fraction"], torch.tensor(0.0)
     )
     torch.testing.assert_close(
@@ -440,7 +462,66 @@ def test_learned_foothold_metrics_separate_evaluations_from_route_events():
         torch.tensor(0.0),
     )
     torch.testing.assert_close(
+        log["learned_foothold_route_success_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_success_count"], torch.tensor(1.0)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_geometric_invalid_fraction"],
+        torch.tensor(0.5),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_route_geometric_invalid_count"],
+        torch.tensor(1.0),
+    )
+    for name in (
+        "learned_foothold_route_recovery_fraction",
+        "learned_foothold_route_transaction_invalidated_fraction",
+        "learned_foothold_route_endpoint_unsafe_fraction",
+        "learned_foothold_route_preflight_unsafe_fraction",
+    ):
+        torch.testing.assert_close(log[name], torch.tensor(0.0))
+    torch.testing.assert_close(
         log["learned_foothold_routed_safe_fraction"], torch.tensor(1.0)
+    )
+
+
+def test_monitor_splits_nominal_safety_branches_and_correction_success():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=2)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.learned_foothold_evaluated[:] = True
+    data.nominal_geometric_valid[:] = torch.tensor([True, True])
+    data.nominal_safety_valid[:] = torch.tensor([True, False])
+    data.learned_foothold_geometric_valid[:] = torch.tensor([True, True])
+    data.learned_foothold_safety_valid[:] = torch.tensor([True, True])
+    data.learned_foothold_safety_score[:] = torch.tensor([0.8, -0.6])
+    data.raw_unclipped_foothold_f[:] = 0.0
+    data.learned_foothold_decoded_f[:] = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.12, 0.0, 0.0]]
+    )
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    torch.testing.assert_close(
+        log["learned_foothold_nominal_safe_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_nominal_unsafe_fraction"], torch.tensor(0.5)
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_nominal_unsafe_correction_success_fraction"],
+        torch.tensor(1.0),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_nominal_unsafe_safety_score_mean"],
+        torch.tensor(-0.6),
+    )
+    torch.testing.assert_close(
+        log["learned_foothold_nominal_unsafe_correction_distance_mean"],
+        torch.tensor(0.12),
     )
 
 
@@ -452,6 +533,7 @@ def test_learned_route_postcheck_failure_does_not_change_route_choice():
     data.learned_foothold_route_event[:] = True
     data.learned_foothold_route_use_nominal[:] = True
     data.learned_foothold_route_initial_executable[:] = True
+    data.learned_foothold_route_outcome[:] = 0
     # A later terrain/trajectory check invalidated an initially selected
     # nominal route.
     data.planner_valid[:] = False
@@ -468,6 +550,37 @@ def test_learned_route_postcheck_failure_does_not_change_route_choice():
         log["learned_foothold_route_postcheck_invalid_fraction"],
         torch.tensor(1.0),
     )
+
+
+def test_learned_route_funnel_reports_each_mutually_exclusive_reason():
+    module = _load_monitor_module()
+    data = _make_data(num_envs=6)
+    monitor = module.FootholdPlannerMonitorTerm(_make_cfg(), _make_env(data))
+
+    data.learned_foothold_route_event[:] = True
+    data.learned_foothold_route_outcome[:] = torch.arange(6)
+    data.learned_foothold_route_use_learned[:] = torch.tensor(
+        [True, False, False, False, False, False]
+    )
+    data.learned_foothold_route_initial_executable[:] = torch.tensor(
+        [True, True, False, True, True, True]
+    )
+    data.planner_valid[:] = True
+    monitor.update(dt=0.02)
+
+    log = monitor.get_log()
+    for name in (
+        "success",
+        "recovery",
+        "transaction_invalidated",
+        "geometric_invalid",
+        "endpoint_unsafe",
+        "preflight_unsafe",
+    ):
+        torch.testing.assert_close(
+            log[f"learned_foothold_route_{name}_fraction"],
+            torch.tensor(1.0 / 6.0),
+        )
 
 
 def test_safe_target_event_ratios_use_total_search_events_not_env_average():

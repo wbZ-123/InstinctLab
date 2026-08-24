@@ -28,6 +28,16 @@ EVENT_RESPONSE_NAMES = {
     5: "STABILIZE",
 }
 
+LEARNED_FOOTHOLD_ROUTE_OUTCOME_NAMES = {
+    0: "success",
+    1: "recovery",
+    2: "transaction_invalidated",
+    3: "geometric_invalid",
+    4: "endpoint_unsafe",
+    5: "preflight_unsafe",
+    6: "postcheck_invalid",
+}
+
 STARTUP_DIAGNOSTIC_JOINT_NAMES = [
     "left_ankle_pitch_joint",
     "left_ankle_roll_joint",
@@ -139,6 +149,180 @@ def _get_sensor(base_env: Any, sensor_name: str) -> Any | None:
 
 def _get_sensor_data(base_env: Any, sensor_name: str) -> Any | None:
     return _safe_getattr(_get_sensor(base_env, sensor_name), "data")
+
+
+def _learned_foothold_diagnostics(
+    sensor: Any,
+    data: Any,
+    env_id: int,
+) -> dict[str, Any]:
+    """Expose learned-target geometry components without changing planning."""
+
+    planner_cfg = _safe_getattr(sensor, "cfg")
+    max_step_height_m = _safe_getattr(
+        planner_cfg,
+        "max_foothold_step_height_m",
+    )
+    flat_provider_cfg = _safe_getattr(sensor, "_flat_provider_cfg")
+    radius_x = _safe_getattr(flat_provider_cfg, "outer_radius_x")
+    radius_y = _safe_getattr(flat_provider_cfg, "outer_radius_y")
+    prepared_f = _select_env_value(
+        _safe_getattr(data, "learned_foothold_prepared_f"),
+        env_id,
+    )
+    decoded_f = _select_env_value(
+        _safe_getattr(data, "learned_foothold_decoded_f"),
+        env_id,
+    )
+    raw_nominal_f = _select_env_value(
+        _safe_getattr(data, "raw_unclipped_foothold_f"),
+        env_id,
+    )
+
+    relative_height_m = None
+    step_height_valid = None
+    nominal_delta_f = None
+    nominal_deviation_usage = None
+    nominal_deviation_cost = None
+    if isinstance(prepared_f, list) and len(prepared_f) >= 3:
+        relative_height_m = prepared_f[2]
+        if isinstance(max_step_height_m, (int, float)):
+            step_height_valid = (
+                math.isfinite(float(relative_height_m))
+                and abs(float(relative_height_m))
+                <= float(max_step_height_m) + 1.0e-6
+            )
+    if (
+        isinstance(decoded_f, list)
+        and len(decoded_f) >= 2
+        and isinstance(raw_nominal_f, list)
+        and len(raw_nominal_f) >= 2
+        and isinstance(radius_x, (int, float))
+        and isinstance(radius_y, (int, float))
+        and float(radius_x) > 0.0
+        and float(radius_y) > 0.0
+    ):
+        nominal_delta_f = [
+            float(decoded_f[0]) - float(raw_nominal_f[0]),
+            float(decoded_f[1]) - float(raw_nominal_f[1]),
+        ]
+        if all(math.isfinite(value) for value in nominal_delta_f):
+            nominal_deviation_usage = math.sqrt(
+                (nominal_delta_f[0] / float(radius_x)) ** 2
+                + (nominal_delta_f[1] / float(radius_y)) ** 2
+            )
+            nominal_deviation_cost = min(
+                1.0,
+                nominal_deviation_usage / 2.0,
+            )
+
+    learned_evaluated = bool(
+        _select_env_value(
+            _safe_getattr(data, "learned_foothold_evaluated"),
+            env_id,
+        )
+    )
+    learned_geometry_valid = bool(
+        _select_env_value(
+            _safe_getattr(data, "learned_foothold_geometric_valid"),
+            env_id,
+        )
+    )
+    learned_safety_valid = bool(
+        _select_env_value(
+            _safe_getattr(data, "learned_foothold_safety_valid"),
+            env_id,
+        )
+    )
+    preflight_ready = bool(
+        _select_env_value(
+            _safe_getattr(data, "swing_preflight_ready"),
+            env_id,
+        )
+    )
+    preflight_safe = bool(
+        _select_env_value(
+            _safe_getattr(data, "swing_preflight_safe"),
+            env_id,
+        )
+    )
+    nominal_safe = bool(
+        _select_env_value(
+            _safe_getattr(data, "nominal_geometric_valid"),
+            env_id,
+        )
+    ) and bool(
+        _select_env_value(
+            _safe_getattr(data, "nominal_safety_valid"),
+            env_id,
+        )
+    )
+    if not learned_evaluated:
+        reward_branch = "none"
+    elif preflight_ready and not preflight_safe:
+        reward_branch = "preflight_invalid"
+    elif not learned_geometry_valid:
+        reward_branch = "geometry_invalid"
+    elif not learned_safety_valid:
+        reward_branch = "obstacle_penalty"
+    elif nominal_safe:
+        reward_branch = "nominal_deviation"
+    else:
+        reward_branch = "command_consistency_minus_deviation"
+
+    route_outcome = _select_env_value(
+        _safe_getattr(data, "learned_foothold_route_outcome"),
+        env_id,
+    )
+    route_outcome_name = None
+    if isinstance(route_outcome, int):
+        route_outcome_name = LEARNED_FOOTHOLD_ROUTE_OUTCOME_NAMES.get(
+            route_outcome,
+            "unknown",
+        )
+
+    return {
+        "learned_action_normalized": _select_env_value(
+            _safe_getattr(data, "learned_foothold_action_normalized"),
+            env_id,
+        ),
+        "learned_decoded_f": decoded_f,
+        "learned_prepared_f": prepared_f,
+        "learned_prepared_w": _select_env_value(
+            _safe_getattr(data, "learned_foothold_prepared_w"),
+            env_id,
+        ),
+        "learned_relative_height_m": relative_height_m,
+        "learned_step_height_valid": step_height_valid,
+        "learned_max_step_height_m": max_step_height_m,
+        "nominal_f": raw_nominal_f,
+        "nominal_delta_f": nominal_delta_f,
+        "nominal_deviation_usage": nominal_deviation_usage,
+        "nominal_deviation_cost": nominal_deviation_cost,
+        "reward_branch": reward_branch,
+        "learned_event_generation": _select_env_value(
+            _safe_getattr(data, "learned_foothold_event_generation"),
+            env_id,
+        ),
+        "learned_safety_score": _select_env_value(
+            _safe_getattr(data, "learned_foothold_safety_score"),
+            env_id,
+        ),
+        "learned_penetrating_point_count": _select_env_value(
+            _safe_getattr(data, "learned_foothold_penetrating_point_count"),
+            env_id,
+        ),
+        "learned_penetrating_point_ratio": _select_env_value(
+            _safe_getattr(data, "learned_foothold_penetrating_point_ratio"),
+            env_id,
+        ),
+        "learned_total_penetration_depth": _select_env_value(
+            _safe_getattr(data, "learned_foothold_total_penetration_depth"),
+            env_id,
+        ),
+        "route_outcome": route_outcome,
+        "route_outcome_name": route_outcome_name,
+    }
 
 
 def _get_command(base_env: Any, command_name: str, env_id: int) -> Any | None:
@@ -444,6 +628,25 @@ def _point_errors(
     return round(math.sqrt(dx * dx + dy * dy), 5), round(dz, 5)
 
 
+def _vector_error_norm(
+    actual: Any | None,
+    reference: Any | None,
+) -> float | None:
+    """Return a compact Euclidean error for a 3-D diagnostic vector."""
+    if actual is None or reference is None:
+        return None
+    if len(actual) < 3 or len(reference) < 3:
+        return None
+    return round(
+        math.sqrt(
+            (actual[0] - reference[0]) ** 2
+            + (actual[1] - reference[1]) ** 2
+            + (actual[2] - reference[2]) ** 2
+        ),
+        5,
+    )
+
+
 def _foot_widths(
     left_sole_w: Any | None,
     right_sole_w: Any | None,
@@ -646,49 +849,25 @@ def _recovery_stability_diagnostics(
             }
         )
 
-    values = (
-        fields["confirmed_foot_contact"],
-        fields["body_tilt_rad"],
-        fields["body_angular_speed_rad_s"],
-        fields["body_horizontal_speed_m_s"],
-        fields["support_slip_m_s"],
-    )
-    if not bounds_available or any(value is None for value in values):
+    confirmed_contact = fields["confirmed_foot_contact"]
+    if not isinstance(confirmed_contact, list):
         fields["stability_current"] = None
         fields["stability_gate"] = fields["stabilization_ready"]
         fields["stability_fail_reasons"] = None
         return fields
 
-    reason_pairs = (
-        (
-            "contact",
-            isinstance(values[0], list)
-            and not any(bool(item) for item in values[0]),
-        ),
-        (
-            "tilt",
-            not math.isfinite(float(values[1]))
-            or float(values[1]) > fields["stability_max_tilt_rad"],
-        ),
-        (
-            "angular_speed",
-            not math.isfinite(float(values[2]))
-            or float(values[2]) > fields["stability_max_angular_speed_rad_s"],
-        ),
-        (
-            "horizontal_speed",
-            not math.isfinite(float(values[3]))
-            or float(values[3]) > fields["stability_max_horizontal_speed_m_s"],
-        ),
+    # Recovery now exits as soon as both feet pass the existing per-foot
+    # contact confirmation. Motion magnitudes and their calibrated bounds stay
+    # in the payload for diagnosis, but they are not exit gates.
+    both_contacts_confirmed = (
+        len(confirmed_contact) >= 2
+        and all(bool(item) for item in confirmed_contact[:2])
     )
-    immediate_fail_reasons = [
-        name for name, failed in reason_pairs if failed
-    ]
-    fields["stability_current"] = not immediate_fail_reasons
-    fields["stability_fail_reasons"] = immediate_fail_reasons
-    if not immediate_fail_reasons and fields["stabilization_ready"] is False:
-        fields["stability_fail_reasons"] = ["dwell"]
-    fields["stability_gate"] = fields["stabilization_ready"]
+    fields["stability_current"] = both_contacts_confirmed
+    fields["stability_gate"] = both_contacts_confirmed
+    fields["stability_fail_reasons"] = (
+        [] if both_contacts_confirmed else ["contact"]
+    )
     return fields
 
 
@@ -727,6 +906,28 @@ def build_foothold_debug_payload(
     swing_reference_w = _select_env_value(
         _safe_getattr(data, "swing_reference_pos_w"),
         env_id,
+    )
+    swing_reference_vel_w = _select_env_value(
+        _safe_getattr(data, "swing_reference_vel_w"),
+        env_id,
+    )
+    actual_swing_vel_w = _select_env_value(
+        _safe_getattr(data, "actual_swing_foot_vel_w"),
+        env_id,
+    )
+    swing_duration_s = _select_env_value(
+        _safe_getattr(data, "swing_duration_s"),
+        env_id,
+    )
+    swing_velocity_error_m_s = _vector_error_norm(
+        actual_swing_vel_w,
+        swing_reference_vel_w,
+    )
+    swing_velocity_equivalent_error_m = (
+        round(swing_velocity_error_m_s * swing_duration_s, 5)
+        if swing_velocity_error_m_s is not None
+        and isinstance(swing_duration_s, (int, float))
+        else None
     )
     swing_start_w = _select_env_value(
         _safe_getattr(data, "swing_start_pos_w"),
@@ -847,6 +1048,10 @@ def build_foothold_debug_payload(
             _safe_getattr(data, "learned_foothold_route_initial_executable"),
             env_id,
         ),
+        "route_outcome": _select_env_value(
+            _safe_getattr(data, "learned_foothold_route_outcome"),
+            env_id,
+        ),
         "lock_geometric_valid": _select_env_value(
             _safe_getattr(data, "learned_foothold_lock_geometric_valid"), env_id
         ),
@@ -922,6 +1127,11 @@ def build_foothold_debug_payload(
         "target_f": target_f,
         "target_w": target_w,
         "swing_reference_w": swing_reference_w,
+        "swing_reference_vel_w": swing_reference_vel_w,
+        "actual_swing_vel_w": actual_swing_vel_w,
+        "swing_duration_s": swing_duration_s,
+        "swing_velocity_error_m_s": swing_velocity_error_m_s,
+        "swing_velocity_equivalent_error_m": swing_velocity_equivalent_error_m,
         "swing_start_w": swing_start_w,
         "actual_swing_w": actual_swing_w,
         "actual_stance_w": actual_stance_w,
@@ -973,6 +1183,13 @@ def build_foothold_debug_payload(
         ),
     }
     payload.update(_command_term_diagnostics(base_env, command_name, env_id))
+    payload.update(
+        _learned_foothold_diagnostics(
+            sensor,
+            data,
+            env_id,
+        )
+    )
     payload.update(
         _build_startup_pose_diagnostics(
             base_env,
@@ -1142,8 +1359,12 @@ def format_foothold_debug_line(
         f"target_f={payload['target_f']} "
         f"target_w={payload['target_w']} "
         f"swing_ref_w={payload['swing_reference_w']} "
+        f"swing_ref_vel_w={payload['swing_reference_vel_w']} "
         f"swing_start_w={payload['swing_start_w']} "
         f"actual_swing_w={payload['actual_swing_w']} "
+        f"actual_swing_vel_w={payload['actual_swing_vel_w']} "
+        f"swing_vel_err_m_s={payload['swing_velocity_error_m_s']} "
+        f"swing_vel_equiv_err_m={payload['swing_velocity_equivalent_error_m']} "
         f"actual_stance_w={payload['actual_stance_w']} "
         f"left_sole_w={payload['left_sole_w']} "
         f"right_sole_w={payload['right_sole_w']} "
@@ -1173,6 +1394,54 @@ def format_foothold_debug_line(
         f" ankle_action={payload['ankle_action']}"
         f" foot_pos_w={payload['foot_pos_w']}"
         f" foot_rpy_w={payload['foot_rpy_w']}"
+    )
+
+
+def format_learned_foothold_debug_line(
+    timestep: int,
+    payload: dict[str, Any],
+) -> str:
+    """Format one compact learned proposal evaluation or routing event."""
+
+    evaluated = bool(payload.get("learned_evaluated"))
+    routed = bool(payload.get("route_event"))
+    if evaluated and routed:
+        event = "EVALUATION+ROUTE"
+    elif evaluated:
+        event = "EVALUATION"
+    else:
+        event = "ROUTE"
+    return (
+        f"[LEARNED_FOOTHOLD_DEBUG] step={timestep} "
+        f"env_id={payload['env_id']} "
+        f"event={event} "
+        f"generation={payload['learned_event_generation']} "
+        f"mode={payload['gait_mode']} "
+        f"swing_side={payload['swing_side']} "
+        f"action_n={payload['learned_action_normalized']} "
+        f"decoded_f={payload['learned_decoded_f']} "
+        f"prepared_f={payload['learned_prepared_f']} "
+        f"prepared_w={payload['learned_prepared_w']} "
+        f"relative_height_m={payload['learned_relative_height_m']} "
+        f"height_query_valid={payload['learned_height_valid']} "
+        f"step_height_valid={payload['learned_step_height_valid']} "
+        f"max_step_height_m={payload['learned_max_step_height_m']} "
+        f"nominal_f={payload['nominal_f']} "
+        f"nominal_delta_f={payload['nominal_delta_f']} "
+        f"nominal_deviation_usage={payload['nominal_deviation_usage']} "
+        f"nominal_deviation_cost={payload['nominal_deviation_cost']} "
+        f"reward_branch={payload['reward_branch']} "
+        f"geometric_valid={payload['learned_geometric_valid']} "
+        f"safety_valid={payload['learned_safety_valid']} "
+        f"safety_score={payload['learned_safety_score']} "
+        f"penetrating_points={payload['learned_penetrating_point_count']} "
+        f"penetrating_ratio={payload['learned_penetrating_point_ratio']} "
+        f"total_penetration_m={payload['learned_total_penetration_depth']} "
+        f"route_nominal={payload['route_use_nominal']} "
+        f"route_learned={payload['route_use_learned']} "
+        f"route_exec={payload['route_executable']} "
+        f"route_outcome={payload.get('route_outcome_name')} "
+        f"clearance_safe={payload['swing_clearance_safe']}"
     )
 
 
@@ -1223,3 +1492,9 @@ def is_foothold_debug_plan_event(payload: dict[str, Any]) -> bool:
     """Return whether this payload corresponds to a fresh safe-target planning event."""
 
     return bool(payload.get("safe_target_search"))
+
+
+def is_learned_foothold_debug_event(payload: dict[str, Any]) -> bool:
+    """Return whether a learned proposal was evaluated or routed this step."""
+
+    return bool(payload.get("learned_evaluated") or payload.get("route_event"))

@@ -1250,6 +1250,23 @@ def test_contact_adaptive_recovery_requires_stability_and_rebuilds_swing_role():
         stability_current=torch.tensor([False]),
     )
     assert state.mode.item() == GaitState.RECOVERY
+    assert state.swing_side.item() == 0
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[True, False]]),
+        touchdown_accepted=torch.tensor([False]),
+        planner_valid=torch.tensor([False]),
+        dt=0.02,
+        cfg=GaitMachineConfig(recovery_hold_s=0.01),
+        event_response=torch.tensor([EventResponse.STABILIZE]),
+        stabilization_ready=torch.tensor([False]),
+        stability_current=torch.tensor([False]),
+    )
+    assert state.mode.item() == GaitState.RECOVERY
+    # The legacy single-support recovery-step path must not rewrite roles
+    # while contact-adaptive Recovery is still waiting for its own handshake.
+    assert state.swing_side.item() == 0
 
     state = advance_gait(
         state=state,
@@ -1261,10 +1278,12 @@ def test_contact_adaptive_recovery_requires_stability_and_rebuilds_swing_role():
         event_response=torch.tensor([EventResponse.STABILIZE]),
         stabilization_ready=torch.tensor([True]),
         stability_current=torch.tensor([True]),
+        step_hold_s=torch.tensor([0.04]),
     )
 
     assert state.mode.item() == GaitState.HOLD
     assert state.swing_side.item() == 1
+    torch.testing.assert_close(state.hold_required_s, torch.tensor([0.04]))
 
 
 def test_contact_adaptive_recovery_dwell_does_not_accumulate_across_unstable_frames():

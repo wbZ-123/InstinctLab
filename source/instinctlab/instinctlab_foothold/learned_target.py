@@ -11,32 +11,16 @@ from .frame_transform import (
 from .geometry import make_frozen_stance_frame, world_to_frozen
 
 
-def _swing_side_valid(
-    target_y_f: torch.Tensor,
-    swing_side: torch.Tensor | None,
-    min_lateral_separation: float | None,
-) -> torch.Tensor:
-    """Check that a learned target stays on the selected foot's side."""
-
-    if swing_side is None and min_lateral_separation is None:
-        return torch.ones_like(target_y_f, dtype=torch.bool)
-    if swing_side is None or min_lateral_separation is None:
-        raise ValueError(
-            "swing_side and min_lateral_separation must be provided together."
-        )
-    if min_lateral_separation < 0.0:
-        raise ValueError("min_lateral_separation must be non-negative.")
-    if swing_side.shape != target_y_f.shape:
-        raise ValueError("swing_side must match the target batch shape.")
-    side_sign = torch.where(
-        swing_side == 0,
-        torch.ones_like(target_y_f),
-        -torch.ones_like(target_y_f),
-    )
-    valid_side = (swing_side == 0) | (swing_side == 1)
-    return valid_side & (
-        side_sign * target_y_f >= min_lateral_separation - 1.0e-6
-    )
+# Route outcomes are diagnostics only.  They are intentionally integer codes
+# so the planner can publish one mutually exclusive reason per committed
+# swing without changing any routing decision.
+LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS = 0
+LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY = 1
+LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED = 2
+LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID = 3
+LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE = 4
+LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE = 5
+LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID = 6
 
 
 @dataclass
@@ -53,6 +37,116 @@ class LearnedFootholdRoute:
     use_nominal: torch.Tensor
     use_learned: torch.Tensor
     executable: torch.Tensor
+
+
+def select_preflight_target_w(
+    *,
+    route_use_learned: torch.Tensor,
+    learned_prepared_w: torch.Tensor,
+    nominal_target_w: torch.Tensor,
+) -> torch.Tensor:
+    """Select the HOLD-prepared world target for trajectory preflight."""
+
+    if route_use_learned.dtype != torch.bool:
+        raise TypeError("route_use_learned must be boolean.")
+    if learned_prepared_w.shape != nominal_target_w.shape:
+        raise ValueError("prepared learned and nominal targets must share shape.")
+    if (
+        learned_prepared_w.ndim != 2
+        or learned_prepared_w.shape[-1] != 3
+        or route_use_learned.shape != learned_prepared_w.shape[:-1]
+    ):
+        raise ValueError("preflight targets must have shape (N, 3).")
+    return torch.where(
+        route_use_learned.unsqueeze(-1),
+        learned_prepared_w,
+        nominal_target_w,
+    )
+
+
+def finalize_learned_foothold_route_outcome(
+    *,
+    initial_outcome: torch.Tensor,
+    route_initial_executable: torch.Tensor,
+    final_planner_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the final lock/terrain validity result to a route diagnostic."""
+
+    if not (
+        initial_outcome.shape
+        == route_initial_executable.shape
+        == final_planner_valid.shape
+    ):
+        raise ValueError("route outcome tensors must share one shape.")
+    if route_initial_executable.dtype != torch.bool or final_planner_valid.dtype != torch.bool:
+        raise TypeError("route validity masks must be boolean.")
+    outcome = initial_outcome.clone()
+    outcome[route_initial_executable & ~final_planner_valid] = (
+        LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID
+    )
+    return outcome
+
+
+def classify_learned_foothold_route(
+    *,
+    recovery_step: torch.Tensor,
+    transaction_evaluated: torch.Tensor,
+    learned_geometric_valid: torch.Tensor,
+    learned_safety_valid: torch.Tensor,
+    preflight_ready: torch.Tensor,
+    preflight_safe: torch.Tensor,
+    route_use_learned: torch.Tensor,
+) -> torch.Tensor:
+    """Return the first failed learned-route gate for diagnostics.
+
+    This helper deliberately has no side effects and is not used to decide
+    which target the planner executes.  It only labels the already-committed
+    route so monitor logs can distinguish endpoint failures from trajectory
+    preflight failures and transaction invalidation.
+    """
+
+    masks = (
+        recovery_step,
+        transaction_evaluated,
+        learned_geometric_valid,
+        learned_safety_valid,
+        preflight_ready,
+        preflight_safe,
+        route_use_learned,
+    )
+    if any(mask.dtype != torch.bool for mask in masks):
+        raise TypeError("learned route diagnostic masks must be boolean.")
+    shape = masks[0].shape
+    if any(mask.shape != shape for mask in masks):
+        raise ValueError("learned route diagnostic masks must share a shape.")
+
+    reason = torch.full(
+        shape,
+        LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED,
+        dtype=torch.long,
+        device=recovery_step.device,
+    )
+    normal = ~recovery_step
+    reason[recovery_step] = LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY
+    reason[normal & transaction_evaluated & ~learned_geometric_valid] = (
+        LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID
+    )
+    endpoint_valid = normal & transaction_evaluated & learned_geometric_valid
+    reason[endpoint_valid & ~learned_safety_valid] = (
+        LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE
+    )
+    preflight_candidate = endpoint_valid & learned_safety_valid
+    reason[preflight_candidate & (~preflight_ready | ~preflight_safe)] = (
+        LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE
+    )
+    route_success = (
+        preflight_candidate
+        & preflight_ready
+        & preflight_safe
+        & route_use_learned
+    )
+    reason[route_success] = LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS
+    return reason
 
 
 def reachable_ellipse_usage(
@@ -81,8 +175,6 @@ def reframe_cached_world_foothold(
     radius_x: float,
     radius_y: float,
     max_step_height_m: float,
-    swing_side: torch.Tensor | None = None,
-    min_lateral_separation: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Express a frozen world target in the current support frame and validate it."""
 
@@ -110,11 +202,6 @@ def reframe_cached_world_foothold(
         finite
         & (normalized_radius <= 1.0 + 1.0e-6)
         & (torch.abs(target_f[:, 2]) <= max_step_height_m)
-        & _swing_side_valid(
-            target_f[:, 1],
-            swing_side,
-            min_lateral_separation,
-        )
     )
     return target_f, geometric_valid
 
@@ -202,6 +289,7 @@ def store_learned_foothold_preparation(
     )
     data.learned_foothold_safety_valid[env_ids] = safety_valid
     data.learned_foothold_evaluated[env_ids] = True
+    data.learned_foothold_transaction_evaluated[env_ids] = True
     # ``prepared_valid`` means executable geometry. Danger-cylinder safety is
     # deliberately retained as a separate soft PPO signal; folding it into
     # this flag would prevent the policy from experiencing the proposal whose
@@ -275,11 +363,13 @@ def clear_learned_foothold_buffers(
         "learned_foothold_geometric_valid",
         "learned_foothold_safety_valid",
         "learned_foothold_evaluated",
+        "learned_foothold_transaction_evaluated",
         "learned_foothold_route_event",
         "learned_foothold_route_use_nominal",
         "learned_foothold_route_use_learned",
         "learned_foothold_route_initial_executable",
     )
+    integer_fields = ("learned_foothold_route_outcome",)
 
     for name in vector_fields:
         value = getattr(data, name, None)
@@ -289,6 +379,10 @@ def clear_learned_foothold_buffers(
         value = getattr(data, name, None)
         if value is not None:
             value[env_ids] = False
+    for name in integer_fields:
+        value = getattr(data, name, None)
+        if value is not None:
+            value[env_ids] = 0
 
 
 def decode_normalized_foothold(
@@ -324,8 +418,6 @@ def prepare_learned_foothold_target(
     radius_y: float,
     max_step_height_m: float,
     terrain_height_query_w: TerrainHeightQuery,
-    swing_side: torch.Tensor | None = None,
-    min_lateral_separation: float | None = None,
 ) -> LearnedFootholdPreparation:
     """Decode XY, query world-frame terrain height, and apply hard geometry."""
 
@@ -354,10 +446,6 @@ def prepare_learned_foothold_target(
     )
     geometric_valid = height_valid & (
         torch.abs(target_f[:, 2]) <= max_step_height_m
-    ) & _swing_side_valid(
-        target_f[:, 1],
-        swing_side,
-        min_lateral_separation,
     )
     return LearnedFootholdPreparation(
         decoded_f=decoded_f,
@@ -402,7 +490,7 @@ def learned_foothold_event_masks(
 def learned_foothold_swing_ready(
     *,
     nominal_route_ready: torch.Tensor,
-    learned_evaluated: torch.Tensor,
+    transaction_evaluated: torch.Tensor,
     learned_prepared_valid: torch.Tensor,
     learned_geometric_valid: torch.Tensor,
     learned_safety_valid: torch.Tensor,
@@ -419,7 +507,7 @@ def learned_foothold_swing_ready(
 
     if not (
         nominal_route_ready.shape
-        == learned_evaluated.shape
+        == transaction_evaluated.shape
         == learned_prepared_valid.shape
         == learned_geometric_valid.shape
         == learned_safety_valid.shape
@@ -434,8 +522,8 @@ def learned_foothold_swing_ready(
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    normal_ready = learned_ready | (
-        learned_evaluated.bool() & nominal_ready
+    normal_ready = transaction_evaluated.bool() & (
+        learned_ready | nominal_ready
     )
     return torch.where(recovery, nominal_ready, normal_ready)
 
@@ -443,11 +531,10 @@ def learned_foothold_swing_ready(
 def learned_foothold_transaction_ready(
     *,
     nominal_route_ready: torch.Tensor,
-    learned_evaluated: torch.Tensor,
+    transaction_evaluated: torch.Tensor,
     learned_prepared_valid: torch.Tensor,
     learned_geometric_valid: torch.Tensor,
     learned_safety_valid: torch.Tensor,
-    preflight_retry_required: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return whether one HOLD proposal can be committed without resampling.
 
@@ -458,30 +545,21 @@ def learned_foothold_transaction_ready(
     """
     masks = (
         nominal_route_ready,
-        learned_evaluated,
+        transaction_evaluated,
         learned_prepared_valid,
         learned_geometric_valid,
         learned_safety_valid,
     )
     if any(mask.shape != nominal_route_ready.shape for mask in masks[1:]):
         raise ValueError("learned foothold transaction masks must share one shape.")
-    if preflight_retry_required is None:
-        preflight_retry_required = torch.zeros_like(
-            nominal_route_ready,
-            dtype=torch.bool,
-        )
-    elif preflight_retry_required.shape != nominal_route_ready.shape:
-        raise ValueError(
-            "preflight_retry_required must match learned foothold transaction masks."
-        )
     learned_safe = (
         learned_prepared_valid.bool()
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    return ~preflight_retry_required.bool() & (learned_safe | (
-        learned_evaluated.bool() & nominal_route_ready.bool()
-    ))
+    return transaction_evaluated.bool() & (
+        learned_safe | nominal_route_ready.bool()
+    )
 
 
 def nominal_foothold_prepare_mask(

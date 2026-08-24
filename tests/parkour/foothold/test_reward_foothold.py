@@ -275,6 +275,7 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
         learned_foothold_safety_score=torch.tensor(
             [0.0, 0.0, -0.4, 0.8, 1.0]
         ),
+        velocity_lookahead_s=torch.full((5,), 0.10),
         nominal_geometric_valid=torch.tensor(
             [True, True, True, True, True]
         ),
@@ -330,11 +331,218 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
         velocity_std=0.5,
     )
 
-    assert reward[0].item() == 1.0
-    assert 0.0 <= reward[1].item() < 0.01
+    torch.testing.assert_close(reward[0], torch.tensor(1.0))
+    torch.testing.assert_close(reward[1], torch.tensor(-1.0))
     torch.testing.assert_close(reward[2], torch.tensor(-0.4))
     assert reward[3].item() == -1.0
     assert reward[4].item() == 0.0
+
+
+def test_nominal_deviation_cost_is_zero_only_at_match_and_bounded():
+    foothold = _load_foothold_reward_module()
+    delta = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.4, 0.0],
+            [0.8, 0.4],
+        ]
+    )
+
+    cost = foothold._normalized_nominal_deviation_cost(
+        delta,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+    )
+
+    torch.testing.assert_close(cost, torch.tensor([0.0, 1.0, 1.0]))
+    assert torch.all(cost[1:] >= cost[:-1])
+
+
+def test_nominal_deviation_reward_has_two_cm_deadband_and_full_match_bonus():
+    foothold = _load_foothold_reward_module()
+    delta = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.01, 0.0],
+            [0.02, 0.0],
+            [0.42, 0.0],
+        ]
+    )
+
+    reward = foothold._nominal_deviation_reward(
+        delta,
+        reachability_radius_x=0.42,
+        reachability_radius_y=0.25,
+        tolerance_m=0.02,
+    )
+
+    torch.testing.assert_close(
+        reward,
+        torch.tensor([1.0, 0.5, 0.0, -1.0]),
+    )
+
+
+def test_safe_learned_target_on_unsafe_nominal_uses_command_consistency():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_safety_score=torch.tensor([1.0]),
+        nominal_geometric_valid=torch.tensor([True]),
+        nominal_safety_valid=torch.tensor([False]),
+        raw_unclipped_foothold_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        learned_foothold_decoded_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        nominal_feasible_velocity_f=torch.tensor([[2.0, 0.0, 0.0]]),
+        velocity_lookahead_s=torch.tensor([0.10]),
+        swing_side=torch.tensor([0]),
+        swing_preflight_ready=torch.tensor([False]),
+        swing_preflight_safe=torch.tensor([True]),
+        stabilization_active=torch.zeros(1, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+        velocity_lookahead_s=0.10,
+        nominal_step_width_m=0.18,
+        velocity_std=0.5,
+    )
+
+    torch.testing.assert_close(reward, torch.tensor([1.0]))
+
+
+def test_safe_correction_never_scores_below_zero_for_unsafe_nominal():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_safety_score=torch.tensor([1.0]),
+        nominal_geometric_valid=torch.tensor([True]),
+        nominal_safety_valid=torch.tensor([False]),
+        raw_unclipped_foothold_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        # A large safe correction with poor command consistency.  The old
+        # subtractive score became negative even though the point was safe.
+        learned_foothold_decoded_f=torch.tensor([[0.40, 0.18, 0.0]]),
+        nominal_feasible_velocity_f=torch.tensor([[2.0, 0.0, 0.0]]),
+        velocity_lookahead_s=torch.tensor([0.10]),
+        swing_side=torch.tensor([0]),
+        swing_preflight_ready=torch.tensor([False]),
+        swing_preflight_safe=torch.tensor([True]),
+        stabilization_active=torch.zeros(1, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+        velocity_lookahead_s=0.10,
+        nominal_step_width_m=0.18,
+        velocity_std=0.5,
+    )
+
+    assert 0.0 <= reward.item() <= 1.0
+
+
+def test_safe_correction_combines_command_and_deviation_quality():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_safety_score=torch.tensor([1.0]),
+        nominal_geometric_valid=torch.tensor([True]),
+        nominal_safety_valid=torch.tensor([False]),
+        raw_unclipped_foothold_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        # Exactly 2 cm from nominal: nominal deviation reward is zero and
+        # therefore the bounded closeness factor is 0.5.
+        learned_foothold_decoded_f=torch.tensor([[0.22, 0.18, 0.0]]),
+        nominal_feasible_velocity_f=torch.tensor([[2.0, 0.0, 0.0]]),
+        velocity_lookahead_s=torch.tensor([0.10]),
+        swing_side=torch.tensor([0]),
+        swing_preflight_ready=torch.tensor([False]),
+        swing_preflight_safe=torch.tensor([True]),
+        stabilization_active=torch.zeros(1, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+        velocity_lookahead_s=0.10,
+        nominal_step_width_m=0.18,
+        velocity_std=0.5,
+    )
+
+    command_consistency = torch.exp(torch.tensor(-0.04 / 0.25))
+    torch.testing.assert_close(
+        reward,
+        (command_consistency * 0.5).expand_as(reward),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+
+def test_planning_reward_uses_runtime_lookahead_for_velocity_consistency():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_safety_score=torch.tensor([1.0]),
+        nominal_geometric_valid=torch.tensor([True]),
+        nominal_safety_valid=torch.tensor([False]),
+        raw_unclipped_foothold_f=torch.tensor([[0.25, 0.18, 0.0]]),
+        learned_foothold_decoded_f=torch.tensor([[0.25, 0.18, 0.0]]),
+        nominal_feasible_velocity_f=torch.tensor([[1.0, 0.0, 0.0]]),
+        velocity_lookahead_s=torch.tensor([0.25]),
+        swing_side=torch.tensor([0]),
+        swing_preflight_ready=torch.tensor([False]),
+        swing_preflight_safe=torch.tensor([True]),
+        stabilization_active=torch.zeros(1, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        reachability_radius_x=0.4,
+        reachability_radius_y=0.2,
+        # Deliberately disagree with runtime data; runtime must win.
+        velocity_lookahead_s=0.10,
+        nominal_step_width_m=0.18,
+        velocity_std=0.5,
+    )
+
+    torch.testing.assert_close(reward, torch.tensor([1.0]))
 
 
 def test_swing_tracking_rewards_reference_match_and_masks_non_swing():
@@ -366,6 +574,85 @@ def test_swing_tracking_rewards_reference_match_and_masks_non_swing():
     reward = foothold.foothold_swing_tracking_exp(env, std=0.2)
 
     torch.testing.assert_close(reward, torch.tensor([1.0, 0.0]))
+
+
+def test_swing_tracking_default_bandwidth_penalizes_ten_cm_error():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        gait_mode=torch.tensor([1]),
+        actual_swing_foot_pos_w=torch.tensor([[1.10, 2.0, 0.3]]),
+        swing_reference_pos_w=torch.tensor([[1.0, 2.0, 0.3]]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.foothold_swing_tracking_exp(env)
+
+    torch.testing.assert_close(reward, torch.tensor([torch.exp(torch.tensor(-4.0))]))
+
+
+def test_swing_velocity_tracking_uses_reference_derivative_and_swing_duration():
+    foothold = _load_foothold_reward_module()
+
+    planner_data = SimpleNamespace(
+        gait_mode=torch.tensor([1, 1, 0]),
+        actual_swing_foot_vel_w=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.16, 0.0, 0.0], [0.16, 0.0, 0.0]]
+        ),
+        swing_reference_vel_w=torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+        swing_duration_s=torch.tensor([0.32, 0.32, 0.32]),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.foothold_swing_velocity_tracking_exp(env)
+
+    # 0.16 m/s over the 0.32 s swing is a 5.12 cm equivalent position error.
+    torch.testing.assert_close(
+        reward,
+        torch.tensor(
+            [
+                1.0,
+                torch.exp(torch.tensor(-((0.16 * 0.32) / 0.05) ** 2)),
+                0.0,
+            ]
+        ),
+    )
+
+
+def test_parkour_position_tracking_bandwidth_is_five_cm_and_velocity_term_is_auxiliary():
+    repo_root = Path(__file__).resolve().parents[3]
+    cfg_text = (
+        repo_root
+        / "source/instinctlab/instinctlab/tasks/parkour/config/parkour_env_cfg.py"
+    ).read_text()
+
+    position_block = cfg_text.split("    foothold_swing_tracking = RewTerm(", 1)[1].split(
+        "    foothold_touchdown_tracking =", 1
+    )[0]
+    velocity_block = cfg_text.split(
+        "    foothold_swing_velocity_tracking = RewTerm(", 1
+    )[1].split("    foothold_clearance_safe_indicator =", 1)[0]
+    assert '"std": 0.05' in position_block
+    assert 'weight=0.8 * _FOOTHOLD_REWARD_WEIGHT_SCALE' in position_block
+    assert 'weight=0.2 * _FOOTHOLD_REWARD_WEIGHT_SCALE' in velocity_block
 
 
 def test_swing_tracking_syncs_base_velocity_before_reading_planner_data():
@@ -1329,6 +1616,35 @@ def test_parkour_reward_cfg_uses_unified_anomaly_penalty_and_keeps_diagnostics()
     assert "weight=-0.3 * _FOOTHOLD_REWARD_WEIGHT_SCALE" in cfg_text
     _assert_locomotion_readiness_curriculum(cfg_text)
     assert "foothold_plan_invalid_indicator = RewTerm(" in cfg_text
+
+
+def test_parkour_recovery_keeps_tracking_rewards_and_masks_dont_wait_and_air_time():
+    repo_root = Path(__file__).resolve().parents[3]
+    cfg_text = (
+        repo_root
+        / "source/instinctlab/instinctlab/tasks/parkour/config/parkour_env_cfg.py"
+    ).read_text()
+
+    assert "func=mdp.track_lin_vel_xy_exp" in cfg_text
+    assert "func=mdp.track_ang_vel_z_exp" in cfg_text
+    assert "func=mdp.heading_error" in cfg_text
+    assert "func=mdp.stand_still" in cfg_text
+    assert "func=instinct_mdp.dont_wait_recovery_masked" in cfg_text
+    assert "func=instinct_mdp.feet_air_time_recovery_masked" in cfg_text
+
+    dont_wait_block = cfg_text.split("    dont_wait = RewTerm(", 1)[1].split(
+        "    is_alive =", 1
+    )[0]
+    assert "func=instinct_mdp.dont_wait_recovery_masked" in dont_wait_block
+    assert "weight=-2.0" in dont_wait_block
+    assert '"sensor_name": "foothold_planner"' in dont_wait_block
+
+    # Velocity and heading tracking remain active in Recovery.  Only the
+    # pressure to leave double support immediately is masked there.
+    task_reward_block = cfg_text.split("class G1Rewards:", 1)[1].split(
+        "    dont_wait = RewTerm(", 1
+    )[0]
+    assert '"sensor_name": "foothold_planner"' not in task_reward_block
 
 
 def test_foothold_diagnostic_indicators_expose_gait_state_events():

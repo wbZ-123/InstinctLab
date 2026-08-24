@@ -364,6 +364,11 @@ def advance_gait(
             state.hold_elapsed_s + dt >= cfg.recovery_hold_s - 1.0e-6
         )
     )
+    if contact_adaptive:
+        # The event-driven path has its own double-contact stabilization
+        # handshake below.  Do not let the legacy single-support recovery-step
+        # path mutate swing/support roles before that handshake completes.
+        recovery_ready = torch.zeros_like(recovery_ready)
     mode[was_recovery] = GaitState.RECOVERY
     mode[recovery_ready] = GaitState.HOLD
 
@@ -640,6 +645,10 @@ def advance_gait(
             swing_side[valid_next_swing] = next_swing[valid_next_swing]
             elapsed_s[exited_recovery] = 0.0
             hold_elapsed_s[exited_recovery] = 0.0
+            # Both feet have already passed the per-foot contact confirmation.
+            # Resume through the same short HOLD handshake used after a normal
+            # touchdown; the long reset hold is reserved for episode startup.
+            hold_required_s[exited_recovery] = step_hold_s[exited_recovery]
             stabilization_elapsed_s[exited_recovery] = 0.0
             recovery_step_pending[exited_recovery] = False
             recovery_step_active[exited_recovery] = False

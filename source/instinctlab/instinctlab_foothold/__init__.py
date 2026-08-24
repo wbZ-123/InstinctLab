@@ -2,7 +2,16 @@
 
 from .frame_transform import apply_world_height_to_planner_target, planner_frame_to_world_xy
 from .learned_target import (
+    LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID,
+    LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID,
+    LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY,
+    LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+    LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED,
     LearnedFootholdPreparation,
+    classify_learned_foothold_route,
+    finalize_learned_foothold_route_outcome,
     clear_learned_foothold_buffers,
     decode_normalized_foothold,
     learned_foothold_event_masks,
@@ -14,6 +23,7 @@ from .learned_target import (
     reachable_ellipse_usage,
     reframe_cached_world_foothold,
     route_nominal_and_learned_footholds,
+    select_preflight_target_w,
     store_learned_foothold_preparation,
 )
 from .geometry import FrozenFrame, SoleGeometry, frozen_to_world, make_frozen_stance_frame, world_to_frozen
@@ -87,6 +97,15 @@ __all__ = [
     "ObservationSlice",
     "apply_world_height_to_planner_target",
     "LearnedFootholdPreparation",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS",
+    "LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED",
+    "classify_learned_foothold_route",
+    "finalize_learned_foothold_route_outcome",
     "clear_learned_foothold_buffers",
     "decode_normalized_foothold",
     "learned_foothold_event_masks",
@@ -98,6 +117,7 @@ __all__ = [
     "reachable_ellipse_usage",
     "reframe_cached_world_foothold",
     "route_nominal_and_learned_footholds",
+    "select_preflight_target_w",
     "store_learned_foothold_preparation",
     "planner_frame_to_world_xy",
     "SoleGeometry",

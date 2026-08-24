@@ -23,7 +23,7 @@ def test_support_roles_follow_confirmed_physical_contacts():
     torch.testing.assert_close(swing, torch.tensor([1, 0, 1, -1]))
 
 
-def test_stability_requires_all_bounds_for_full_dwell():
+def test_recovery_contact_dwell_does_not_require_motion_bounds():
     bounds = StabilityBounds(
         max_tilt_rad=0.20,
         max_angular_speed_rad_s=0.80,
@@ -47,8 +47,8 @@ def test_stability_requires_all_bounds_for_full_dwell():
         dt=0.02,
     )
 
-    torch.testing.assert_close(ready, torch.tensor([True, False]))
-    torch.testing.assert_close(next_elapsed, torch.tensor([0.10, 0.0]))
+    torch.testing.assert_close(ready, torch.tensor([True, True]))
+    torch.testing.assert_close(next_elapsed, torch.tensor([0.10, 0.10]))
 
 
 def test_stability_exit_gate_does_not_block_on_support_slip():
@@ -84,6 +84,76 @@ def test_stability_exit_gate_does_not_block_on_support_slip():
     torch.testing.assert_close(elapsed, torch.tensor([0.04]))
 
 
+def test_recovery_stability_can_require_both_confirmed_feet():
+    bounds = StabilityBounds(
+        max_tilt_rad=0.35,
+        max_angular_speed_rad_s=1.5,
+        max_horizontal_speed_m_s=0.35,
+        max_support_slip_m_s=0.05,
+        dwell_s=0.04,
+    )
+    signals = StabilitySignals(
+        confirmed_contact=torch.tensor([[True, False], [True, True]]),
+        body_tilt_rad=torch.tensor([0.10, 0.10]),
+        body_angular_speed_rad_s=torch.tensor([0.20, 0.20]),
+        body_horizontal_speed_m_s=torch.tensor([0.10, 0.10]),
+        support_slip_m_s=torch.tensor([0.50, 0.50]),
+    )
+
+    ready, next_elapsed = stability_ready(
+        signals,
+        bounds,
+        torch.tensor([0.02, 0.02]),
+        dt=0.02,
+        require_both_contact=True,
+    )
+
+    torch.testing.assert_close(ready, torch.tensor([False, True]))
+    torch.testing.assert_close(next_elapsed, torch.tensor([0.0, 0.04]))
+
+
+def test_recovery_exit_uses_contact_dwell_not_motion_speed_thresholds():
+    """Recovery hands back to HOLD once both feet are confirmed.
+
+    A recovery handoff is a gait resynchronization event, not a requirement
+    that the commanded walking motion has already stopped.
+    """
+    bounds = StabilityBounds(
+        max_tilt_rad=0.35,
+        max_angular_speed_rad_s=1.5,
+        max_horizontal_speed_m_s=0.35,
+        max_support_slip_m_s=0.05,
+        dwell_s=0.04,
+    )
+    signals = StabilitySignals(
+        confirmed_contact=torch.tensor([[True, True]]),
+        body_tilt_rad=torch.tensor([0.70]),
+        body_angular_speed_rad_s=torch.tensor([3.0]),
+        body_horizontal_speed_m_s=torch.tensor([0.80]),
+        support_slip_m_s=torch.tensor([0.20]),
+    )
+
+    ready, elapsed = stability_ready(
+        signals,
+        bounds,
+        torch.zeros(1),
+        dt=0.02,
+        require_both_contact=True,
+    )
+    torch.testing.assert_close(ready, torch.tensor([False]))
+    torch.testing.assert_close(elapsed, torch.tensor([0.02]))
+
+    ready, elapsed = stability_ready(
+        signals,
+        bounds,
+        elapsed,
+        dt=0.02,
+        require_both_contact=True,
+    )
+    torch.testing.assert_close(ready, torch.tensor([True]))
+    torch.testing.assert_close(elapsed, torch.tensor([0.04]))
+
+
 def test_event_response_keeps_invalid_plan_in_hold_and_searches_late_contact():
     retry = response_for_event(
         event=torch.tensor([ContactEvent.PLAN_INVALID]),
@@ -115,6 +185,18 @@ def test_unstable_contact_event_enters_autonomous_stabilization():
     response = response_for_event(
         event=torch.tensor([ContactEvent.SUPPORT_LOST]),
         support_stable=torch.tensor([False]),
+        late_search_available=torch.tensor([False]),
+    )
+
+    assert response.item() == EventResponse.STABILIZE
+
+
+def test_support_loss_always_uses_motor_recovery_even_with_one_contact():
+    response = response_for_event(
+        event=torch.tensor([ContactEvent.SUPPORT_LOST]),
+        # A remaining foot is not a reason to start a new planner transaction
+        # while the previous stance has already been lost.
+        support_stable=torch.tensor([True]),
         late_search_available=torch.tensor([False]),
     )
 

@@ -94,8 +94,17 @@ def stability_ready(
     bounds: StabilityBounds,
     elapsed_s: torch.Tensor,
     dt: float,
+    require_both_contact: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Accumulate a continuous stable dwell and return readiness plus timer."""
+    """Accumulate a continuous contact dwell and return readiness plus timer.
+
+    Recovery uses this as a gait-resynchronization handshake: contact (one or
+    both feet, selected by ``require_both_contact``) must remain confirmed for
+    the calibrated dwell.  Motion magnitudes and support slip are retained in
+    ``StabilitySignals`` for diagnostics/calibration, but they are not exit
+    gates.  Requiring the body to nearly stop would prevent a moving command
+    from handing control back to the normal HOLD/planner transaction.
+    """
     if dt <= 0.0:
         raise ValueError("dt must be positive")
     if signals.confirmed_contact.ndim != 2 or signals.confirmed_contact.shape[-1] != 2:
@@ -110,17 +119,19 @@ def stability_ready(
         _require_batch_shape(getattr(signals, name), (num_envs,), name)
     _require_batch_shape(elapsed_s, (num_envs,), "elapsed_s")
 
-    # Support slip remains part of the sampled signal for diagnostics and
-    # calibration, but it is not a hard Recovery-exit gate: contact handoff
-    # and stair edges can produce short slip spikes after the body is stable.
+    # Motion and slip remain sampled for diagnostics and calibration, but are
+    # intentionally not hard gates for the Recovery handoff.
+    confirmed_contact = signals.confirmed_contact.bool()
+    contact_ready = (
+        torch.all(confirmed_contact, dim=-1)
+        if require_both_contact
+        else torch.any(confirmed_contact, dim=-1)
+    )
     stable = (
-        torch.any(signals.confirmed_contact.bool(), dim=-1)
+        contact_ready
         & torch.isfinite(signals.body_tilt_rad)
         & torch.isfinite(signals.body_angular_speed_rad_s)
         & torch.isfinite(signals.body_horizontal_speed_m_s)
-        & (signals.body_tilt_rad <= bounds.max_tilt_rad)
-        & (signals.body_angular_speed_rad_s <= bounds.max_angular_speed_rad_s)
-        & (signals.body_horizontal_speed_m_s <= bounds.max_horizontal_speed_m_s)
     )
     next_elapsed_s = torch.where(
         stable,
@@ -177,6 +188,8 @@ def response_for_event(
     response[
         late & ~late_touchdown_confirmed.bool() & ~late_search_available.bool()
     ] = EventResponse.STABILIZE
-    response[support_lost & support_stable.bool()] = EventResponse.REASSIGN_SUPPORT
-    response[support_lost & ~support_stable.bool()] = EventResponse.STABILIZE
+    # A lost stance is a physical gait failure.  Even if one foot remains in
+    # contact, let the motor policy restore double support; do not create a
+    # separate single-support planner/recovery step here.
+    response[support_lost] = EventResponse.STABILIZE
     return response

@@ -6,6 +6,7 @@
 2. `docs/foothold_planner_implementation.md`
 3. `docs/foothold_parameter_audit.md`
 4. 与当前任务相关的 `docs/superpowers/specs/` 设计文档
+5. `docs/foothold_project_status.md`（当前完成情况、客观训练证据和下一步）
 
 本文件描述当前 Git 分支的实现，不是历史聊天记录，也不代表所有旧实验都仍然有效。
 
@@ -334,4 +335,6 @@ git diff --check
 
 如果这些约束或依赖发生变化，先更新本文件和对应实现文档，再开始新的长训。
 
+当前交接状态、最近训练指标、已知问题和未实施的 planner PPO 分支平衡方案，统一记录在
+[`docs/foothold_project_status.md`](docs/foothold_project_status.md)。
 

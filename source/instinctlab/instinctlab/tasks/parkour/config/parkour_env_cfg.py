@@ -42,10 +42,11 @@ from instinctlab_foothold import FlatProviderConfig
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 
-# The learned foothold planner uses autonomous, motor-policy recovery.  This
-# file is the repository's reviewed initial G1 stability baseline; deployments
-# may replace it with FOOTHOLD_RECOVERY_CALIBRATION_PATH after collecting a
-# checkpoint-specific calibration.
+# The learned foothold planner uses autonomous, motor-policy recovery.  The
+# file supplies diagnostic/calibration metadata for contact adaptation.  Its
+# motion and slip values are not hard Recovery-exit gates; the handoff uses
+# confirmed double contact dwell.  Deployments may replace it with
+# FOOTHOLD_RECOVERY_CALIBRATION_PATH after collecting checkpoint data.
 _FOOTHOLD_RECOVERY_STABILITY_SEED_PATH = os.path.normpath(
     os.path.join(
         __file_dir__,
@@ -735,29 +736,30 @@ class G1Rewards:
 
     # Task rewards
     track_lin_vel_xy_exp = RewTerm(
-        func=instinct_mdp.track_lin_vel_xy_exp_recovery_masked,
+        # Keep velocity and heading tracking active while the motor policy
+        # re-synchronizes contact.  Only ``dont_wait`` is paused in Recovery:
+        # otherwise it directly penalizes the double-contact state required
+        # to hand control back to the normal foothold planner.
+        func=mdp.track_lin_vel_xy_exp,
         weight=2.0,
         params={
             "command_name": "base_velocity",
             "std": 0.5,
-            "sensor_name": "foothold_planner",
         },
     )
     track_ang_vel_z_exp = RewTerm(
-        func=instinct_mdp.track_ang_vel_z_exp_recovery_masked,
+        func=mdp.track_ang_vel_z_exp,
         weight=2.0,
         params={
             "command_name": "base_velocity",
             "std": 0.5,
-            "sensor_name": "foothold_planner",
         },
     )
     heading_error = RewTerm(
-        func=instinct_mdp.heading_error_recovery_masked,
+        func=mdp.heading_error,
         weight=-1.0,
         params={
             "command_name": "base_velocity",
-            "sensor_name": "foothold_planner",
         },
     )
     dont_wait = RewTerm(
@@ -771,12 +773,11 @@ class G1Rewards:
     is_alive = RewTerm(func=mdp.is_alive, weight=0.03)
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-50.0)
     stand_still = RewTerm(
-        func=instinct_mdp.stand_still_recovery_masked,
+        func=mdp.stand_still,
         weight=-0.3,
         params={
             "command_name": "base_velocity",
             "offset": 4.0,
-            "sensor_name": "foothold_planner",
         },
     )
     foothold_swing_tracking = RewTerm(
@@ -785,7 +786,29 @@ class G1Rewards:
         params={
             "sensor_name": "foothold_planner",
             "command_name": "base_velocity",
-            "std": 0.15,
+            # Five centimetres makes a 10 cm swing-position error visibly
+            # costly (exp(-4)); the auxiliary velocity term uses the same
+            # position-equivalent bandwidth below.
+            "std": 0.05,
+            "curriculum_start_scale": 0.0,
+            "curriculum_end_scale": 1.0,
+            "curriculum_ramp_steps": 0,
+            "curriculum_gate": "locomotion_readiness",
+            "curriculum_min_episode_length": _FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+            "curriculum_full_episode_length": _FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
+            "curriculum_velocity_command_name": "base_velocity",
+            "curriculum_velocity_std": 0.5,
+            "curriculum_velocity_start_score": 0.4,
+            "curriculum_velocity_full_score": 0.7,
+        },
+    )
+    foothold_swing_velocity_tracking = RewTerm(
+        func=mdp.foothold_swing_velocity_tracking_exp,
+        weight=0.2 * _FOOTHOLD_REWARD_WEIGHT_SCALE,
+        params={
+            "sensor_name": "foothold_planner",
+            "command_name": "base_velocity",
+            "std": 0.05,
             "curriculum_start_scale": 0.0,
             "curriculum_end_scale": 1.0,
             "curriculum_ramp_steps": 0,
@@ -1386,8 +1409,8 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.foothold_planner.enable_learned_foothold = True
         # The learned route must never use the legacy analytic recovery step:
         # recovery is owned by the existing motor policy and only returns to a
-        # fresh HOLD transaction after continuous physical stability.  An
-        # explicit calibration path from the environment remains authoritative.
+        # fresh HOLD transaction after both feet regain confirmed contact. An
+        # explicit calibration path is retained for motion diagnostics.
         if not self.scene.foothold_planner.enable_contact_adaptive_recovery:
             self.enable_contact_adaptive_recovery(
                 _FOOTHOLD_RECOVERY_STABILITY_SEED_PATH
@@ -1436,7 +1459,7 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
         self,
         calibration_path: str,
     ) -> None:
-        """Opt in to autonomous recovery using calibrated stability bounds."""
+        """Opt in to contact-gated recovery with calibrated diagnostics."""
 
         if self.scene.foothold_planner is None:
             raise RuntimeError(

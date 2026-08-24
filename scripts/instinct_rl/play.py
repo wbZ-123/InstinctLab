@@ -177,9 +177,11 @@ from play_debug import (
     build_reset_debug_payload,
     capture_reset_debug_snapshot,
     format_foothold_debug_line,
+    format_learned_foothold_debug_line,
     format_reset_debug_line,
     is_foothold_debug_anomaly,
     is_foothold_debug_plan_event,
+    is_learned_foothold_debug_event,
 )
 from play_curriculum import (
     load_checkpoint_foothold_curriculum_scale,
@@ -515,6 +517,15 @@ def main():
                         args_cli.print_foothold_debug_on_plan_event
                         and is_foothold_debug_plan_event(payload)
                     )
+                    learned_event = is_learned_foothold_debug_event(payload)
+                    if learned_event:
+                        print(
+                            format_learned_foothold_debug_line(
+                                timestep,
+                                payload,
+                            ),
+                            flush=True,
+                        )
                     if not interval_tick and not plan_event:
                         continue
                     if (

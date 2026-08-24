@@ -40,7 +40,10 @@ class FootholdPlannerCfg(SensorBaseCfg):
     hold_contact_lost_confirm_s: float = 0.10
     early_contact_phase: float = 0.65
     overdue_s: float = 0.12
-    recovery_hold_s: float = 0.20
+    # Legacy non-adaptive callers use this fallback timer. The learned
+    # contact-adaptive path exits as soon as both feet pass the existing
+    # per-foot ``contact_confirm_s`` filter and does not use this second timer.
+    recovery_hold_s: float = 0.04
     step_hold_s: float = 0.04
     step_hold_min_s: float = 0.0
     step_hold_velocity_scale_s_per_mps: float = 0.02
@@ -77,10 +80,10 @@ class FootholdPlannerCfg(SensorBaseCfg):
     # existing max_foothold_step_height_m instead of defining duplicate limits.
     enable_learned_foothold: bool = False
 
-    # Contact-adaptive recovery is opt-in until stability bounds have been
-    # calibrated from a successful normal-HOLD run.  Enabling it without the
-    # generated JSON is rejected by the planner instead of using guessed
-    # thresholds.
+    # Contact-adaptive recovery is opt-in until a calibration file is
+    # available. Its motion/slip fields remain diagnostics; Recovery exits
+    # when both feet have confirmed contact, without extra motion thresholds
+    # or a second dwell interval.
     enable_contact_adaptive_recovery: bool = False
     recovery_stability_calibration_path: str = ""
 

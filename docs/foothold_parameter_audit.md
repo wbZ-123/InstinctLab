@@ -53,6 +53,8 @@
 | `outer_radius_y` | `0.25` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | G1 腿部运动学可达范围扫描 | 需要标定 |
 | `min_lateral_separation` | `0.06` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | 左右脚防交叉安全间距，至少要结合脚宽和脚间距 | 需要标定 |
 | `nominal_step_width` | `0.18` | `instinctlab_foothold/flat_provider.py` | 临时保守值；active G1 shoe URDF 静态链路粗算左右 sole 中心距约 `0.237 m`，说明当前值不是直接来自模型 | reset 初始站姿左右脚中心距离，或 gait/reference 中的默认脚宽 | 需要标定 |
+
+当前边界：`min_lateral_separation=0.06` 仍只属于解析平地名义目标生成器的临时参数；学习式落点的几何有效性不再使用它作左右脚硬拒绝。学习式目标只检查有限性、世界地形高度、最大步高和可达椭圆，横向偏离通过名义点距离代价和真实安全评分学习。
 | `flat_target_lookahead_phase` | `0.8` | `sensors/foothold_planner/foothold_planner_cfg.py` | 临时标定比例：预计在 swing phase 的 80% 处触地 | 真实 touchdown phase 分布、`last_air_time / swing_duration_s` 分布 | 需要标定 |
 | `velocity_lookahead_s` | `flat_target_lookahead_phase * swing_duration_s = 0.256` | `sensors/foothold_planner/foothold_planner.py` | 由 planner 标称摆动时间推导，不再使用独立 `0.10` 临时值 | `flat_target_lookahead_phase` 的标定结果 | 临时已对齐，仍需验证 |
 | `curriculum_radius_x` | `(0.04, 0.08, 0.12)` | `instinctlab_foothold/flat_provider.py` | 训练课程设计 | 外椭圆和训练阶段；最终档不应超过可达范围 | 可保留，但需说明 |

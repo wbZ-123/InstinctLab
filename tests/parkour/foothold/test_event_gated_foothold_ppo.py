@@ -315,6 +315,40 @@ def test_policy_gradient_step_can_update_each_group_in_isolation():
     )
 
 
+def test_policy_gradient_step_steps_each_enabled_optimizer_once():
+    module = _load_ppo_module()
+    algorithm, _ = _make_algorithm(module)
+    observations = torch.randn(4, 4)
+    means = algorithm.actor_critic.act_inference(observations)
+    motor_step_count = 0
+    foothold_step_count = 0
+    original_motor_step = algorithm.optimizer.step
+    original_foothold_step = algorithm.foothold_optimizer.step
+
+    def count_motor_step(*args, **kwargs):
+        nonlocal motor_step_count
+        motor_step_count += 1
+        return original_motor_step(*args, **kwargs)
+
+    def count_foothold_step(*args, **kwargs):
+        nonlocal foothold_step_count
+        foothold_step_count += 1
+        return original_foothold_step(*args, **kwargs)
+
+    algorithm.optimizer.step = count_motor_step
+    algorithm.foothold_optimizer.step = count_foothold_step
+
+    algorithm._policy_gradient_step(
+        motor_loss=means[..., :29].square().mean(),
+        foothold_loss=means[..., 29:].square().mean(),
+        run_foothold=True,
+        average_stats={},
+    )
+
+    assert motor_step_count == 1
+    assert foothold_step_count == 1
+
+
 def test_excess_foothold_kl_blocks_only_foothold_update_and_lr():
     module = _load_ppo_module()
     algorithm, _ = _make_algorithm(module)

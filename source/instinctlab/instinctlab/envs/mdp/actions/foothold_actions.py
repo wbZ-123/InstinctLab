@@ -12,9 +12,14 @@ if TYPE_CHECKING:
 
 
 def normalize_foothold_action(raw_action: torch.Tensor) -> torch.Tensor:
-    """Clamp the policy output without assigning meter-valued semantics."""
+    """Smoothly map an unconstrained policy sample into the unit disk."""
 
-    return torch.clamp(raw_action, -1.0, 1.0)
+    if raw_action.shape[-1] != 2:
+        raise ValueError("raw_action must contain two planner coordinates.")
+    scale = torch.rsqrt(
+        1.0 + raw_action.square().sum(dim=-1, keepdim=True)
+    )
+    return raw_action * scale
 
 
 class LearnedFootholdAction(ActionTerm):

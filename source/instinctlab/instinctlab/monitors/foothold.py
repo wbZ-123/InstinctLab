@@ -7,7 +7,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from instinctlab_foothold import GaitState
+from instinctlab_foothold import (
+    GaitState,
+    LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID,
+    LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY,
+    LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+    LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED,
+)
 
 from .monitor_manager import MonitorTerm
 
@@ -85,6 +93,11 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_safe_target_candidate_obstacle_safe_count_sum",
         "_safe_target_candidate_valid_count_sum",
         "_learned_foothold_evaluation_count",
+        "_learned_foothold_nominal_safe_count",
+        "_learned_foothold_nominal_unsafe_count",
+        "_learned_foothold_nominal_unsafe_correction_success_count",
+        "_learned_foothold_nominal_unsafe_safety_score_sum",
+        "_learned_foothold_nominal_unsafe_correction_distance_sum",
         "_learned_foothold_geometric_valid_count",
         "_learned_foothold_safety_valid_count",
         "_learned_foothold_safety_score_sum",
@@ -96,6 +109,12 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         "_learned_foothold_route_invalid_count",
         "_learned_foothold_route_postcheck_invalid_count",
         "_learned_foothold_routed_safe_count",
+        "_learned_foothold_route_success_count",
+        "_learned_foothold_route_recovery_count",
+        "_learned_foothold_route_transaction_invalidated_count",
+        "_learned_foothold_route_geometric_invalid_count",
+        "_learned_foothold_route_endpoint_unsafe_count",
+        "_learned_foothold_route_preflight_unsafe_count",
     )
     _MAX_BUFFER_NAMES = (
         "_penetration_max",
@@ -253,6 +272,18 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         learned_foothold_total_penetration_depth_raw = self._require(
             data, "learned_foothold_total_penetration_depth"
         )
+        nominal_geometric_valid = self._require(
+            data, "nominal_geometric_valid"
+        ).bool()
+        nominal_safety_valid = self._require(
+            data, "nominal_safety_valid"
+        ).bool()
+        learned_foothold_decoded_f = self._require(
+            data, "learned_foothold_decoded_f"
+        )
+        raw_unclipped_foothold_f = self._require(
+            data, "raw_unclipped_foothold_f"
+        )
         learned_foothold_route_event = self._require(
             data, "learned_foothold_route_event"
         ).bool()
@@ -265,6 +296,9 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         learned_foothold_route_initial_executable = self._require(
             data, "learned_foothold_route_initial_executable"
         ).bool()
+        learned_foothold_route_outcome = self._require(
+            data, "learned_foothold_route_outcome"
+        ).long()
         recovery_step_active = self._require(
             data, "recovery_step_active"
         ).bool()
@@ -484,8 +518,39 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         # different event frequencies. Keep separate denominators so repeated
         # proposal learning samples never masquerade as repeated foot plans.
         learned_evaluation_sample = learned_foothold_evaluated.float()
+        nominal_safe_event = (
+            learned_foothold_evaluated
+            & nominal_geometric_valid
+            & nominal_safety_valid
+        )
+        nominal_unsafe_event = learned_foothold_evaluated & ~(
+            nominal_geometric_valid & nominal_safety_valid
+        )
+        nominal_unsafe_correction_success = (
+            nominal_unsafe_event
+            & learned_foothold_geometric_valid
+            & learned_foothold_safety_valid
+        )
+        nominal_unsafe_correction_distance = torch.linalg.vector_norm(
+            learned_foothold_decoded_f[..., :2]
+            - raw_unclipped_foothold_f[..., :2],
+            dim=-1,
+        )
         self._learned_foothold_evaluation_count += (
             learned_evaluation_sample
+        )
+        self._learned_foothold_nominal_safe_count += nominal_safe_event.float()
+        self._learned_foothold_nominal_unsafe_count += (
+            nominal_unsafe_event.float()
+        )
+        self._learned_foothold_nominal_unsafe_correction_success_count += (
+            nominal_unsafe_correction_success.float()
+        )
+        self._learned_foothold_nominal_unsafe_safety_score_sum += (
+            learned_foothold_safety_score_raw * nominal_unsafe_event.float()
+        )
+        self._learned_foothold_nominal_unsafe_correction_distance_sum += (
+            nominal_unsafe_correction_distance * nominal_unsafe_event.float()
         )
         self._learned_foothold_geometric_valid_count += (
             learned_foothold_evaluated
@@ -531,6 +596,34 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
         ).float()
         self._learned_foothold_routed_safe_count += (
             route_learned & learned_foothold_safety_valid
+        ).float()
+        route_outcome = learned_foothold_route_outcome
+        self._learned_foothold_route_success_count += (
+            learned_foothold_route_event
+            & (route_outcome == LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS)
+        ).float()
+        self._learned_foothold_route_recovery_count += (
+            learned_foothold_route_event
+            & (route_outcome == LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY)
+        ).float()
+        self._learned_foothold_route_transaction_invalidated_count += (
+            learned_foothold_route_event
+            & (
+                route_outcome
+                == LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED
+            )
+        ).float()
+        self._learned_foothold_route_geometric_invalid_count += (
+            learned_foothold_route_event
+            & (route_outcome == LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID)
+        ).float()
+        self._learned_foothold_route_endpoint_unsafe_count += (
+            learned_foothold_route_event
+            & (route_outcome == LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE)
+        ).float()
+        self._learned_foothold_route_preflight_unsafe_count += (
+            learned_foothold_route_event
+            & (route_outcome == LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE)
         ).float()
 
         self._previous_touchdown_accepted.copy_(touchdown_accepted)
@@ -791,17 +884,38 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
                     "safe_target_candidate_obstacle_safe_count_mean",
                     "safe_target_candidate_valid_count_mean",
                     "learned_foothold_evaluation_rate",
+                    "learned_foothold_evaluation_count",
+                    "learned_foothold_nominal_safe_fraction",
+                    "learned_foothold_nominal_unsafe_fraction",
+                    "learned_foothold_nominal_unsafe_correction_success_fraction",
+                    "learned_foothold_nominal_unsafe_safety_score_mean",
+                    "learned_foothold_nominal_unsafe_correction_distance_mean",
                     "learned_foothold_geometric_valid_fraction",
+                    "learned_foothold_geometric_valid_count",
                     "learned_foothold_safety_valid_fraction",
+                    "learned_foothold_safety_valid_count",
                     "learned_foothold_safety_score_mean",
                     "learned_foothold_penetrating_point_ratio_mean",
                     "learned_foothold_total_penetration_depth_mean",
                     "learned_foothold_route_rate",
+                    "learned_foothold_route_count",
                     "learned_foothold_route_nominal_fraction",
                     "learned_foothold_route_learned_fraction",
                     "learned_foothold_route_invalid_fraction",
                     "learned_foothold_route_postcheck_invalid_fraction",
                     "learned_foothold_routed_safe_fraction",
+                    "learned_foothold_route_success_fraction",
+                    "learned_foothold_route_success_count",
+                    "learned_foothold_route_recovery_fraction",
+                    "learned_foothold_route_recovery_count",
+                    "learned_foothold_route_transaction_invalidated_fraction",
+                    "learned_foothold_route_transaction_invalidated_count",
+                    "learned_foothold_route_geometric_invalid_fraction",
+                    "learned_foothold_route_geometric_invalid_count",
+                    "learned_foothold_route_endpoint_unsafe_fraction",
+                    "learned_foothold_route_endpoint_unsafe_count",
+                    "learned_foothold_route_preflight_unsafe_fraction",
+                    "learned_foothold_route_preflight_unsafe_count",
                 )
             }
 
@@ -1040,15 +1154,50 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "learned_foothold_evaluation_rate": self._safe_ratio(
                 learned_evaluation_count, step_count
             ).mean(),
+            "learned_foothold_evaluation_count": (
+                total_learned_evaluation_count
+            ),
+            "learned_foothold_nominal_safe_fraction": self._safe_ratio(
+                self._learned_foothold_nominal_safe_count[env_ids].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_nominal_unsafe_fraction": self._safe_ratio(
+                self._learned_foothold_nominal_unsafe_count[env_ids].sum(),
+                total_learned_evaluation_count,
+            ),
+            "learned_foothold_nominal_unsafe_correction_success_fraction": self._safe_ratio(
+                self._learned_foothold_nominal_unsafe_correction_success_count[
+                    env_ids
+                ].sum(),
+                self._learned_foothold_nominal_unsafe_count[env_ids].sum(),
+            ),
+            "learned_foothold_nominal_unsafe_safety_score_mean": self._safe_ratio(
+                self._learned_foothold_nominal_unsafe_safety_score_sum[
+                    env_ids
+                ].sum(),
+                self._learned_foothold_nominal_unsafe_count[env_ids].sum(),
+            ),
+            "learned_foothold_nominal_unsafe_correction_distance_mean": self._safe_ratio(
+                self._learned_foothold_nominal_unsafe_correction_distance_sum[
+                    env_ids
+                ].sum(),
+                self._learned_foothold_nominal_unsafe_count[env_ids].sum(),
+            ),
             "learned_foothold_geometric_valid_fraction": self._safe_ratio(
                 self._learned_foothold_geometric_valid_count[
                     env_ids
                 ].sum(),
                 total_learned_evaluation_count,
             ),
+            "learned_foothold_geometric_valid_count": (
+                self._learned_foothold_geometric_valid_count[env_ids].sum()
+            ),
             "learned_foothold_safety_valid_fraction": self._safe_ratio(
                 self._learned_foothold_safety_valid_count[env_ids].sum(),
                 total_learned_evaluation_count,
+            ),
+            "learned_foothold_safety_valid_count": (
+                self._learned_foothold_safety_valid_count[env_ids].sum()
             ),
             "learned_foothold_safety_score_mean": self._safe_ratio(
                 self._learned_foothold_safety_score_sum[env_ids].sum(),
@@ -1070,6 +1219,7 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "learned_foothold_route_rate": self._safe_ratio(
                 learned_route_count, step_count
             ).mean(),
+            "learned_foothold_route_count": total_learned_route_count,
             "learned_foothold_route_nominal_fraction": self._safe_ratio(
                 self._learned_foothold_route_nominal_count[env_ids].sum(),
                 total_learned_route_count,
@@ -1093,6 +1243,70 @@ class FootholdPlannerMonitorTerm(MonitorTerm):
             "learned_foothold_routed_safe_fraction": self._safe_ratio(
                 self._learned_foothold_routed_safe_count[env_ids].sum(),
                 total_learned_route_used_count,
+            ),
+            "learned_foothold_route_success_fraction": self._safe_ratio(
+                self._learned_foothold_route_success_count[env_ids].sum(),
+                total_learned_route_count,
+            ),
+            "learned_foothold_route_success_count": (
+                self._learned_foothold_route_success_count[env_ids].sum()
+            ),
+            "learned_foothold_route_recovery_fraction": self._safe_ratio(
+                self._learned_foothold_route_recovery_count[env_ids].sum(),
+                total_learned_route_count,
+            ),
+            "learned_foothold_route_recovery_count": (
+                self._learned_foothold_route_recovery_count[env_ids].sum()
+            ),
+            "learned_foothold_route_transaction_invalidated_fraction": (
+                self._safe_ratio(
+                    self._learned_foothold_route_transaction_invalidated_count[
+                        env_ids
+                    ].sum(),
+                    total_learned_route_count,
+                )
+            ),
+            "learned_foothold_route_transaction_invalidated_count": (
+                self._learned_foothold_route_transaction_invalidated_count[
+                    env_ids
+                ].sum()
+            ),
+            "learned_foothold_route_geometric_invalid_fraction": (
+                self._safe_ratio(
+                    self._learned_foothold_route_geometric_invalid_count[
+                        env_ids
+                    ].sum(),
+                    total_learned_route_count,
+                )
+            ),
+            "learned_foothold_route_geometric_invalid_count": (
+                self._learned_foothold_route_geometric_invalid_count[
+                    env_ids
+                ].sum()
+            ),
+            "learned_foothold_route_endpoint_unsafe_fraction": (
+                self._safe_ratio(
+                    self._learned_foothold_route_endpoint_unsafe_count[
+                        env_ids
+                    ].sum(),
+                    total_learned_route_count,
+                )
+            ),
+            "learned_foothold_route_endpoint_unsafe_count": (
+                self._learned_foothold_route_endpoint_unsafe_count[env_ids].sum()
+            ),
+            "learned_foothold_route_preflight_unsafe_fraction": (
+                self._safe_ratio(
+                    self._learned_foothold_route_preflight_unsafe_count[
+                        env_ids
+                    ].sum(),
+                    total_learned_route_count,
+                )
+            ),
+            "learned_foothold_route_preflight_unsafe_count": (
+                self._learned_foothold_route_preflight_unsafe_count[
+                    env_ids
+                ].sum()
             ),
         }
         return {

@@ -41,7 +41,11 @@ class FootholdPlannerData:
     learned_foothold_height_valid: torch.Tensor | None = None
     learned_foothold_geometric_valid: torch.Tensor | None = None
     learned_foothold_safety_valid: torch.Tensor | None = None
+    # One-step reward/PPO event pulse. Cleared at the start of every update.
     learned_foothold_evaluated: torch.Tensor | None = None
+    # Persistent latch for the current HOLD planning transaction. Cleared only
+    # when that transaction is explicitly discarded or a new one begins.
+    learned_foothold_transaction_evaluated: torch.Tensor | None = None
     # Monotonic counter incremented exactly when the current high-level action
     # is evaluated. Unlike per-step flags, this is never cleared by reset.
     learned_foothold_event_generation: torch.Tensor | None = None
@@ -52,6 +56,9 @@ class FootholdPlannerData:
     learned_foothold_route_use_nominal: torch.Tensor | None = None
     learned_foothold_route_use_learned: torch.Tensor | None = None
     learned_foothold_route_initial_executable: torch.Tensor | None = None
+    # Mutually exclusive reason code for the last committed new-SWING route.
+    # It is diagnostic only; route_event is the validity pulse for this field.
+    learned_foothold_route_outcome: torch.Tensor | None = None
     learned_foothold_safety_score: torch.Tensor | None = None
     learned_foothold_penetrating_point_count: torch.Tensor | None = None
     learned_foothold_penetrating_point_ratio: torch.Tensor | None = None
@@ -75,6 +82,8 @@ class FootholdPlannerData:
     feasible_velocity_f: torch.Tensor | None = None
     default_swing_reference_pos_w: torch.Tensor | None = None
     swing_reference_pos_w: torch.Tensor | None = None
+    swing_reference_vel_w: torch.Tensor | None = None
+    swing_duration_s: torch.Tensor | None = None
     default_swing_apex_height: torch.Tensor | None = None
     swing_apex_height: torch.Tensor | None = None
     swing_clearance_safe: torch.Tensor | None = None
@@ -89,6 +98,7 @@ class FootholdPlannerData:
     swing_preflight_ready: torch.Tensor | None = None
     actual_stance_foot_pos_w: torch.Tensor | None = None
     actual_swing_foot_pos_w: torch.Tensor | None = None
+    actual_swing_foot_vel_w: torch.Tensor | None = None
     swing_start_pos_w: torch.Tensor | None = None
     foot_contact: torch.Tensor | None = None
     confirmed_foot_contact: torch.Tensor | None = None

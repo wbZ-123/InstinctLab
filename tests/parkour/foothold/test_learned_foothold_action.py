@@ -68,25 +68,26 @@ def test_environment_action_order_keeps_motors_before_foothold():
     )
 
 
-def test_normalize_foothold_action_preserves_values_inside_unit_range(monkeypatch):
+def test_normalize_foothold_action_smoothly_maps_to_the_unit_disk(monkeypatch):
     module = _load_foothold_actions_module(monkeypatch)
-    raw = torch.tensor([[-1.0, 0.25], [0.5, 1.0]])
-
-    normalized = module.normalize_foothold_action(raw)
-
-    torch.testing.assert_close(normalized, raw)
-
-
-def test_normalize_foothold_action_clamps_without_meter_scaling(monkeypatch):
-    module = _load_foothold_actions_module(monkeypatch)
-    raw = torch.tensor([[-2.0, 0.25], [0.5, 2.0]])
+    raw = torch.tensor([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
 
     normalized = module.normalize_foothold_action(raw)
 
     torch.testing.assert_close(
         normalized,
-        torch.tensor([[-1.0, 0.25], [0.5, 1.0]]),
+        torch.tensor([[0.0, 0.0], [0.70710677, 0.0], [0.57735026, 0.57735026]]),
     )
+    assert torch.all(torch.linalg.vector_norm(normalized, dim=-1) < 1.0)
+
+
+def test_normalize_foothold_action_keeps_large_gaussian_samples_inside_ellipse(monkeypatch):
+    module = _load_foothold_actions_module(monkeypatch)
+    raw = torch.tensor([[-2.0, 0.25], [0.5, 2.0]])
+
+    normalized = module.normalize_foothold_action(raw)
+
+    assert torch.all(torch.linalg.vector_norm(normalized, dim=-1) < 1.0)
 
 
 def test_action_term_shares_processed_action_with_planner_buffer(monkeypatch):
@@ -112,5 +113,8 @@ def test_action_term_shares_processed_action_with_planner_buffer(monkeypatch):
     )
     torch.testing.assert_close(
         planner_data.learned_foothold_action_normalized,
-        torch.tensor([[1.0, 0.25], [-0.5, -1.0]]),
+        torch.tensor([
+                [0.8888889, 0.1111111],
+                [-0.2182179, -0.8728716],
+            ]),
     )

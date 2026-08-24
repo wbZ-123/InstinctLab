@@ -29,15 +29,15 @@ from instinctlab_foothold import (
     ContactEvent,
     EventResponse,
     StabilityBounds,
-    StabilitySignals,
     load_stability_bounds,
     response_for_event,
-    stability_ready,
     support_roles_from_contacts,
     evaluate_safe_foothold_target,
+    finalize_learned_foothold_route_outcome,
     gait_phase,
     initial_gait_state,
     adjust_apex_for_edge_clearance,
+    classify_learned_foothold_route,
     learned_foothold_event_masks,
     learned_foothold_swing_ready,
     learned_foothold_transaction_ready,
@@ -49,6 +49,7 @@ from instinctlab_foothold import (
     reachable_ellipse_usage,
     reframe_cached_world_foothold,
     route_nominal_and_learned_footholds,
+    select_preflight_target_w,
     sample_flat_targets,
     store_learned_foothold_preparation,
 )
@@ -667,8 +668,6 @@ class FootholdPlanner(SensorBase):
             radius_y=self._flat_provider_cfg.outer_radius_y,
             max_step_height_m=self.cfg.max_foothold_step_height_m,
             terrain_height_query_w=terrain_query_w,
-            swing_side=self._data.swing_side[env_ids],
-            min_lateral_separation=self._flat_provider_cfg.min_lateral_separation,
         )
 
         obstacle = self._virtual_obstacles.get("edges")
@@ -960,6 +959,10 @@ class FootholdPlanner(SensorBase):
             self._data.default_swing_reference_pos_w[reset_env_ids] = 0.0
         if self._data.swing_reference_pos_w is not None:
             self._data.swing_reference_pos_w[reset_env_ids] = 0.0
+        if self._data.swing_reference_vel_w is not None:
+            self._data.swing_reference_vel_w[reset_env_ids] = 0.0
+        if self._data.actual_swing_foot_vel_w is not None:
+            self._data.actual_swing_foot_vel_w[reset_env_ids] = 0.0
         if self._data.default_swing_apex_height is not None:
             self._data.default_swing_apex_height[reset_env_ids] = 0.0
         if self._data.swing_apex_height is not None:
@@ -1383,6 +1386,11 @@ class FootholdPlanner(SensorBase):
             device=self._device,
             dtype=torch.bool,
         )
+        self._data.learned_foothold_transaction_evaluated = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.bool,
+        )
         self._data.learned_foothold_event_generation = torch.zeros(
             self._num_envs,
             device=self._device,
@@ -1407,6 +1415,11 @@ class FootholdPlanner(SensorBase):
             self._num_envs,
             device=self._device,
             dtype=torch.bool,
+        )
+        self._data.learned_foothold_route_outcome = torch.zeros(
+            self._num_envs,
+            device=self._device,
+            dtype=torch.long,
         )
         self._data.learned_foothold_safety_score = torch.zeros(
             self._num_envs,
@@ -1600,6 +1613,16 @@ class FootholdPlanner(SensorBase):
             3,
             device=self._device,
         )
+        self._data.swing_reference_vel_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.swing_duration_s = torch.full(
+            (self._num_envs,),
+            self.cfg.swing_duration_s,
+            device=self._device,
+        )
         self._data.default_swing_apex_height = torch.zeros(
             self._num_envs,
             device=self._device,
@@ -1650,6 +1673,11 @@ class FootholdPlanner(SensorBase):
             device=self._device,
         )
         self._data.actual_swing_foot_pos_w = torch.zeros(
+            self._num_envs,
+            3,
+            device=self._device,
+        )
+        self._data.actual_swing_foot_vel_w = torch.zeros(
             self._num_envs,
             3,
             device=self._device,
@@ -1886,6 +1914,9 @@ class FootholdPlanner(SensorBase):
         assert self._data.gait_mode is not None
         assert self._data.phase is not None
         assert self._data.swing_reference_pos_w is not None
+        assert self._data.swing_reference_vel_w is not None
+        assert self._data.swing_duration_s is not None
+        assert self._data.actual_swing_foot_vel_w is not None
         assert self._data.foot_contact is not None
         assert self._data.touchdown_xy_error is not None
         assert self._data.touchdown_z_error is not None
@@ -1912,6 +1943,8 @@ class FootholdPlanner(SensorBase):
             self._data.learned_foothold_route_initial_executable[
                 env_ids
             ] = False
+        if self._data.learned_foothold_route_outcome is not None:
+            self._data.learned_foothold_route_outcome[env_ids] = 0
         _clear_safe_target_event_buffers(self._data, env_ids)
 
         robot_body_poses_w = self._robot_body_physx_view.get_transforms().view(
@@ -2003,6 +2036,18 @@ class FootholdPlanner(SensorBase):
             6,
         )[env_ids]
         base_vel_w = robot_body_vels_w[:, self._base_body_id]
+        left_ankle_velocity_w = robot_body_vels_w[:, self._left_ankle_body_id]
+        right_ankle_velocity_w = robot_body_vels_w[:, self._right_ankle_body_id]
+        left_sole_velocity_w = self._sole_geometry.center_velocity_world(
+            left_ankle_velocity_w[:, :3],
+            left_ankle_velocity_w[:, 3:],
+            left_ankle_quat_w,
+        )
+        right_sole_velocity_w = self._sole_geometry.center_velocity_world(
+            right_ankle_velocity_w[:, :3],
+            right_ankle_velocity_w[:, 3:],
+            right_ankle_quat_w,
+        )
         base_quat = base_quat_w
         pelvis_z_world_z = 1.0 - 2.0 * (
             base_quat[:, 1].square() + base_quat[:, 2].square()
@@ -2164,7 +2209,10 @@ class FootholdPlanner(SensorBase):
         # gets a fresh analytic target in the new support frame.  Active
         # swings keep their locked target until the state machine reports the
         # failure; only HOLD/recovery planning is cleared here.
-        discard_pending_plan = (
+        assert self._data.planning_failure is not None
+        discard_pending_plan = self._data.planning_failure[
+            selected_env_ids
+        ].clone() | (
             (
                 (previous_gait_state.mode == GaitState.HOLD)
                 | (previous_gait_state.mode == GaitState.RECOVERY)
@@ -2232,13 +2280,15 @@ class FootholdPlanner(SensorBase):
         prepare_learned &= ~previous_gait_state.recovery_step_pending
         if self.cfg.enable_contact_adaptive_recovery:
             prepare_learned &= ~recovery_mode
-        # Once a fully executable proposal has been found, keep it through the
-        # rest of HOLD. Unsafe proposals are still recorded for PPO, but they
-        # are not eligible to start a swing and therefore trigger a fresh
-        # proposal while the robot remains in stable HOLD.
+        # Evaluate at most one learned action per HOLD transaction. An unsafe
+        # action keeps its single PPO penalty while routing falls back to the
+        # safe nominal target; ordinary control updates must not resample it.
         if self.cfg.enable_learned_foothold:
-            assert self._data.learned_foothold_evaluated is not None
+            assert (
+                self._data.learned_foothold_transaction_evaluated is not None
+            )
             assert self._data.learned_foothold_prepared_valid is not None
+            assert self._data.learned_foothold_prepared_w is not None
             assert self._data.learned_foothold_geometric_valid is not None
             assert self._data.learned_foothold_safety_valid is not None
             assert self._data.swing_preflight_ready is not None
@@ -2250,9 +2300,11 @@ class FootholdPlanner(SensorBase):
             )
             already_usable = learned_foothold_transaction_ready(
                 nominal_route_ready=nominal_route_ready,
-                learned_evaluated=self._data.learned_foothold_evaluated[
-                    selected_env_ids
-                ],
+                transaction_evaluated=(
+                    self._data.learned_foothold_transaction_evaluated[
+                        selected_env_ids
+                    ]
+                ),
                 learned_prepared_valid=self._data.learned_foothold_prepared_valid[
                     selected_env_ids
                 ],
@@ -2262,10 +2314,6 @@ class FootholdPlanner(SensorBase):
                 learned_safety_valid=self._data.learned_foothold_safety_valid[
                     selected_env_ids
                 ],
-                preflight_retry_required=(
-                    self._data.swing_preflight_ready[selected_env_ids]
-                    & ~self._data.swing_preflight_safe[selected_env_ids]
-                ),
             )
             prepare_learned &= ~already_usable
         if torch.any(prepare_learned).item():
@@ -2295,7 +2343,9 @@ class FootholdPlanner(SensorBase):
             assert self._data.nominal_foothold_prepared is not None
             assert self._data.nominal_geometric_valid is not None
             assert self._data.nominal_safety_valid is not None
-            assert self._data.learned_foothold_evaluated is not None
+            assert (
+                self._data.learned_foothold_transaction_evaluated is not None
+            )
             assert self._data.learned_foothold_prepared_valid is not None
             assert self._data.learned_foothold_geometric_valid is not None
             nominal_route_ready = (
@@ -2305,8 +2355,10 @@ class FootholdPlanner(SensorBase):
             )
             swing_ready = learned_foothold_swing_ready(
                 nominal_route_ready=nominal_route_ready,
-                learned_evaluated=(
-                    self._data.learned_foothold_evaluated[selected_env_ids]
+                transaction_evaluated=(
+                    self._data.learned_foothold_transaction_evaluated[
+                        selected_env_ids
+                    ]
                 ),
                 learned_prepared_valid=(
                     self._data.learned_foothold_prepared_valid[
@@ -2329,7 +2381,9 @@ class FootholdPlanner(SensorBase):
                 swing_ready &= ~recovery_mode
             plan_wait_expired = (
                 self._data.nominal_foothold_prepared[selected_env_ids]
-                & self._data.learned_foothold_evaluated[selected_env_ids]
+                & self._data.learned_foothold_transaction_evaluated[
+                    selected_env_ids
+                ]
                 & ~swing_ready
             )
 
@@ -2346,8 +2400,11 @@ class FootholdPlanner(SensorBase):
             assert self._data.nominal_foothold_w is not None
             assert self._data.nominal_frame_origin_w is not None
             assert self._data.nominal_frame_yaw_w is not None
-            assert self._data.learned_foothold_evaluated is not None
+            assert (
+                self._data.learned_foothold_transaction_evaluated is not None
+            )
             assert self._data.learned_foothold_prepared_valid is not None
+            assert self._data.learned_foothold_prepared_w is not None
             assert self._data.learned_foothold_geometric_valid is not None
             assert self._data.learned_foothold_safety_valid is not None
             assert self._data.learned_foothold_target_w is not None
@@ -2373,6 +2430,27 @@ class FootholdPlanner(SensorBase):
                 ),
                 recovery_step=previous_gait_state.recovery_step_pending,
             )
+            # Preserve a failed preflight through the reward step that owns
+            # the learned event. On the following HOLD update, discard only
+            # the cached trajectory result and preflight the safe nominal
+            # fallback without sampling another learned action.
+            retry_failed_preflight = (
+                preflight_window
+                & self._data.learned_foothold_transaction_evaluated[
+                    selected_env_ids
+                ]
+                & self._data.swing_preflight_ready[selected_env_ids]
+                & ~self._data.swing_preflight_safe[selected_env_ids]
+                & self._data.nominal_geometric_valid[selected_env_ids]
+                & self._data.nominal_safety_valid[selected_env_ids]
+            )
+            if torch.any(retry_failed_preflight).item():
+                retry_preflight_env_ids = selected_env_ids[
+                    retry_failed_preflight
+                ]
+                self._data.swing_preflight_ready[
+                    retry_preflight_env_ids
+                ] = False
             preflight_candidate = (
                 preflight_window
                 & preflight_route.executable
@@ -2380,10 +2458,18 @@ class FootholdPlanner(SensorBase):
             )
             if torch.any(preflight_candidate).item():
                 preflight_env_ids = selected_env_ids[preflight_candidate]
-                preflight_target_w = torch.where(
-                    preflight_route.use_learned[preflight_candidate].unsqueeze(-1),
-                    self._data.learned_foothold_target_w[preflight_env_ids],
-                    self._data.nominal_foothold_w[preflight_env_ids],
+                preflight_target_w = select_preflight_target_w(
+                    route_use_learned=(
+                        preflight_route.use_learned[preflight_candidate]
+                    ),
+                    learned_prepared_w=(
+                        self._data.learned_foothold_prepared_w[
+                            preflight_env_ids
+                        ]
+                    ),
+                    nominal_target_w=(
+                        self._data.nominal_foothold_w[preflight_env_ids]
+                    ),
                 )
                 preflight_start_w = self._data.actual_swing_foot_pos_w[
                     preflight_env_ids
@@ -2479,14 +2565,27 @@ class FootholdPlanner(SensorBase):
                 ] = preflight_start_escape_safe
                 failed_preflight = preflight_env_ids[~preflight_safe]
                 if failed_preflight.numel() > 0:
-                    # Force a fresh learned proposal on the next HOLD cycle;
-                    # do not turn a preflight failure into PLAN_INVALID or
-                    # start a swing with a known-bad trajectory.
+                    # Keep the learned action's single PPO outcome, but remove
+                    # it from execution routing. The persistent HOLD latch
+                    # prevents resampling; the next cycle preflights the safe
+                    # nominal fallback instead.
                     self._data.learned_foothold_prepared_valid[
                         failed_preflight
                     ] = False
-                plan_wait_expired = plan_wait_expired | (
-                    preflight_candidate & ~self._data.swing_preflight_safe[selected_env_ids]
+                failed_preflight_mask = (
+                    preflight_candidate
+                    & ~self._data.swing_preflight_safe[selected_env_ids]
+                )
+                learned_fallback_available = (
+                    failed_preflight_mask
+                    & preflight_route.use_learned
+                    & nominal_route_ready
+                )
+                failed_without_fallback = (
+                    failed_preflight_mask & ~learned_fallback_available
+                )
+                plan_wait_expired = (
+                    plan_wait_expired | failed_without_fallback
                 )
                 swing_ready = swing_ready & self._data.swing_preflight_safe[
                     selected_env_ids
@@ -2503,50 +2602,19 @@ class FootholdPlanner(SensorBase):
         event_response = None
         stabilization_ready = None
         late_search_exhausted = None
-        stable_now = torch.ones_like(swing_ready, dtype=torch.bool)
+        support_available = torch.any(confirmed_contact, dim=-1)
+        recovery_contact_stable = torch.all(confirmed_contact, dim=-1)
         if self.cfg.enable_contact_adaptive_recovery:
             assert self._stability_bounds is not None
             assert self._data.body_tilt_rad is not None
             assert self._data.body_angular_speed_rad_s is not None
             assert self._data.body_horizontal_speed_m_s is not None
             assert self._data.support_slip_m_s is not None
-            stability_signals = StabilitySignals(
-                confirmed_contact=confirmed_contact,
-                body_tilt_rad=self._data.body_tilt_rad[env_ids],
-                body_angular_speed_rad_s=(
-                    self._data.body_angular_speed_rad_s[env_ids]
-                ),
-                body_horizontal_speed_m_s=(
-                    self._data.body_horizontal_speed_m_s[env_ids]
-                ),
-                support_slip_m_s=self._data.support_slip_m_s[env_ids],
-            )
-            # Support-foot slip is logged separately, but is deliberately not
-            # a hard exit gate.  Its contact-transition spikes otherwise keep
-            # a physically stable policy in RECOVERY indefinitely.
-            stable_now = (
-                torch.any(confirmed_contact, dim=-1)
-                & (stability_signals.body_tilt_rad <= self._stability_bounds.max_tilt_rad)
-                & (
-                    stability_signals.body_angular_speed_rad_s
-                    <= self._stability_bounds.max_angular_speed_rad_s
-                )
-                & (
-                    stability_signals.body_horizontal_speed_m_s
-                    <= self._stability_bounds.max_horizontal_speed_m_s
-                )
-            )
-            previous_stability_elapsed = (
-                previous_gait_state.stabilization_elapsed_s
-                if previous_gait_state.stabilization_elapsed_s is not None
-                else torch.zeros_like(previous_gait_state.elapsed_s)
-            )
-            stabilization_ready, _ = stability_ready(
-                stability_signals,
-                self._stability_bounds,
-                previous_stability_elapsed,
-                self.cfg.control_dt_s,
-            )
+            # Each foot has already passed the existing contact-confirmation
+            # interval before appearing in ``confirmed_contact``.  Recovery is
+            # only a contact resynchronization phase, so do not impose a second
+            # dwell after both confirmed contacts are available.
+            stabilization_ready = recovery_contact_stable
             event = torch.full_like(
                 previous_gait_state.mode,
                 ContactEvent.NONE,
@@ -2585,7 +2653,7 @@ class FootholdPlanner(SensorBase):
             late_search_exhausted = late_elapsed >= self.cfg.overdue_s
             event_response = response_for_event(
                 event,
-                support_stable=stable_now,
+                support_stable=support_available,
                 late_search_available=~late_search_exhausted,
                 late_touchdown_confirmed=(
                     (previous_gait_state.mode == GaitState.OVERDUE)
@@ -2596,7 +2664,7 @@ class FootholdPlanner(SensorBase):
             event_response[previous_gait_state.mode == GaitState.RECOVERY] = (
                 EventResponse.STABILIZE
             )
-            planning_failure &= stable_now
+            planning_failure &= support_available
             self._data.event_response[env_ids] = event_response
             self._data.stabilization_ready[env_ids] = stabilization_ready
             self._data.planning_failure[env_ids] = planning_failure
@@ -2617,7 +2685,9 @@ class FootholdPlanner(SensorBase):
             plan_wait_expired=plan_wait_expired,
             event_response=event_response,
             stabilization_ready=stabilization_ready,
-            stability_current=stable_now,
+            # Keep the timer predicate identical to the readiness predicate:
+            # two confirmed contacts on every consecutive control step.
+            stability_current=recovery_contact_stable,
             late_search_exhausted=late_search_exhausted,
             planning_failure=planning_failure,
         )
@@ -2632,6 +2702,12 @@ class FootholdPlanner(SensorBase):
         )
         self._data.actual_stance_foot_pos_w[env_ids] = stance_sole_pos_w
         self._data.actual_swing_foot_pos_w[env_ids] = swing_sole_pos_w
+        swing_is_left = gait_state.swing_side == 0
+        self._data.actual_swing_foot_vel_w[env_ids] = torch.where(
+            swing_is_left[:, None],
+            left_sole_velocity_w,
+            right_sole_velocity_w,
+        )
         if self._data.stabilization_active is not None:
             self._data.stabilization_active[env_ids] = (
                 gait_state.mode == GaitState.RECOVERY
@@ -2886,6 +2962,13 @@ class FootholdPlanner(SensorBase):
                     self._data.learned_foothold_route_initial_executable
                     is not None
                 )
+                assert self._data.learned_foothold_route_outcome is not None
+                assert (
+                    self._data.learned_foothold_transaction_evaluated
+                    is not None
+                )
+                assert self._data.swing_preflight_ready is not None
+                assert self._data.swing_preflight_safe is not None
                 route = route_nominal_and_learned_footholds(
                     nominal_geometric_valid=(
                         self._data.nominal_geometric_valid[
@@ -2930,6 +3013,33 @@ class FootholdPlanner(SensorBase):
                 self._data.learned_foothold_route_initial_executable[
                     new_swing_env_ids
                 ] = route.executable
+                self._data.learned_foothold_route_outcome[
+                    new_swing_env_ids
+                ] = classify_learned_foothold_route(
+                    recovery_step=recovery_step.bool(),
+                    transaction_evaluated=(
+                        self._data.learned_foothold_transaction_evaluated[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    learned_geometric_valid=(
+                        self._data.learned_foothold_geometric_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    learned_safety_valid=(
+                        self._data.learned_foothold_safety_valid[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    preflight_ready=self._data.swing_preflight_ready[
+                        new_swing_env_ids
+                    ],
+                    preflight_safe=self._data.swing_preflight_safe[
+                        new_swing_env_ids
+                    ],
+                    route_use_learned=route.use_learned,
+                )
                 self._data.planner_valid[new_swing_env_ids] = (
                     route.executable
                 )
@@ -2995,10 +3105,6 @@ class FootholdPlanner(SensorBase):
                         radius_y=self._flat_provider_cfg.outer_radius_y,
                         max_step_height_m=(
                             self.cfg.max_foothold_step_height_m
-                        ),
-                        swing_side=new_swing_side,
-                        min_lateral_separation=(
-                            self._flat_provider_cfg.min_lateral_separation
                         ),
                     )
                 )
@@ -3452,6 +3558,34 @@ class FootholdPlanner(SensorBase):
                 new_swing_env_ids
             ] = new_clearance_start_escape_safe
 
+            # Route classification is finalized only after the frozen-frame
+            # lock, terrain query, and full swing clearance result are known.
+            # This prevents a route that was initially accepted from being
+            # reported as success when a later post-check invalidated it.
+            if self.cfg.enable_learned_foothold:
+                assert self._data.learned_foothold_route_outcome is not None
+                assert (
+                    self._data.learned_foothold_route_initial_executable
+                    is not None
+                )
+                final_route_valid = (
+                    self._data.planner_valid[new_swing_env_ids]
+                    & new_clearance_safe
+                )
+                self._data.learned_foothold_route_outcome[
+                    new_swing_env_ids
+                ] = finalize_learned_foothold_route_outcome(
+                    initial_outcome=self._data.learned_foothold_route_outcome[
+                        new_swing_env_ids
+                    ],
+                    route_initial_executable=(
+                        self._data.learned_foothold_route_initial_executable[
+                            new_swing_env_ids
+                        ]
+                    ),
+                    final_planner_valid=final_route_valid,
+                )
+
         default_apex_height = torch.full(
             (num_selected_envs,),
             self.cfg.swing_apex_height_m,
@@ -3600,8 +3734,10 @@ class FootholdPlanner(SensorBase):
 
         assert self._data.default_swing_reference_pos_w is not None
         assert self._data.swing_reference_pos_w is not None
+        assert self._data.swing_reference_vel_w is not None
         self._data.default_swing_reference_pos_w[env_ids] = default_swing_reference.position
         self._data.swing_reference_pos_w[env_ids] = swing_reference.position
+        self._data.swing_reference_vel_w[env_ids] = swing_reference.velocity
         self._data.default_swing_apex_height[env_ids] = default_apex_height
         self._data.swing_apex_height[env_ids] = apex_height
         self._data.swing_clearance_safe[env_ids] = clearance_safe

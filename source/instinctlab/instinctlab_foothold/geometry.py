@@ -45,6 +45,28 @@ class SoleGeometry:
         )
         return ankle_pos_w + center_offset_w
 
+    def center_velocity_world(
+        self,
+        ankle_linear_vel_w: torch.Tensor,
+        ankle_angular_vel_w: torch.Tensor,
+        ankle_quat_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the sole-center world velocity from rigid-body kinematics."""
+        center_offset_b = self.center_offset_b.to(
+            device=ankle_linear_vel_w.device,
+            dtype=ankle_linear_vel_w.dtype,
+        )
+        center_offset_b = center_offset_b.unsqueeze(0).expand_as(ankle_linear_vel_w)
+        center_offset_w = _rotate_vector_by_quaternion(
+            ankle_quat_w,
+            center_offset_b,
+        )
+        return ankle_linear_vel_w + torch.cross(
+            ankle_angular_vel_w,
+            center_offset_w,
+            dim=-1,
+        )
+
     def corners_world(
         self,
         ankle_pos_w: torch.Tensor,

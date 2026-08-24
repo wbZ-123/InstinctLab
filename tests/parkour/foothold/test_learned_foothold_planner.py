@@ -1,11 +1,22 @@
 import importlib.util
+import inspect
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import instinctlab_foothold.learned_target as learned_target
 
 from instinctlab_foothold.learned_target import (
+    LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID,
+    LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE,
+    LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID,
+    LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY,
+    LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+    LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED,
+    classify_learned_foothold_route,
+    finalize_learned_foothold_route_outcome,
     LearnedFootholdPreparation,
     clear_learned_foothold_buffers,
     decode_normalized_foothold,
@@ -20,6 +31,73 @@ from instinctlab_foothold.learned_target import (
     route_nominal_and_learned_footholds,
     store_learned_foothold_preparation,
 )
+
+
+def test_learned_route_reason_classifies_the_first_failed_gate():
+    reason = classify_learned_foothold_route(
+        recovery_step=torch.tensor([True, False, False, False, False, False]),
+        transaction_evaluated=torch.tensor(
+            [True, False, True, True, True, True]
+        ),
+        learned_geometric_valid=torch.tensor(
+            [True, True, False, True, True, True]
+        ),
+        learned_safety_valid=torch.tensor(
+            [True, True, True, False, True, True]
+        ),
+        preflight_ready=torch.tensor(
+            [True, True, True, True, True, True]
+        ),
+        preflight_safe=torch.tensor(
+            [True, True, True, True, False, True]
+        ),
+        route_use_learned=torch.tensor(
+            [False, False, False, False, False, True]
+        ),
+    )
+
+    assert reason.tolist() == [
+        LEARNED_FOOTHOLD_ROUTE_REASON_RECOVERY,
+        LEARNED_FOOTHOLD_ROUTE_REASON_TRANSACTION_INVALIDATED,
+        LEARNED_FOOTHOLD_ROUTE_REASON_GEOMETRIC_INVALID,
+        LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+        LEARNED_FOOTHOLD_ROUTE_REASON_PREFLIGHT_UNSAFE,
+        LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+    ]
+
+
+def test_learned_route_reason_is_reclassified_after_final_lock_check():
+    outcome = finalize_learned_foothold_route_outcome(
+        initial_outcome=torch.tensor([
+            LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+            LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+            LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+        ]),
+        route_initial_executable=torch.tensor([True, True, False]),
+        final_planner_valid=torch.tensor([True, False, False]),
+    )
+    assert outcome.tolist() == [
+        LEARNED_FOOTHOLD_ROUTE_REASON_SUCCESS,
+        LEARNED_FOOTHOLD_ROUTE_REASON_POSTCHECK_INVALID,
+        LEARNED_FOOTHOLD_ROUTE_REASON_ENDPOINT_UNSAFE,
+    ]
+
+
+def test_hold_preflight_uses_prepared_learned_target_before_swing_lock():
+    target = learned_target.select_preflight_target_w(
+        route_use_learned=torch.tensor([True, False]),
+        learned_prepared_w=torch.tensor(
+            [[1.0, 2.0, 0.3], [3.0, 4.0, 0.5]]
+        ),
+        nominal_target_w=torch.tensor(
+            [[10.0, 20.0, 0.3], [30.0, 40.0, 0.5]]
+        ),
+    )
+
+    torch.testing.assert_close(
+        target,
+        torch.tensor([[1.0, 2.0, 0.3], [30.0, 40.0, 0.5]]),
+    )
 
 
 def test_nominal_foothold_waits_for_confirmed_hold_contact():
@@ -44,18 +122,18 @@ def test_reachable_ellipse_usage_reports_lateral_overflow():
 def test_safe_nominal_locks_one_unsafe_learned_proposal_for_the_hold_transaction():
     ready = learned_foothold_transaction_ready(
         nominal_route_ready=torch.tensor([True, True, False]),
-        learned_evaluated=torch.tensor([True, True, True]),
+        transaction_evaluated=torch.tensor([True, True, True]),
         learned_prepared_valid=torch.tensor([True, True, True]),
         learned_geometric_valid=torch.tensor([True, True, True]),
         learned_safety_valid=torch.tensor([False, True, False]),
-        preflight_retry_required=torch.tensor([False, True, False]),
     )
 
     # First row keeps the unsafe action's PPO penalty but uses the safe
     # nominal instead of replacing the action again in the same HOLD.
-    # The second row had its *trajectory* rejected, so it must re-propose
-    # even though a safe nominal endpoint exists.
-    assert ready.tolist() == [True, False, False]
+    # A safe learned endpoint also completes the proposal transaction.  A
+    # trajectory failure later falls back to nominal without resampling the
+    # high-level action.
+    assert ready.tolist() == [True, True, False]
 
 
 def _load_foothold_planner_data_class():
@@ -261,6 +339,88 @@ def test_preflight_is_cached_until_a_new_hold_proposal_replaces_it():
     assert "self._data.swing_preflight_ready[prepare_env_ids] = False" in preparation_block
 
 
+def test_reward_event_pulse_and_hold_transaction_latch_are_not_reused():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    update_prefix = planner_text[
+        planner_text.index("self._data.planner_valid[env_ids] = True") :
+        planner_text.index("_clear_safe_target_event_buffers", planner_text.index(
+            "self._data.planner_valid[env_ids] = True"
+        ))
+    ]
+    assert "self._data.learned_foothold_evaluated[env_ids] = False" in update_prefix
+    assert "learned_foothold_transaction_evaluated" not in update_prefix
+
+    hold_block = planner_text[
+        planner_text.index("prepare_learned, _ = learned_foothold_event_masks(") :
+        planner_text.index("# Preflight the complete swing transaction")
+    ]
+    assert "learned_foothold_transaction_evaluated" in hold_block
+    assert (
+        "learned_evaluated=self._data.learned_foothold_evaluated"
+        not in hold_block
+    )
+
+
+def test_failed_learned_preflight_is_visible_for_one_reward_cycle():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    failed_block = planner_text[
+        planner_text.index("failed_preflight = preflight_env_ids") :
+        planner_text.index("failed_preflight_mask = (", planner_text.index(
+            "failed_preflight = preflight_env_ids"
+        ))
+    ]
+    assert (
+        "self._data.learned_foothold_prepared_valid["
+        in failed_block
+    )
+    assert "swing_preflight_ready[failed_preflight] = False" not in failed_block
+
+
+def test_failed_preflight_switches_to_nominal_on_the_next_hold_update():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    preflight_block = planner_text[
+        planner_text.index("# Preflight the complete swing transaction") :
+        planner_text.index("preflight_candidate = (")
+    ]
+    assert "retry_failed_preflight" in preflight_block
+    assert (
+        "self._data.swing_preflight_ready[\n"
+        "                    retry_preflight_env_ids\n"
+        "                ] = False"
+        in preflight_block
+    )
+
+
+def test_failed_learned_preflight_does_not_fail_while_nominal_fallback_exists():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    result_block = planner_text[
+        planner_text.index("failed_preflight = preflight_env_ids") :
+        planner_text.index("swing_ready = swing_ready", planner_text.index(
+            "failed_preflight = preflight_env_ids"
+        ))
+    ]
+    assert "learned_fallback_available" in result_block
+    assert "failed_without_fallback" in result_block
+    assert "& ~learned_fallback_available" in result_block
+
+
+def test_explicit_planning_failure_discards_transaction_on_next_update():
+    planner_text = _planner_source_path("foothold_planner.py").read_text()
+    discard_block = planner_text[
+        planner_text.index("discard_pending_plan =") :
+        planner_text.index("nominal_ready_before_update =", planner_text.index(
+            "discard_pending_plan ="
+        ))
+    ]
+    assert (
+        "self._data.planning_failure[\n"
+        "            selected_env_ids\n"
+        "        ].clone()"
+        in discard_block
+    )
+    assert "clear_learned_foothold_buffers" in discard_block
+
+
 def test_planner_data_declares_prepared_and_locked_learned_target_buffers():
     data_class = _load_foothold_planner_data_class()
     field_names = {field.name for field in fields(data_class)}
@@ -280,10 +440,12 @@ def test_planner_data_declares_prepared_and_locked_learned_target_buffers():
         "learned_foothold_geometric_valid",
         "learned_foothold_safety_valid",
         "learned_foothold_evaluated",
+        "learned_foothold_transaction_evaluated",
         "learned_foothold_route_event",
         "learned_foothold_route_use_nominal",
         "learned_foothold_route_use_learned",
         "learned_foothold_route_initial_executable",
+        "learned_foothold_route_outcome",
         "learned_foothold_safety_score",
         "learned_foothold_penetrating_point_count",
         "learned_foothold_penetrating_point_ratio",
@@ -317,6 +479,9 @@ def test_clear_learned_foothold_buffers_resets_selected_environments_only():
         learned_foothold_geometric_valid=torch.ones(3, dtype=torch.bool),
         learned_foothold_safety_valid=torch.ones(3, dtype=torch.bool),
         learned_foothold_evaluated=torch.ones(3, dtype=torch.bool),
+        learned_foothold_transaction_evaluated=torch.ones(
+            3, dtype=torch.bool
+        ),
         learned_foothold_event_generation=torch.tensor(
             [7, 11, 13],
             dtype=torch.int64,
@@ -326,6 +491,9 @@ def test_clear_learned_foothold_buffers_resets_selected_environments_only():
         learned_foothold_route_use_learned=torch.ones(3, dtype=torch.bool),
         learned_foothold_route_initial_executable=torch.ones(
             3, dtype=torch.bool
+        ),
+        learned_foothold_route_outcome=torch.full(
+            (3,), 5, dtype=torch.long
         ),
         learned_foothold_safety_score=torch.ones(3),
         learned_foothold_penetrating_point_count=torch.ones(3),
@@ -365,12 +533,14 @@ def test_clear_learned_foothold_buffers_resets_selected_environments_only():
         "learned_foothold_geometric_valid",
         "learned_foothold_safety_valid",
         "learned_foothold_evaluated",
+        "learned_foothold_transaction_evaluated",
         "learned_foothold_route_event",
         "learned_foothold_route_use_nominal",
         "learned_foothold_route_use_learned",
         "learned_foothold_route_initial_executable",
     ):
         assert getattr(data, name).tolist() == [False, True, False]
+    assert data.learned_foothold_route_outcome.tolist() == [0, 5, 0]
 
 
 def test_decode_normalized_foothold_preserves_points_inside_unit_disk():
@@ -465,10 +635,10 @@ def test_normal_route_falls_back_to_safe_nominal_when_learned_is_unavailable():
     assert route.executable.tolist() == [True, True, False]
 
 
-def test_normal_swing_waits_for_learned_evaluation_before_using_safe_nominal():
+def test_normal_swing_waits_for_transaction_evaluation_before_safe_nominal():
     ready = learned_foothold_swing_ready(
         nominal_route_ready=torch.tensor([True, True, False]),
-        learned_evaluated=torch.tensor([False, True, True]),
+        transaction_evaluated=torch.tensor([False, True, True]),
         learned_prepared_valid=torch.tensor([False, False, True]),
         learned_geometric_valid=torch.tensor([False, False, True]),
         learned_safety_valid=torch.tensor([False, False, True]),
@@ -478,10 +648,10 @@ def test_normal_swing_waits_for_learned_evaluation_before_using_safe_nominal():
     assert ready.tolist() == [False, True, True]
 
 
-def test_safe_learned_proposal_remains_swing_ready_after_event_flag_clears():
+def test_safe_learned_proposal_remains_swing_ready_after_event_pulse_clears():
     ready = learned_foothold_swing_ready(
         nominal_route_ready=torch.tensor([False]),
-        learned_evaluated=torch.tensor([False]),
+        transaction_evaluated=torch.tensor([True]),
         learned_prepared_valid=torch.tensor([True]),
         learned_geometric_valid=torch.tensor([True]),
         learned_safety_valid=torch.tensor([True]),
@@ -494,7 +664,7 @@ def test_safe_learned_proposal_remains_swing_ready_after_event_flag_clears():
 def test_recovery_swing_does_not_wait_for_or_use_learned_evaluation():
     ready = learned_foothold_swing_ready(
         nominal_route_ready=torch.tensor([True, False]),
-        learned_evaluated=torch.tensor([False, True]),
+        transaction_evaluated=torch.tensor([False, True]),
         learned_prepared_valid=torch.tensor([False, True]),
         learned_geometric_valid=torch.tensor([False, True]),
         learned_safety_valid=torch.tensor([False, True]),
@@ -620,7 +790,7 @@ def test_cached_world_target_is_rejected_after_support_frame_drift_makes_it_unre
     assert geometric_valid.tolist() == [False]
 
 
-def test_learned_target_rejects_crossed_or_too_narrow_swing_side():
+def test_learned_target_does_not_use_an_uncalibrated_lateral_hard_gate():
     def terrain_query(points_xy_w):
         return torch.zeros(points_xy_w.shape[0]), torch.ones(
             points_xy_w.shape[0], dtype=torch.bool
@@ -634,14 +804,26 @@ def test_learned_target_rejects_crossed_or_too_narrow_swing_side():
         radius_y=0.25,
         max_step_height_m=0.25,
         terrain_height_query_w=terrain_query,
-        swing_side=torch.tensor([0, 1]),
-        min_lateral_separation=0.06,
     )
 
-    assert result.geometric_valid.tolist() == [False, False]
+    assert result.geometric_valid.tolist() == [True, True]
 
 
-def test_cached_world_target_rechecks_swing_side_after_frame_reframing():
+def test_learned_target_geometry_api_has_no_uncalibrated_lateral_gate():
+    preparation_params = inspect.signature(
+        prepare_learned_foothold_target
+    ).parameters
+    reframe_params = inspect.signature(
+        reframe_cached_world_foothold
+    ).parameters
+
+    assert "swing_side" not in preparation_params
+    assert "min_lateral_separation" not in preparation_params
+    assert "swing_side" not in reframe_params
+    assert "min_lateral_separation" not in reframe_params
+
+
+def test_cached_world_target_rechecks_geometry_without_lateral_hard_gate():
     _, geometric_valid = reframe_cached_world_foothold(
         target_w=torch.tensor([[0.20, -0.08, 0.0]]),
         current_origin_w=torch.zeros(1, 3),
@@ -649,11 +831,9 @@ def test_cached_world_target_rechecks_swing_side_after_frame_reframing():
         radius_x=0.42,
         radius_y=0.25,
         max_step_height_m=0.25,
-        swing_side=torch.tensor([0]),
-        min_lateral_separation=0.06,
     )
 
-    assert geometric_valid.tolist() == [False]
+    assert geometric_valid.tolist() == [True]
 
 
 def test_soft_unsafe_target_is_recorded_for_learning_but_not_locked():
@@ -670,6 +850,9 @@ def test_soft_unsafe_target_is_recorded_for_learning_but_not_locked():
         learned_foothold_geometric_valid=torch.zeros(2, dtype=torch.bool),
         learned_foothold_safety_valid=torch.zeros(2, dtype=torch.bool),
         learned_foothold_evaluated=torch.zeros(2, dtype=torch.bool),
+        learned_foothold_transaction_evaluated=torch.zeros(
+            2, dtype=torch.bool
+        ),
         learned_foothold_safety_score=torch.zeros(2),
         learned_foothold_penetrating_point_count=torch.zeros(2),
         learned_foothold_penetrating_point_ratio=torch.zeros(2),
@@ -700,6 +883,8 @@ def test_soft_unsafe_target_is_recorded_for_learning_but_not_locked():
     )
 
     assert used.tolist() == [True, False]
+    assert data.learned_foothold_evaluated.tolist() == [True, True]
+    assert data.learned_foothold_transaction_evaluated.tolist() == [True, True]
     assert data.learned_foothold_prepared_valid.tolist() == [True, True]
     assert data.learned_foothold_locked.tolist() == [True, False]
     assert data.learned_foothold_used.tolist() == [True, False]

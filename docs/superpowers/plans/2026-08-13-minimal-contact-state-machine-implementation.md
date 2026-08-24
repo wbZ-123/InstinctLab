@@ -21,9 +21,11 @@ RECOVERY is reserved for physical instability or loss of all usable support.
    late-touchdown search through HOLD/temporary events; only unstable early
    contact, unrecoverable support loss, or exhausted late-contact search may
    enter RECOVERY.
-2. Recovery rewards: add project-local wrappers for task/progress rewards so
-   they return zero while recovery is active, while preserving stability,
-   smoothness, energy, alive, and termination terms.
+2. Recovery rewards: keep normal command-tracking/progress rewards active so
+   the motor policy retains the walking direction during recovery.  Pause
+   only planner-dependent terms (including feet-air-time, which otherwise
+   pushes toward single support) while preserving stability, smoothness,
+   energy, alive, and termination terms.
 3. Regression tests: cover planning retry without Recovery, late-contact
    search, recovery exit dwell, and recovery reward masking.
 4. Run targeted state-machine/reward tests, then the complete foothold suite
@@ -32,7 +34,8 @@ RECOVERY is reserved for physical instability or loss of all usable support.
 ## Acceptance criteria
 
 - A failed foothold proposal cannot create a long-lived RECOVERY state.
-- RECOVERY cannot exit without confirmed contact and 0.04 s continuous
-  stability.
-- A recovery episode does not receive velocity/heading/progress pressure.
+- RECOVERY cannot exit without both feet confirmed and 0.04 s continuous
+  contact dwell.
+- A recovery episode keeps velocity/heading/progress pressure, but does not
+  receive planner-dependent foothold pressure.
 - Existing observation/checkpoint compatibility tests remain green.

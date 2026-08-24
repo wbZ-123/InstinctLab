@@ -5,6 +5,7 @@ import torch
 
 FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH = 100.0
 FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH = 700.0
+FOOTHOLD_NOMINAL_DEVIATION_TOLERANCE_M = 0.02
 
 
 def _foothold_planner_data(env, sensor_name: str):
@@ -46,11 +47,12 @@ def _mask_stabilization_reward(value: torch.Tensor, data) -> torch.Tensor:
 
 
 def mask_recovery_reward(value: torch.Tensor, data) -> torch.Tensor:
-    """Pause task-pressure rewards while the motor policy self-stabilizes.
+    """Pause a planner-specific reward while the motor policy self-stabilizes.
 
     This is deliberately a project-local wrapper.  The upstream locomotion
-    reward functions remain unchanged; only their contribution is suppressed
-    for environments whose foothold sensor reports autonomous RECOVERY.
+    reward functions remain unchanged.  Only terms that explicitly opt into
+    this wrapper are suppressed for environments whose foothold sensor reports
+    autonomous RECOVERY; the normal command-tracking terms stay active.
     """
 
     return _mask_stabilization_reward(value, data)
@@ -256,6 +258,74 @@ def learned_foothold_safety_event_reward(
     )
 
 
+def _normalized_nominal_deviation_cost(
+    delta_xy: torch.Tensor,
+    *,
+    reachability_radius_x: float,
+    reachability_radius_y: float,
+) -> torch.Tensor:
+    """Return the bounded cost corresponding to nominal-distance reward."""
+
+    return (
+        1.0
+        - _nominal_deviation_reward(
+            delta_xy,
+            reachability_radius_x=reachability_radius_x,
+            reachability_radius_y=reachability_radius_y,
+        )
+    ).clamp(0.0, 2.0) / 2.0
+
+
+def _nominal_deviation_reward(
+    delta_xy: torch.Tensor,
+    *,
+    reachability_radius_x: float,
+    reachability_radius_y: float,
+    tolerance_m: float = FOOTHOLD_NOMINAL_DEVIATION_TOLERANCE_M,
+) -> torch.Tensor:
+    """Score nominal deviation with a 2 cm deadband and a +1 match bonus."""
+
+    if delta_xy.shape[-1] != 2:
+        raise ValueError("delta_xy must have two coordinates.")
+    if (
+        reachability_radius_x <= 0.0
+        or reachability_radius_y <= 0.0
+        or tolerance_m < 0.0
+    ):
+        raise ValueError(
+            "reachability radii must be positive and tolerance non-negative."
+        )
+    radii = delta_xy.new_tensor(
+        (reachability_radius_x, reachability_radius_y)
+    )
+    distance_m = torch.linalg.vector_norm(delta_xy, dim=-1)
+    safe_distance = distance_m.clamp_min(torch.finfo(delta_xy.dtype).eps)
+    direction = delta_xy / safe_distance.unsqueeze(-1)
+    directional_radius = 1.0 / torch.sqrt(
+        (direction / radii).square().sum(dim=-1)
+    )
+    directional_radius = torch.where(
+        distance_m > 0.0,
+        directional_radius,
+        torch.full_like(
+            directional_radius,
+            min(reachability_radius_x, reachability_radius_y),
+        ),
+    )
+    tolerance = delta_xy.new_tensor(tolerance_m)
+    inside_tolerance = distance_m <= tolerance
+    positive = 1.0 - distance_m / tolerance.clamp_min(
+        torch.finfo(delta_xy.dtype).eps
+    )
+    negative = -(
+        (distance_m - tolerance)
+        / (directional_radius - tolerance).clamp_min(
+            torch.finfo(delta_xy.dtype).eps
+        )
+    ).clamp(0.0, 1.0)
+    return torch.where(inside_tolerance, positive, negative).clamp(-1.0, 1.0)
+
+
 def learned_foothold_planning_event_reward(
     env,
     sensor_name: str = "foothold_planner",
@@ -286,14 +356,35 @@ def learned_foothold_planning_event_reward(
         data.learned_foothold_decoded_f[:, :2]
         - data.raw_unclipped_foothold_f[:, :2]
     )
-    radii = delta_xy.new_tensor(
-        (reachability_radius_x, reachability_radius_y)
+    nominal_deviation_reward = _nominal_deviation_reward(
+        delta_xy,
+        reachability_radius_x=reachability_radius_x,
+        reachability_radius_y=reachability_radius_y,
     )
-    normalized_distance = torch.linalg.vector_norm(
-        delta_xy / radii,
-        dim=-1,
-    ).clamp(0.0, 1.0)
-    nominal_closeness = 1.0 - 2.0 * normalized_distance
+    nominal_deviation_cost = ((1.0 - nominal_deviation_reward) / 2.0).clamp(
+        0.0,
+        1.0,
+    )
+
+    runtime_lookahead_s = getattr(data, "velocity_lookahead_s", None)
+    if runtime_lookahead_s is None:
+        lookahead_s = torch.full_like(
+            data.nominal_feasible_velocity_f[:, 0],
+            velocity_lookahead_s,
+        )
+    else:
+        lookahead_s = runtime_lookahead_s.to(
+            device=delta_xy.device,
+            dtype=delta_xy.dtype,
+        )
+        if lookahead_s.shape != delta_xy.shape[:-1]:
+            raise ValueError("velocity_lookahead_s data must match the batch.")
+        fallback = torch.full_like(lookahead_s, velocity_lookahead_s)
+        lookahead_s = torch.where(
+            torch.isfinite(lookahead_s) & (lookahead_s > 0.0),
+            lookahead_s,
+            fallback,
+        )
 
     side_sign = torch.where(
         data.swing_side == 0,
@@ -302,12 +393,12 @@ def learned_foothold_planning_event_reward(
     )
     learned_velocity = torch.stack(
         (
-            data.learned_foothold_decoded_f[:, 0] / velocity_lookahead_s,
+            data.learned_foothold_decoded_f[:, 0] / lookahead_s,
             (
                 data.learned_foothold_decoded_f[:, 1]
                 - side_sign * nominal_step_width_m
             )
-            / velocity_lookahead_s,
+            / lookahead_s,
         ),
         dim=-1,
     )
@@ -319,7 +410,6 @@ def learned_foothold_planning_event_reward(
         dim=-1,
     )
     command_consistency = torch.exp(-command_error / velocity_std**2)
-    safe_score = nominal_closeness.clamp(0.0, 1.0) * command_consistency
 
     learned_safety = data.learned_foothold_safety_score.clamp(
         -1.0,
@@ -341,17 +431,33 @@ def learned_foothold_planning_event_reward(
         torch.ones_like(event),
     ).bool()
     execution_safe = ~preflight_known | preflight_safe
+    learned_geometry_valid = data.learned_foothold_geometric_valid.bool()
+    learned_safety_valid = data.learned_foothold_safety_valid.bool()
+    nominal_safe = (
+        data.nominal_geometric_valid.bool()
+        & data.nominal_safety_valid.bool()
+    )
+    safe_learned_score = torch.where(
+        nominal_safe,
+        nominal_deviation_reward,
+        # For an unsafe nominal target, safety has priority over closeness.
+        # The multiplicative form keeps every safe correction non-negative,
+        # while still preferring command-consistent corrections near the
+        # nominal intent.  A stationary safe point receives nearly zero from
+        # command_consistency, and cannot outrank a useful forward step.
+        command_consistency * (1.0 - nominal_deviation_cost),
+    )
     score = torch.where(
-        (
-            data.learned_foothold_safety_valid.bool()
-            & data.learned_foothold_geometric_valid.bool()
-            & execution_safe
-        ),
-        safe_score,
+        ~execution_safe,
+        torch.full_like(learned_safety, -1.0),
         torch.where(
-            execution_safe,
-            learned_safety,
-            torch.full_like(learned_safety, -2.0),
+            ~learned_geometry_valid,
+            torch.full_like(learned_safety, -1.0),
+            torch.where(
+                learned_safety_valid,
+                safe_learned_score,
+                learned_safety,
+            ),
         ),
     )
     return _mask_stabilization_reward(
@@ -636,7 +742,7 @@ def foothold_swing_tracking_exp(
     env,
     sensor_name: str = "foothold_planner",
     command_name: str | None = "base_velocity",
-    std: float = 0.15,
+    std: float = 0.05,
     curriculum_start_scale: float = 1.0,
     curriculum_end_scale: float = 1.0,
     curriculum_ramp_steps: int = 0,
@@ -656,6 +762,64 @@ def foothold_swing_tracking_exp(
     position_error = data.actual_swing_foot_pos_w - data.swing_reference_pos_w
     squared_error = torch.sum(torch.square(position_error), dim=-1)
     reward = torch.exp(-squared_error / (std * std))
+
+    return _apply_reward_curriculum(
+        _mask_stabilization_reward(
+            reward * _is_valid_swing_mode(data).float(),
+            data,
+        ),
+        env,
+        curriculum_start_scale,
+        curriculum_end_scale,
+        curriculum_ramp_steps,
+        curriculum_gate,
+        curriculum_min_episode_length,
+        curriculum_full_episode_length,
+        curriculum_velocity_command_name,
+        curriculum_velocity_std,
+        curriculum_velocity_start_score,
+        curriculum_velocity_full_score,
+        curriculum_asset_name,
+        sensor_name,
+    )
+
+
+def foothold_swing_velocity_tracking_exp(
+    env,
+    sensor_name: str = "foothold_planner",
+    command_name: str | None = "base_velocity",
+    std: float = 0.05,
+    curriculum_start_scale: float = 1.0,
+    curriculum_end_scale: float = 1.0,
+    curriculum_ramp_steps: int = 0,
+    curriculum_gate: str | None = None,
+    curriculum_min_episode_length: float = FOOTHOLD_CURRICULUM_MIN_EPISODE_LENGTH,
+    curriculum_full_episode_length: float = FOOTHOLD_CURRICULUM_FULL_EPISODE_LENGTH,
+    curriculum_velocity_command_name: str = "base_velocity",
+    curriculum_velocity_std: float = 0.5,
+    curriculum_velocity_start_score: float = 0.4,
+    curriculum_velocity_full_score: float = 0.7,
+    curriculum_asset_name: str = "robot",
+):
+    """Track the analytic swing velocity using position-equivalent error.
+
+    Multiplying velocity error by the locked swing duration converts it to the
+    position error it would accumulate over one swing.  This reuses the same
+    five-centimeter bandwidth as position tracking without introducing a
+    separate, arbitrary velocity threshold.
+    """
+    _sync_desired_velocity_command(env, sensor_name, command_name)
+    data = _foothold_planner_data(env, sensor_name)
+    velocity_error = (
+        data.actual_swing_foot_vel_w - data.swing_reference_vel_w
+    )
+    equivalent_position_error = torch.linalg.vector_norm(
+        velocity_error,
+        dim=-1,
+    ) * data.swing_duration_s
+    reward = torch.exp(
+        -torch.square(equivalent_position_error) / (std * std)
+    )
 
     return _apply_reward_curriculum(
         _mask_stabilization_reward(

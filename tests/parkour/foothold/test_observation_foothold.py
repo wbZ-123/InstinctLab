@@ -103,6 +103,7 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
         swing_apex_height=torch.tensor([0.14, 0.08]),
         swing_clearance_safe=torch.tensor([False, True]),
         swing_clearance_penetration=torch.tensor([0.02, 0.00]),
+        nominal_frame_yaw_w=torch.tensor([0.0, 0.0]),
     )
     command = torch.tensor(
         [
@@ -113,11 +114,7 @@ def test_foothold_planner_observation_exposes_target_velocity_phase_and_side():
     planner = _FakePlanner(planner_data)
     env = SimpleNamespace(
         command_manager=_FakeCommandManager(command),
-        scene=SimpleNamespace(
-            sensors={
-                "foothold_planner": planner,
-            }
-        ),
+        scene=SimpleNamespace(sensors={"foothold_planner": planner}),
     )
 
     observation = foothold.foothold_planner_observation(env)
@@ -169,6 +166,7 @@ def test_nominal_foothold_observation_syncs_command_before_sensor_read():
         swing_apex_height=torch.tensor([0.08]),
         swing_clearance_safe=torch.tensor([True]),
         swing_clearance_penetration=torch.tensor([0.0]),
+        nominal_frame_yaw_w=torch.tensor([0.0]),
     )
     command = torch.tensor([[0.50, 0.00, 0.00]])
     planner = _FakePlanner(planner_data)
@@ -186,4 +184,51 @@ def test_nominal_foothold_observation_syncs_command_before_sensor_read():
     torch.testing.assert_close(
         nominal_observation,
         planner_data.raw_unclipped_foothold_f,
+    )
+
+
+def test_foothold_planner_observation_rotates_world_errors_into_planner_frame():
+    foothold = _load_foothold_observation_module()
+
+    planner_data = SimpleNamespace(
+        target_foothold_f=torch.tensor([[0.30, 0.10, 0.02]]),
+        feasible_velocity_f=torch.tensor([[0.50, 0.00, 0.00]]),
+        phase=torch.tensor([0.25]),
+        swing_side=torch.tensor([0]),
+        # World-frame errors: reference is +Y, target is -Y.
+        target_foothold_w=torch.tensor([[0.00, -0.30, 0.05]]),
+        swing_reference_pos_w=torch.tensor([[0.00, 0.20, 0.00]]),
+        actual_swing_foot_pos_w=torch.zeros((1, 3)),
+        foot_contact=torch.tensor([[True, False]]),
+        swing_has_lifted=torch.tensor([True]),
+        recovery_step_active=torch.tensor([False]),
+        stabilization_active=torch.tensor([False]),
+        default_swing_apex_height=torch.tensor([0.08]),
+        swing_apex_height=torch.tensor([0.08]),
+        swing_clearance_safe=torch.tensor([True]),
+        swing_clearance_penetration=torch.tensor([0.00]),
+        nominal_frame_yaw_w=torch.tensor([torch.pi / 2.0]),
+    )
+    command = torch.tensor([[0.50, 0.00, 0.00]])
+    planner = _FakePlanner(planner_data)
+    env = SimpleNamespace(
+        command_manager=_FakeCommandManager(command),
+        scene=SimpleNamespace(sensors={"foothold_planner": planner}),
+    )
+
+    observation = foothold.foothold_planner_observation(env)
+
+    # A +90-degree frozen support-frame yaw maps world +Y to frame +X and
+    # world -Y to frame -X.
+    torch.testing.assert_close(
+        observation[:, 12:15],
+        torch.tensor([[0.20, 0.00, 0.00]]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        observation[:, 15:18],
+        torch.tensor([[-0.30, 0.00, 0.05]]),
+        atol=1e-6,
+        rtol=1e-6,
     )
