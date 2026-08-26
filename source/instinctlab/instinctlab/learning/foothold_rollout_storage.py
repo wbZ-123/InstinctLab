@@ -13,11 +13,18 @@ class FootholdTransition(RolloutStorage.Transition):
     def __init__(self):
         super().__init__()
         self.foothold_action_event: torch.Tensor | None = None
+        self.foothold_nominal_safe_event: torch.Tensor | None = None
+        self.foothold_nominal_unsafe_event: torch.Tensor | None = None
 
 
 FootholdMiniBatch = namedtuple(
     "FootholdMiniBatch",
-    [*RolloutStorage.MiniBatch._fields, "foothold_action_event"],
+    [
+        *RolloutStorage.MiniBatch._fields,
+        "foothold_action_event",
+        "foothold_nominal_safe_event",
+        "foothold_nominal_unsafe_event",
+    ],
 )
 
 
@@ -52,6 +59,18 @@ class FootholdRolloutStorage(RolloutStorage):
             dtype=torch.bool,
             device=self.device,
         )
+        self.foothold_nominal_safe_event = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.foothold_nominal_unsafe_event = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
     def add_transitions(self, transition: FootholdTransition):
         event = transition.foothold_action_event
@@ -65,9 +84,46 @@ class FootholdRolloutStorage(RolloutStorage):
                 f"({self.num_envs},), got {tuple(event.shape)}."
             )
 
+        branch_masks = (
+            (
+                "nominal safe",
+                transition.foothold_nominal_safe_event,
+            ),
+            (
+                "nominal unsafe",
+                transition.foothold_nominal_unsafe_event,
+            ),
+        )
+        for name, branch in branch_masks:
+            if branch is None:
+                raise ValueError(
+                    f"Foothold {name} event mask is required."
+                )
+            if branch.dtype != torch.bool:
+                raise TypeError(
+                    f"Foothold {name} event mask must use torch.bool."
+                )
+            if branch.shape != (self.num_envs,):
+                raise ValueError(
+                    f"Foothold {name} event mask must have shape "
+                    f"({self.num_envs},), got {tuple(branch.shape)}."
+                )
+        safe_event = transition.foothold_nominal_safe_event
+        unsafe_event = transition.foothold_nominal_unsafe_event
+        if torch.any(safe_event & unsafe_event).item():
+            raise ValueError(
+                "Foothold nominal safe and nominal unsafe event masks overlap."
+            )
+        if not torch.equal(safe_event | unsafe_event, event):
+            raise ValueError(
+                "Foothold nominal branch event mask union must equal event."
+            )
+
         step = self.step
         super().add_transitions(transition)
         self.foothold_action_event[step].copy_(event)
+        self.foothold_nominal_safe_event[step].copy_(safe_event)
+        self.foothold_nominal_unsafe_event[step].copy_(unsafe_event)
 
     def compute_returns(self, last_values, gamma, lam):
         """Compute GAE and normalize each reward advantage independently."""
@@ -113,4 +169,6 @@ class FootholdRolloutStorage(RolloutStorage):
             prev_done_mask,
         )
         event_batch = self.foothold_action_event[T_select, B_select]
-        return self.MiniBatch(*minibatch, event_batch)
+        safe_batch = self.foothold_nominal_safe_event[T_select, B_select]
+        unsafe_batch = self.foothold_nominal_unsafe_event[T_select, B_select]
+        return self.MiniBatch(*minibatch, event_batch, safe_batch, unsafe_batch)

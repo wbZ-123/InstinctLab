@@ -70,9 +70,9 @@ class FootholdPlannerCfg(SensorBaseCfg):
     target_terrain_raycast_start_height_m: float = 20.0
     target_terrain_raycast_max_dist_m: float = 40.0
     target_terrain_height_offset_m: float = 0.0
-    # Ordinary parkour stair height range tops out at 0.23 m; 0.25 m keeps a
-    # small tolerance while preventing one swing from spanning multiple steps.
-    max_foothold_step_height_m: float = 0.25
+    # Ordinary parkour stair height range tops out at 0.23 m; require the
+    # support-to-target height difference to stay strictly below 0.27 m.
+    max_foothold_step_height_m: float = 0.27
 
     # Opt-in while the learned explicit foothold path is integrated.  When
     # disabled, the existing analytical planner remains the only target source.
@@ -105,6 +105,9 @@ class FootholdPlannerCfg(SensorBaseCfg):
         (-1.0, -1.0),
     )
     safe_target_search_margin_m: float = 0.0
+    # Endpoint execution may tolerate at most two penetrating sole-perimeter
+    # samples. Their safety score remains negative; three or more are invalid.
+    safe_target_max_penetrating_points: int = 2
     safe_target_foot_length_m: float = 0.186
     safe_target_foot_width_m: float = 0.072
     safe_target_foot_grid_num_x: int = 10

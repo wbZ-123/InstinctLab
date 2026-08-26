@@ -44,6 +44,18 @@ class FakeNonFiniteObstacle:
         return torch.full_like(points, float("nan"))
 
 
+class GoalSolePointObstacle:
+    def __init__(self, max_penetrating_y: float):
+        self.max_penetrating_y = max_penetrating_y
+
+    def get_points_penetration_offset(self, points: torch.Tensor) -> torch.Tensor:
+        offset = torch.zeros_like(points)
+        at_goal = points[:, 0] >= 0.399
+        selected = at_goal & (points[:, 1] <= self.max_penetrating_y)
+        offset[selected, 0] = 0.01
+        return offset
+
+
 def test_sample_swing_centerline_uses_spacing_with_bounds():
     start = torch.tensor([[0.0, 0.0, 0.0]])
     goal = torch.tensor([[0.30, 0.0, 0.0]])
@@ -142,6 +154,32 @@ def test_swing_clearance_checks_sole_perimeter_not_only_centerline():
 
     assert center_only.collides.tolist() == [False]
     assert sole_sweep.collides.tolist() == [True]
+
+
+def test_swing_clearance_allows_two_goal_points_but_not_three():
+    common = dict(
+        start=torch.tensor([[0.0, 0.0, 0.10]]),
+        goal=torch.tensor([[0.40, 0.0, 0.10]]),
+        apex_height=torch.tensor([0.20]),
+        swing_duration_s=0.8,
+        foot_points_xy=torch.tensor([[0.0, 0.0], [0.0, 0.02], [0.0, 0.04]]),
+        foot_yaw_w=torch.tensor([0.0]),
+        goal_max_penetrating_points=2,
+    )
+
+    two_points = check_swing_centerline_penetration(
+        obstacle=GoalSolePointObstacle(0.02),
+        **common,
+    )
+    three_points = check_swing_centerline_penetration(
+        obstacle=GoalSolePointObstacle(0.04),
+        **common,
+    )
+
+    assert two_points.goal_penetrating_point_count.tolist() == [2]
+    assert two_points.collides.tolist() == [False]
+    assert three_points.goal_penetrating_point_count.tolist() == [3]
+    assert three_points.collides.tolist() == [True]
 
 
 def test_swing_clearance_treats_nonfinite_penetration_as_unsafe():

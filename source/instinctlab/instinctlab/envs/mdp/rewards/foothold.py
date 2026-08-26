@@ -58,6 +58,26 @@ def mask_recovery_reward(value: torch.Tensor, data) -> torch.Tensor:
     return _mask_stabilization_reward(value, data)
 
 
+def no_fly(
+    env,
+    sensor_cfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return one only when neither selected foot has ground contact."""
+
+    if threshold < 0.0:
+        raise ValueError("threshold must be non-negative")
+    force_history = env.scene.sensors[
+        sensor_cfg.name
+    ].data.net_forces_w_history
+    selected_forces = force_history[:, :, sensor_cfg.body_ids]
+    foot_contact = (
+        torch.linalg.vector_norm(selected_forces, dim=-1).amax(dim=1)
+        > threshold
+    )
+    return (~torch.any(foot_contact, dim=-1)).to(force_history.dtype)
+
+
 def _recovery_masked_upstream_reward(
     env,
     upstream_name: str,

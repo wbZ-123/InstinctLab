@@ -96,10 +96,21 @@ def _make_algorithm(module):
     return algorithm, obs_format
 
 
-def _make_minibatch(module, actor_critic, *, event_mask=None):
+def _make_minibatch(
+    module,
+    actor_critic,
+    *,
+    event_mask=None,
+    nominal_safe_event=None,
+    nominal_unsafe_event=None,
+):
     batch_size = 4
     if event_mask is None:
         event_mask = torch.tensor([True, False, True, False])
+    if nominal_safe_event is None:
+        nominal_safe_event = event_mask
+    if nominal_unsafe_event is None:
+        nominal_unsafe_event = torch.zeros_like(event_mask)
     old_sigma = torch.cat(
         (actor_critic.motor_std, actor_critic.foothold_std),
     ).detach().expand(batch_size, -1).clone()
@@ -118,6 +129,8 @@ def _make_minibatch(module, actor_critic, *, event_mask=None):
         hidden_states=None,
         masks=None,
         foothold_action_event=event_mask,
+        foothold_nominal_safe_event=nominal_safe_event,
+        foothold_nominal_unsafe_event=nominal_unsafe_event,
     )
 
 
@@ -201,6 +214,85 @@ def test_no_event_minibatch_has_zero_planner_loss_with_gradient_path():
 
     assert result.item() == 0.0
     result.backward()
+    torch.testing.assert_close(values.grad, torch.zeros_like(values))
+
+
+def test_balanced_event_mean_weights_safe_and_unsafe_branches_equally():
+    module = _load_ppo_module()
+    values = torch.tensor([1.0, 3.0, 100.0, 200.0], requires_grad=True)
+    event = torch.tensor([True, True, True, True])
+    safe = torch.tensor([True, True, False, False])
+    unsafe = ~safe
+
+    balanced, safe_mean, unsafe_mean = module.balanced_event_masked_mean(
+        values,
+        event,
+        safe,
+        unsafe,
+    )
+
+    torch.testing.assert_close(safe_mean, torch.tensor(2.0))
+    torch.testing.assert_close(unsafe_mean, torch.tensor(150.0))
+    torch.testing.assert_close(balanced, torch.tensor(76.0))
+
+
+def test_balanced_event_mean_uses_available_branch_without_zero_dilution():
+    module = _load_ppo_module()
+    values = torch.tensor([2.0, 4.0, 1000.0], requires_grad=True)
+    event = torch.tensor([True, True, False])
+    safe = torch.tensor([True, True, False])
+    unsafe = torch.tensor([False, False, False])
+
+    balanced, safe_mean, unsafe_mean = module.balanced_event_masked_mean(
+        values,
+        event,
+        safe,
+        unsafe,
+    )
+
+    torch.testing.assert_close(balanced, torch.tensor(3.0))
+    torch.testing.assert_close(safe_mean, torch.tensor(3.0))
+    torch.testing.assert_close(unsafe_mean, torch.tensor(0.0))
+
+
+def test_balanced_event_mean_rejects_overlap_and_incomplete_masks():
+    module = _load_ppo_module()
+    values = torch.ones(2, requires_grad=True)
+    event = torch.tensor([True, False])
+
+    with pytest.raises(ValueError, match="overlap"):
+        module.balanced_event_masked_mean(
+            values,
+            event,
+            torch.tensor([True, False]),
+            torch.tensor([True, False]),
+        )
+    with pytest.raises(ValueError, match="union"):
+        module.balanced_event_masked_mean(
+            values,
+            event,
+            torch.tensor([False, False]),
+            torch.tensor([False, False]),
+        )
+
+
+def test_balanced_event_mean_empty_partition_is_finite_with_gradient_path():
+    module = _load_ppo_module()
+    values = torch.tensor([3.0, 7.0], requires_grad=True)
+    event = torch.tensor([False, False])
+    empty = torch.tensor([False, False])
+
+    balanced, safe_mean, unsafe_mean = module.balanced_event_masked_mean(
+        values,
+        event,
+        empty,
+        empty,
+    )
+
+    assert balanced.item() == 0.0
+    assert safe_mean.item() == 0.0
+    assert unsafe_mean.item() == 0.0
+    balanced.backward()
     torch.testing.assert_close(values.grad, torch.zeros_like(values))
 
 
@@ -411,6 +503,64 @@ def test_process_env_step_rejects_missing_causal_event():
         )
 
 
+@pytest.mark.parametrize(
+    "infos, error",
+    [
+        (
+            {
+                "learned_foothold_action_event": torch.tensor([True, False]),
+            },
+            "learned_foothold_nominal_safe_event",
+        ),
+        (
+            {
+                "learned_foothold_action_event": torch.tensor([True, False]),
+                "learned_foothold_nominal_safe_event": torch.tensor(
+                    [True, False]
+                ),
+            },
+            "learned_foothold_nominal_unsafe_event",
+        ),
+    ],
+)
+def test_process_env_step_requires_nominal_branch_events(infos, error):
+    module = _load_ppo_module()
+    algorithm, obs_format = _make_algorithm(module)
+    algorithm.init_storage(2, 1, obs_format, 31, num_rewards=2)
+
+    with pytest.raises(KeyError, match=error):
+        algorithm.process_env_step(
+            rewards=torch.zeros(2, 2),
+            dones=torch.zeros(2, dtype=torch.long),
+            infos=infos,
+            next_obs=torch.zeros(2, 4),
+            next_critic_obs=torch.zeros(2, 4),
+        )
+
+
+def test_process_env_step_rejects_non_partitioned_nominal_branch_events():
+    module = _load_ppo_module()
+    algorithm, obs_format = _make_algorithm(module)
+    algorithm.init_storage(2, 1, obs_format, 31, num_rewards=2)
+
+    with pytest.raises(ValueError, match="union"):
+        algorithm.process_env_step(
+            rewards=torch.zeros(2, 2),
+            dones=torch.zeros(2, dtype=torch.long),
+            infos={
+                "learned_foothold_action_event": torch.tensor([True, False]),
+                "learned_foothold_nominal_safe_event": torch.tensor(
+                    [False, False]
+                ),
+                "learned_foothold_nominal_unsafe_event": torch.tensor(
+                    [False, False]
+                ),
+            },
+            next_obs=torch.zeros(2, 4),
+            next_critic_obs=torch.zeros(2, 4),
+        )
+
+
 def test_compute_losses_reports_separate_policy_groups():
     module = _load_ppo_module()
     algorithm, _ = _make_algorithm(module)
@@ -428,6 +578,25 @@ def test_compute_losses_reports_separate_policy_groups():
         "foothold_event_count",
     }.issubset(stats)
     assert stats["foothold_event_count"].item() == 2
+
+
+def test_compute_losses_reports_balanced_nominal_branch_statistics():
+    module = _load_ppo_module()
+    algorithm, _ = _make_algorithm(module)
+    minibatch = _make_minibatch(
+        module,
+        algorithm.actor_critic,
+        nominal_safe_event=torch.tensor([True, False, False, False]),
+        nominal_unsafe_event=torch.tensor([False, False, True, False]),
+    )
+
+    _, _, stats = algorithm.compute_losses(minibatch)
+
+    assert stats["foothold_nominal_safe_event_count"].item() == 1
+    assert stats["foothold_nominal_unsafe_event_count"].item() == 1
+    assert "foothold_nominal_safe_surrogate_loss" in stats
+    assert "foothold_nominal_unsafe_surrogate_loss" in stats
+    assert "foothold_balanced_surrogate_loss" in stats
 
 
 def test_compute_losses_reports_event_only_foothold_action_diagnostics():

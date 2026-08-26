@@ -232,6 +232,56 @@ def test_recovery_masked_feet_air_time_uses_project_parkour_reward(monkeypatch):
     )
 
 
+def test_no_fly_penalizes_only_when_both_feet_are_airborne():
+    foothold = _load_foothold_reward_module()
+    forces = torch.zeros(4, 3, 2, 3)
+    forces[1, -1, 0, 2] = 2.0
+    forces[2, -1, 1, 2] = 2.0
+    forces[3, -1, :, 2] = 2.0
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "contact_forces": SimpleNamespace(
+                    data=SimpleNamespace(net_forces_w_history=forces)
+                )
+            }
+        )
+    )
+    sensor_cfg = SimpleNamespace(
+        name="contact_forces",
+        body_ids=[0, 1],
+    )
+
+    torch.testing.assert_close(
+        foothold.no_fly(
+            env,
+            sensor_cfg=sensor_cfg,
+            threshold=1.0,
+        ),
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    )
+
+
+def test_parkour_config_registers_no_fly_with_minus_one_weight():
+    cfg_path = (
+        Path(__file__).resolve().parents[3]
+        / "source/instinctlab/instinctlab/tasks/parkour/config/parkour_env_cfg.py"
+    )
+    cfg_text = cfg_path.read_text()
+    block = cfg_text.split(
+        "    no_fly = RewTerm(",
+        1,
+    )[1].split("    feet_slide = RewTerm(", 1)[0]
+
+    assert "func=instinct_mdp.no_fly" in block
+    assert "weight=-1.0" in block
+    assert (
+        'SceneEntityCfg("contact_forces", '
+        'body_names=".*_ankle_roll_link")'
+    ) in block
+    assert '"threshold": 1.0' in block
+
+
 def test_stabilization_masks_foothold_and_learned_event_rewards():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(
@@ -1612,8 +1662,11 @@ def test_parkour_reward_cfg_uses_unified_anomaly_penalty_and_keeps_diagnostics()
     assert "foothold_overdue_indicator = RewTerm(" in cfg_text
     assert "foothold_stance_lost_indicator = RewTerm(" in cfg_text
     assert "foothold_hold_contact_lost_indicator = RewTerm(" in cfg_text
-    assert "foothold_recovery_indicator = RewTerm(" in cfg_text
-    assert "weight=-0.3 * _FOOTHOLD_REWARD_WEIGHT_SCALE" in cfg_text
+    assert (
+        "foothold_recovery_indicator = RewTerm(\n"
+        "        func=mdp.foothold_recovery_indicator,\n"
+        "        weight=-1.0 * _FOOTHOLD_REWARD_WEIGHT_SCALE"
+    ) in cfg_text
     _assert_locomotion_readiness_curriculum(cfg_text)
     assert "foothold_plan_invalid_indicator = RewTerm(" in cfg_text
 

@@ -188,11 +188,27 @@ class InstinctRlVecEnvWrapper(VecEnv):
                 raise RuntimeError(
                     "Learned foothold action disappeared during env.step()."
                 )
-            extras["learned_foothold_action_event"] = (
-                foothold_event_from_generation(
-                    foothold_generation_before,
-                    foothold_generation_after,
+            foothold_event = foothold_event_from_generation(
+                foothold_generation_before,
+                foothold_generation_after,
+            )
+            nominal_safe_event, nominal_unsafe_event = (
+                self._read_learned_foothold_nominal_event_masks(foothold_event)
+            )
+            if not torch.equal(
+                nominal_safe_event | nominal_unsafe_event,
+                foothold_event,
+            ):
+                raise RuntimeError(
+                    "Learned foothold nominal branch events must partition "
+                    "the learned foothold action event."
                 )
+            extras["learned_foothold_action_event"] = foothold_event
+            extras["learned_foothold_nominal_safe_event"] = (
+                nominal_safe_event
+            )
+            extras["learned_foothold_nominal_unsafe_event"] = (
+                nominal_unsafe_event
             )
         obs_pack = self._flatten_all_obs_groups(obs_pack)
         # compute dones for compatibility with RSL-RL
@@ -294,6 +310,58 @@ class InstinctRlVecEnvWrapper(VecEnv):
                 "Foothold planner event generation must use torch.int64."
             )
         return generation.clone()
+
+    def _read_learned_foothold_nominal_event_masks(
+        self,
+        event: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the current planner event's nominal safety branch masks."""
+
+        scene = getattr(self.unwrapped, "scene", None)
+        sensors = getattr(scene, "sensors", {})
+        planner = sensors.get("foothold_planner")
+        if planner is None:
+            raise RuntimeError(
+                "Learned foothold action requires the foothold_planner sensor."
+            )
+        planner_data = getattr(planner, "_data", None)
+        nominal_geometric_valid = getattr(
+            planner_data,
+            "nominal_geometric_valid",
+            None,
+        )
+        nominal_safety_valid = getattr(
+            planner_data,
+            "nominal_safety_valid",
+            None,
+        )
+        if (
+            nominal_geometric_valid is None
+            or nominal_safety_valid is None
+        ):
+            raise RuntimeError(
+                "Foothold planner nominal event masks are not initialized."
+            )
+        expected_shape = (self.num_envs,)
+        for name, value in (
+            ("event", event),
+            ("nominal_geometric_valid", nominal_geometric_valid),
+            ("nominal_safety_valid", nominal_safety_valid),
+        ):
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"Foothold planner {name} must have shape "
+                    f"{expected_shape}, got {tuple(value.shape)}."
+                )
+            if value.dtype != torch.bool:
+                raise TypeError(
+                    f"Foothold planner {name} must use torch.bool."
+                )
+        nominal_safe = event & nominal_geometric_valid & nominal_safety_valid
+        nominal_unsafe = event & ~(
+            nominal_geometric_valid & nominal_safety_valid
+        )
+        return nominal_safe, nominal_unsafe
 
     def _flatten_obs_group(self, obs_group: dict) -> torch.Tensor:
         """Considering observation_manager only concatenate observation terms of 1D tensors,

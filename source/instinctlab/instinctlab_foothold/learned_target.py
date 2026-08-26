@@ -201,7 +201,7 @@ def reframe_cached_world_foothold(
     geometric_valid = (
         finite
         & (normalized_radius <= 1.0 + 1.0e-6)
-        & (torch.abs(target_f[:, 2]) <= max_step_height_m)
+        & (torch.abs(target_f[:, 2]) < max_step_height_m)
     )
     return target_f, geometric_valid
 
@@ -445,7 +445,7 @@ def prepare_learned_foothold_target(
         )
     )
     geometric_valid = height_valid & (
-        torch.abs(target_f[:, 2]) <= max_step_height_m
+        torch.abs(target_f[:, 2]) < max_step_height_m
     )
     return LearnedFootholdPreparation(
         decoded_f=decoded_f,

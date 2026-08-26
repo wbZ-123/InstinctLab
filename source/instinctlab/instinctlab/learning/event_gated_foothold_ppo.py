@@ -90,6 +90,64 @@ def event_masked_mean(
     return selected.mean()
 
 
+def balanced_event_masked_mean(
+    values: torch.Tensor,
+    event_mask: torch.Tensor,
+    nominal_safe_event: torch.Tensor,
+    nominal_unsafe_event: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Average planner values with equal weight for the two event branches.
+
+    The branch masks are a partition of ``event_mask``.  When a minibatch only
+    contains one branch, its mean is used without dilution by an empty branch.
+    """
+
+    masks = (event_mask, nominal_safe_event, nominal_unsafe_event)
+    if any(mask.shape != values.shape for mask in masks):
+        raise ValueError("Balanced event masks and values shapes must match.")
+    if any(mask.dtype != torch.bool for mask in masks):
+        raise TypeError("Balanced event masks must use torch.bool.")
+    if torch.any(nominal_safe_event & nominal_unsafe_event).item():
+        raise ValueError("Balanced nominal event masks overlap.")
+    if not torch.equal(
+        nominal_safe_event | nominal_unsafe_event,
+        event_mask,
+    ):
+        raise ValueError("Balanced nominal event masks must union to event mask.")
+
+    safe_mean = event_masked_mean(values, nominal_safe_event)
+    unsafe_mean = event_masked_mean(values, nominal_unsafe_event)
+    safe_count = int(nominal_safe_event.sum().item())
+    unsafe_count = int(nominal_unsafe_event.sum().item())
+    if safe_count > 0 and unsafe_count > 0:
+        balanced = 0.5 * (safe_mean + unsafe_mean)
+    elif safe_count > 0:
+        balanced = safe_mean
+    elif unsafe_count > 0:
+        balanced = unsafe_mean
+    else:
+        balanced = values.sum() * 0.0
+    return balanced, safe_mean, unsafe_mean
+
+
+def _clipped_surrogate_terms(
+    new_log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantage: torch.Tensor,
+    clip_param: float,
+) -> torch.Tensor:
+    """Return per-sample PPO clipped surrogate loss terms."""
+
+    ratio = torch.exp(new_log_prob - old_log_prob)
+    surrogate = -advantage * ratio
+    surrogate_clipped = -advantage * torch.clamp(
+        ratio,
+        1.0 - clip_param,
+        1.0 + clip_param,
+    )
+    return torch.maximum(surrogate, surrogate_clipped)
+
+
 def grouped_clipped_surrogates(
     *,
     new_motor_log_prob: torch.Tensor,
@@ -119,31 +177,18 @@ def grouped_clipped_surrogates(
     if clip_param <= 0.0:
         raise ValueError("PPO clip_param must be positive.")
 
-    motor_ratio = torch.exp(new_motor_log_prob - old_motor_log_prob)
-    motor_surrogate = -execution_advantage * motor_ratio
-    motor_surrogate_clipped = -execution_advantage * torch.clamp(
-        motor_ratio,
-        1.0 - clip_param,
-        1.0 + clip_param,
-    )
-    motor_loss = torch.maximum(
-        motor_surrogate,
-        motor_surrogate_clipped,
+    motor_loss = _clipped_surrogate_terms(
+        new_motor_log_prob,
+        old_motor_log_prob,
+        execution_advantage,
+        clip_param,
     ).mean()
-
-    foothold_ratio = torch.exp(
-        new_foothold_log_prob - old_foothold_log_prob
-    )
-    foothold_surrogate = -foothold_advantage * foothold_ratio
-    foothold_surrogate_clipped = -foothold_advantage * torch.clamp(
-        foothold_ratio,
-        1.0 - clip_param,
-        1.0 + clip_param,
-    )
     foothold_loss = event_masked_mean(
-        torch.maximum(
-            foothold_surrogate,
-            foothold_surrogate_clipped,
+        _clipped_surrogate_terms(
+            new_foothold_log_prob,
+            old_foothold_log_prob,
+            foothold_advantage,
+            clip_param,
         ),
         event_mask,
     )
@@ -468,14 +513,46 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         next_critic_obs,
     ):
         event_key = "learned_foothold_action_event"
+        safe_event_key = "learned_foothold_nominal_safe_event"
+        unsafe_event_key = "learned_foothold_nominal_unsafe_event"
         if event_key not in infos:
             raise KeyError(
                 f"Missing causal PPO transition key: {event_key}"
             )
+        if safe_event_key not in infos:
+            raise KeyError(
+                f"Missing causal PPO transition key: {safe_event_key}"
+            )
+        if unsafe_event_key not in infos:
+            raise KeyError(
+                f"Missing causal PPO transition key: {unsafe_event_key}"
+            )
         event = infos[event_key]
         if event.dtype != torch.bool:
             raise TypeError("Learned foothold action event must use bool.")
+        safe_event = infos[safe_event_key]
+        unsafe_event = infos[unsafe_event_key]
+        if safe_event.dtype != torch.bool or unsafe_event.dtype != torch.bool:
+            raise TypeError("Learned foothold nominal event masks must use bool.")
+        if safe_event.shape != event.shape or unsafe_event.shape != event.shape:
+            raise ValueError(
+                "Learned foothold nominal event masks must match event shape."
+            )
+        if torch.any(safe_event & unsafe_event).item():
+            raise ValueError(
+                "Learned foothold nominal event masks overlap."
+            )
+        if not torch.equal(safe_event | unsafe_event, event):
+            raise ValueError(
+                "Learned foothold nominal event masks must union to event."
+            )
         self.transition.foothold_action_event = event.detach().clone()
+        self.transition.foothold_nominal_safe_event = (
+            safe_event.detach().clone()
+        )
+        self.transition.foothold_nominal_unsafe_event = (
+            unsafe_event.detach().clone()
+        )
         super().process_env_step(
             rewards,
             dones,
@@ -534,7 +611,7 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
             minibatch.actions,
             self.motor_action_dim,
         )
-        motor_surrogate_loss, foothold_surrogate_loss = (
+        motor_surrogate_loss, _ = (
             grouped_clipped_surrogates(
                 new_motor_log_prob=new_motor_log_prob,
                 old_motor_log_prob=old_motor_log_prob,
@@ -549,6 +626,22 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
                 event_mask=minibatch.foothold_action_event,
                 clip_param=self.clip_param,
             )
+        )
+        foothold_surrogate_terms = _clipped_surrogate_terms(
+            new_foothold_log_prob,
+            old_foothold_log_prob,
+            minibatch.advantages[..., self.foothold_reward_index],
+            self.clip_param,
+        )
+        (
+            foothold_surrogate_loss,
+            nominal_safe_surrogate_loss,
+            nominal_unsafe_surrogate_loss,
+        ) = balanced_event_masked_mean(
+            foothold_surrogate_terms,
+            minibatch.foothold_action_event,
+            minibatch.foothold_nominal_safe_event,
+            minibatch.foothold_nominal_unsafe_event,
         )
 
         critic_hidden_states = (
@@ -638,6 +731,23 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
             "motor_kl": motor_kl,
             "foothold_kl": foothold_kl,
             "foothold_event_count": event_count,
+            "foothold_nominal_safe_event_count": minibatch.foothold_nominal_safe_event.sum().to(
+                dtype=torch.float32
+            ),
+            "foothold_nominal_unsafe_event_count": minibatch.foothold_nominal_unsafe_event.sum().to(
+                dtype=torch.float32
+            ),
+            "foothold_nominal_safe_advantage_mean": event_masked_mean(
+                minibatch.advantages[..., self.foothold_reward_index],
+                minibatch.foothold_nominal_safe_event,
+            ),
+            "foothold_nominal_unsafe_advantage_mean": event_masked_mean(
+                minibatch.advantages[..., self.foothold_reward_index],
+                minibatch.foothold_nominal_unsafe_event,
+            ),
+            "foothold_nominal_safe_surrogate_loss": nominal_safe_surrogate_loss,
+            "foothold_nominal_unsafe_surrogate_loss": nominal_unsafe_surrogate_loss,
+            "foothold_balanced_surrogate_loss": foothold_surrogate_loss,
             "foothold_raw_out_of_range_fraction": event_masked_mean(
                 raw_out_of_range,
                 minibatch.foothold_action_event,

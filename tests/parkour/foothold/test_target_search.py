@@ -48,6 +48,16 @@ class FakeCylinderObstacle:
         return offset
 
 
+class FirstNPointsPenetrationObstacle:
+    def __init__(self, num_penetrating_points: int):
+        self.num_penetrating_points = num_penetrating_points
+
+    def get_points_penetration_offset(self, points: torch.Tensor) -> torch.Tensor:
+        offset = torch.zeros_like(points)
+        offset[: self.num_penetrating_points, 0] = 0.01
+        return offset
+
+
 class FakeHeightAwareCylinderObstacle:
     def __init__(self, centers_xyz: torch.Tensor, radius: float):
         if centers_xyz.ndim == 1:
@@ -306,6 +316,35 @@ def test_evaluate_safe_foothold_target_reports_sole_penetration_statistics():
     torch.testing.assert_close(result.max_penetration_depth, torch.tensor([0.02]))
     torch.testing.assert_close(result.mean_penetration_depth, torch.tensor([0.02 / 3.0]))
     torch.testing.assert_close(result.penetrating_point_ratio, torch.tensor([1.0 / 3.0]))
+
+
+def test_evaluate_target_allows_two_penetrating_points_but_keeps_negative_score():
+    common = dict(
+        target_f=torch.tensor([[0.10, 0.00, 0.0]]),
+        support_foot_f=torch.zeros(1, 3),
+        ellipse_half_length=0.30,
+        ellipse_half_width=0.16,
+        foot_points_xy=torch.tensor(
+            [[0.0, 0.0], [0.01, 0.0], [0.02, 0.0], [0.03, 0.0]]
+        ),
+        safety_margin=0.0,
+        max_penetrating_points=2,
+    )
+
+    two_points = evaluate_safe_foothold_target(
+        obstacle=FirstNPointsPenetrationObstacle(2),
+        **common,
+    )
+    three_points = evaluate_safe_foothold_target(
+        obstacle=FirstNPointsPenetrationObstacle(3),
+        **common,
+    )
+
+    assert two_points.obstacle_safe.tolist() == [True]
+    assert two_points.valid.tolist() == [True]
+    assert two_points.safety_score.item() < 0.0
+    assert three_points.obstacle_safe.tolist() == [False]
+    assert three_points.valid.tolist() == [False]
 
 
 def test_evaluate_safe_foothold_target_treats_nonfinite_penetration_as_unsafe():

@@ -34,6 +34,8 @@ def _make_transition(FootholdTransition):
     transition.action_mean = torch.zeros(2, 31)
     transition.action_sigma = torch.ones(2, 31)
     transition.foothold_action_event = torch.tensor([True, False])
+    transition.foothold_nominal_safe_event = torch.tensor([True, False])
+    transition.foothold_nominal_unsafe_event = torch.tensor([False, False])
     return transition
 
 
@@ -52,6 +54,8 @@ def test_storage_keeps_event_mask_aligned_with_transition():
     storage.add_transitions(_make_transition(FootholdTransition))
 
     assert storage.foothold_action_event[0].tolist() == [True, False]
+    assert storage.foothold_nominal_safe_event[0].tolist() == [True, False]
+    assert storage.foothold_nominal_unsafe_event[0].tolist() == [False, False]
 
 
 def test_minibatch_keeps_event_mask_aligned_with_selected_rows():
@@ -69,6 +73,8 @@ def test_minibatch_keeps_event_mask_aligned_with_selected_rows():
     storage.add_transitions(first)
     second = _make_transition(FootholdTransition)
     second.foothold_action_event = torch.tensor([False, True])
+    second.foothold_nominal_safe_event = torch.tensor([False, False])
+    second.foothold_nominal_unsafe_event = torch.tensor([False, True])
     storage.add_transitions(second)
 
     minibatch = storage.get_minibatch_from_selection(
@@ -78,6 +84,8 @@ def test_minibatch_keeps_event_mask_aligned_with_selected_rows():
 
     assert minibatch.foothold_action_event.dtype == torch.bool
     assert minibatch.foothold_action_event.tolist() == [True, True]
+    assert minibatch.foothold_nominal_safe_event.tolist() == [False, True]
+    assert minibatch.foothold_nominal_unsafe_event.tolist() == [True, False]
 
 
 def test_storage_rejects_missing_event_mask():
@@ -98,6 +106,24 @@ def test_storage_rejects_missing_event_mask():
         storage.add_transitions(transition)
 
 
+def test_storage_rejects_missing_nominal_branch_masks():
+    FootholdRolloutStorage, FootholdTransition = _load_storage_types()
+    storage = FootholdRolloutStorage(
+        2,
+        1,
+        [3],
+        [3],
+        [31],
+        num_rewards=2,
+        device="cpu",
+    )
+    transition = _make_transition(FootholdTransition)
+    transition.foothold_nominal_unsafe_event = None
+
+    with pytest.raises(ValueError, match="nominal unsafe"):
+        storage.add_transitions(transition)
+
+
 def test_storage_rejects_non_boolean_event_mask():
     FootholdRolloutStorage, FootholdTransition = _load_storage_types()
     storage = FootholdRolloutStorage(
@@ -113,6 +139,39 @@ def test_storage_rejects_non_boolean_event_mask():
     transition.foothold_action_event = torch.tensor([1, 0])
 
     with pytest.raises(TypeError, match="bool"):
+        storage.add_transitions(transition)
+
+
+@pytest.mark.parametrize(
+    "safe_mask, unsafe_mask, error",
+    [
+        (torch.tensor([1, 0]), torch.tensor([False, False]), "bool"),
+        (torch.tensor([True]), torch.tensor([False, False]), "shape"),
+        (torch.tensor([True, False]), torch.tensor([True, False]), "overlap"),
+        (torch.tensor([False, False]), torch.tensor([False, False]), "union"),
+        (torch.tensor([False, False]), torch.tensor([True, True]), "union"),
+    ],
+)
+def test_storage_rejects_invalid_nominal_branch_masks(
+    safe_mask,
+    unsafe_mask,
+    error,
+):
+    FootholdRolloutStorage, FootholdTransition = _load_storage_types()
+    storage = FootholdRolloutStorage(
+        2,
+        1,
+        [3],
+        [3],
+        [31],
+        num_rewards=2,
+        device="cpu",
+    )
+    transition = _make_transition(FootholdTransition)
+    transition.foothold_nominal_safe_event = safe_mask
+    transition.foothold_nominal_unsafe_event = unsafe_mask
+
+    with pytest.raises((TypeError, ValueError), match=error):
         storage.add_transitions(transition)
 
 

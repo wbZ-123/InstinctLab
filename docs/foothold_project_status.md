@@ -144,9 +144,9 @@ logs/instinct_rl/g1_parkour/20260821_124341_planner_branch_reward_from0_30000it
 
 可达椭圆、摆动时序、触地阶段、清障上限、名义脚宽和 Recovery 步长仍应结合 URDF、运动学扫描、air-time 和 play 统计继续标定。详见 [foothold_parameter_audit.md](foothold_parameter_audit.md)。
 
-## 5. 已确定但尚未实施的下一步
+## 5. 当前正在验证的 planner PPO 分支平衡改动
 
-下一步只处理 planner PPO 的样本分支平衡，不同时修改轨迹跟踪、Recovery、AMP、MoE、深度编码器或安全奖励公式。
+本轮已实现且只处理 planner PPO 的样本分支平衡，没有同时修改轨迹跟踪、Recovery、AMP、MoE、深度编码器或安全奖励公式。
 
 目标是：
 
@@ -158,16 +158,22 @@ planner 损失 =
 
 这里必须是加号。PPO 损失已经包含优势符号；不安全输出的负奖励会通过优势进入正确的更新方向，再减去不安全损失会把方向反过来。
 
-实施时需要：
+已完成的代码改动：
 
-1. 在 rollout 中保留每个 planner 事件的“名义安全/不安全”分支标签；
-2. 分别计算两类事件的 PPO surrogate/value/entropy 统计；
-3. 两类都存在时等权平均，某一类为空时只使用存在的分支；
-4. 增加分支计数、分支优势和分支损失日志；
-5. 先跑 64 环境/100 轮和 4096 环境/100 轮，再比较修正成功率和平均修正距离；
-6. 只有确认困难分支改善后，才重新启动长训。
+1. wrapper 在 causal planner event 上输出“名义安全/不安全”互斥标签；
+2. rollout storage 保留两类标签，且校验它们的并集严格等于 planner event；
+3. planner actor surrogate 在两类都存在时使用等权平均，单类 minibatch 不被空分支稀释；
+4. 增加分支计数、优势均值、分支 surrogate loss 和平衡 surrogate loss 日志。
 
-这个修改不是在奖励中额外增加一个拍脑袋权重，而是避免普通安全事件在 PPO 汇总时淹没困难事件。当前尚未修改这部分代码。
+已完成验证：
+
+- 落足模块测试：`420 passed`；
+- 相关 PPO/storage 测试：`41 passed, 1 skipped`；
+- 三个修改文件通过 `py_compile` 和 `git diff --check`。
+
+运行时冒烟训练暂未完成：当前执行环境没有可用 CUDA GPU，Isaac Sim 在初始化阶段报 `RuntimeError: No CUDA GPUs are available`。因此仍需在训练服务器上先跑 64 环境短训和 4096 环境短训，再比较修正成功率和平均修正距离；在此之前不要直接启动 30000 轮长训。
+
+这个修改不是在奖励中额外增加一个拍脑袋权重，而是避免普通安全事件在 PPO 汇总时淹没困难事件。
 
 ## 6. 换电脑复现清单
 

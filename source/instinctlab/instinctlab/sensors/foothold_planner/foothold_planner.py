@@ -696,6 +696,9 @@ class FootholdPlanner(SensorBase):
                 ),
                 foot_points_xy=self._safe_target_foot_points_xy,
                 safety_margin=self.cfg.safe_target_search_margin_m,
+                max_penetrating_points=(
+                    self.cfg.safe_target_max_penetrating_points
+                ),
             )
             safety_valid = evaluation.obstacle_safe
             safety_score = evaluation.safety_score
@@ -841,7 +844,7 @@ class FootholdPlanner(SensorBase):
         )
         geometric_valid = height_valid & (
             torch.abs(target_f[:, 2])
-            <= self.cfg.max_foothold_step_height_m
+            < self.cfg.max_foothold_step_height_m
         )
         obstacle = self._virtual_obstacles.get("edges")
         if obstacle is None:
@@ -866,6 +869,9 @@ class FootholdPlanner(SensorBase):
                 ),
                 foot_points_xy=self._safe_target_foot_points_xy,
                 safety_margin=self.cfg.safe_target_search_margin_m,
+                max_penetrating_points=(
+                    self.cfg.safe_target_max_penetrating_points
+                ),
             )
             safety_valid = evaluation.obstacle_safe
             safety_score = evaluation.safety_score
@@ -2516,6 +2522,9 @@ class FootholdPlanner(SensorBase):
                         foot_points_xy=self._safe_target_foot_points_xy,
                         foot_yaw_w=preflight_yaw_w,
                         allow_start_penetration_escape=True,
+                        goal_max_penetrating_points=(
+                            self.cfg.safe_target_max_penetrating_points
+                        ),
                     )
                     preflight_safe = adjustment.is_safe
                     preflight_apex = adjustment.apex_height
@@ -3516,6 +3525,9 @@ class FootholdPlanner(SensorBase):
                         foot_points_xy=self._safe_target_foot_points_xy,
                         foot_yaw_w=new_swing_base_yaw_w[missing_preflight],
                         allow_start_penetration_escape=True,
+                        goal_max_penetrating_points=(
+                            self.cfg.safe_target_max_penetrating_points
+                        ),
                     )
                     new_apex_height[missing_preflight] = apex_adjustment.apex_height
                     new_clearance_safe[missing_preflight] = apex_adjustment.is_safe

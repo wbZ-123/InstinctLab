@@ -200,6 +200,7 @@ def test_learned_planner_config_is_opt_in_without_duplicate_meter_limits():
     cfg_text = _planner_source_path("foothold_planner_cfg.py").read_text()
 
     assert "enable_learned_foothold: bool = False" in cfg_text
+    assert "max_foothold_step_height_m: float = 0.27" in cfg_text
     assert "learned_foothold_x_range" not in cfg_text
     assert "learned_foothold_y_range" not in cfg_text
     assert "learned_foothold_step_height_limit_m" not in cfg_text
@@ -753,6 +754,25 @@ def test_prepare_target_queries_world_xy_and_applies_existing_height_limit():
         torch.tensor([[0.2, 0.0, 0.15], [0.2, 0.0, 0.40]]),
     )
     assert result.height_valid.tolist() == [True, True]
+    assert result.geometric_valid.tolist() == [True, False]
+
+
+def test_prepare_target_requires_height_difference_strictly_below_limit():
+    def terrain_query(points_xy_w):
+        return torch.tensor([0.269, 0.270]), torch.ones(
+            points_xy_w.shape[0], dtype=torch.bool
+        )
+
+    result = prepare_learned_foothold_target(
+        normalized_action=torch.zeros(2, 2),
+        origin_w=torch.zeros(2, 3),
+        yaw_w=torch.zeros(2),
+        radius_x=0.42,
+        radius_y=0.25,
+        max_step_height_m=0.27,
+        terrain_height_query_w=terrain_query,
+    )
+
     assert result.geometric_valid.tolist() == [True, False]
 
 

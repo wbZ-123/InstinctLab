@@ -196,7 +196,7 @@ def _lift_targets_to_terrain_height(
     height_valid = terrain_valid & finite_height
     if max_step_height_m is not None:
         height_delta = torch.abs(terrain_height_w - target_origin_w[:, 2])
-        height_valid = height_valid & (height_delta <= max_step_height_m)
+        height_valid = height_valid & (height_delta < max_step_height_m)
 
     lifted = target_f.clone()
     lifted[:, 2] = torch.where(
@@ -487,6 +487,7 @@ def evaluate_safe_foothold_target(
     ellipse_half_width: float,
     foot_points_xy: torch.Tensor,
     safety_margin: float,
+    max_penetrating_points: int = 0,
     terrain_height_query_w: TerrainHeightQuery | None = None,
     max_step_height_m: float | None = None,
 ) -> SafeFootholdTargetEvaluation:
@@ -497,6 +498,9 @@ def evaluate_safe_foothold_target(
     obstacle-footprint checks as the planner search without running fallback
     candidate selection.
     """
+
+    if max_penetrating_points < 0:
+        raise ValueError("max_penetrating_points must be non-negative.")
 
     foot_points_xy = foot_points_xy.to(device=target_f.device, dtype=target_f.dtype)
     if target_origin_w is None:
@@ -538,7 +542,13 @@ def evaluate_safe_foothold_target(
         positive_penetration_depths,
     )
     mean_penetration_depth = torch.mean(positive_penetration_depths, dim=-1)
-    obstacle_safe = max_penetration_depth <= safety_margin
+    finite_penetration = torch.isfinite(penetration_depths).all(dim=-1)
+    hard_penetrating_point_count = (
+        penetration_depths > safety_margin
+    ).sum(dim=-1)
+    obstacle_safe = finite_penetration & (
+        hard_penetrating_point_count <= max_penetrating_points
+    )
     valid = height_valid & inside_ellipse & obstacle_safe
     return SafeFootholdTargetEvaluation(
         target_f=lifted_target_f,

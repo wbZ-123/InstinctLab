@@ -28,6 +28,7 @@ class SwingCenterlinePenetration:
     deepest_phase: torch.Tensor
     start_penetration_depth: torch.Tensor
     goal_penetration_depth: torch.Tensor
+    goal_penetrating_point_count: torch.Tensor
     start_escape_safe: torch.Tensor
 
 @dataclass(frozen=True)
@@ -120,8 +121,13 @@ def check_swing_centerline_penetration(
     foot_points_xy: torch.Tensor | None = None,
     foot_yaw_w: torch.Tensor | float | None = None,
     allow_start_penetration_escape: bool = False,
+    goal_max_penetrating_points: int = 0,
 ) -> SwingCenterlinePenetration:
     """Check a sampled swing path, optionally sweeping the sole perimeter."""
+    if goal_max_penetrating_points < 0:
+        raise ValueError(
+            "goal_max_penetrating_points must be non-negative."
+        )
     path_points, phases = sample_swing_centerline(
         start=start,
         goal=goal,
@@ -218,7 +224,9 @@ def check_swing_centerline_penetration(
     max_penetration_depth, deepest_indices = torch.max(penetration_depth, dim=-1)
     start_penetration_depth = penetration_depth[:, 0]
     goal_penetration_depth = penetration_depth[:, -1]
-    start_penetrates = start_penetration_depth > penetration_tolerance
+    point_penetrates = point_penetration_depth > penetration_tolerance
+    start_penetrates = point_penetrates[:, 0].any(dim=-1)
+    goal_penetrating_point_count = point_penetrates[:, -1].sum(dim=-1)
     start_escape_safe = torch.zeros_like(start_penetrates)
     if num_samples > 1:
         post_start_depth = penetration_depth[:, 1:]
@@ -230,15 +238,29 @@ def check_swing_centerline_penetration(
         )
         start_escape_safe = start_penetrates & leaves_initial_region & does_not_deepen
 
-    collides = max_penetration_depth > penetration_tolerance
+    if num_samples > 2:
+        middle_collides = point_penetrates[:, 1:-1].any(dim=(-1, -2))
+    else:
+        middle_collides = torch.zeros_like(start_penetrates)
+    goal_exceeds_count = (
+        goal_penetrating_point_count > goal_max_penetrating_points
+    )
+    has_nonfinite = nonfinite.any(dim=(-1, -2))
+    collides = (
+        start_penetrates
+        | middle_collides
+        | goal_exceeds_count
+        | has_nonfinite
+    )
     if allow_start_penetration_escape:
         # A virtual edge cylinder may already overlap the swing foot at
         # liftoff.  That overlap cannot be removed by raising the apex.  Allow
         # the trajectory only when it exits the initial overlap, never gets
         # deeper, and finishes clear; endpoint and mid-swing collisions remain
         # hard failures.
-        escaped_start = start_escape_safe & (goal_penetration_depth <= penetration_tolerance)
+        escaped_start = start_escape_safe & ~goal_exceeds_count
         collides = torch.where(start_penetrates, ~escaped_start, collides)
+        collides = collides | has_nonfinite
     deepest_phase = phases[deepest_indices]
 
     return SwingCenterlinePenetration(
@@ -251,6 +273,7 @@ def check_swing_centerline_penetration(
         deepest_phase=deepest_phase,
         start_penetration_depth=start_penetration_depth,
         goal_penetration_depth=goal_penetration_depth,
+        goal_penetrating_point_count=goal_penetrating_point_count,
         start_escape_safe=start_escape_safe,
     )
 
@@ -269,6 +292,7 @@ def adjust_apex_for_edge_clearance(
     foot_points_xy: torch.Tensor | None = None,
     foot_yaw_w: torch.Tensor | float | None = None,
     allow_start_penetration_escape: bool = False,
+    goal_max_penetrating_points: int = 0,
 ) -> ApexAdjustmentResult:
     """Increase swing apex until the sampled sole sweep clears edge obstacles."""
     if apex_step <= 0.0:
@@ -308,6 +332,7 @@ def adjust_apex_for_edge_clearance(
         foot_points_xy=foot_points_xy,
         foot_yaw_w=foot_yaw_w,
         allow_start_penetration_escape=allow_start_penetration_escape,
+        goal_max_penetrating_points=goal_max_penetrating_points,
     )
 
     for iteration in range(max_iterations):
@@ -324,6 +349,7 @@ def adjust_apex_for_edge_clearance(
             foot_points_xy=foot_points_xy,
             foot_yaw_w=foot_yaw_w,
             allow_start_penetration_escape=allow_start_penetration_escape,
+            goal_max_penetrating_points=goal_max_penetrating_points,
         )
 
         unsafe = penetration.collides
