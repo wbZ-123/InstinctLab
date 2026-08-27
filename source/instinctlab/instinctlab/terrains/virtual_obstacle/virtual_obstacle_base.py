@@ -62,3 +62,18 @@ class VirtualObstacleBase(ABC):
             torch.Tensor: Shape (N, 3) The penetration offsets for the points. pointing from the surface to the point.
         """
         raise NotImplementedError("This method should be implemented by subclasses.")
+
+    def get_points_signed_clearance(
+        self,
+        points: torch.Tensor,
+        max_clearance: float = 0.04,
+    ) -> torch.Tensor:
+        """Return signed distance to the nearest obstacle surface when known.
+
+        Existing obstacle implementations may omit this optional diagnostic;
+        callers must then fall back to their penetration-only signal.
+        """
+        del points, max_clearance
+        raise NotImplementedError(
+            "This obstacle does not expose signed clearance."
+        )

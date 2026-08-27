@@ -60,6 +60,8 @@ class FootholdPlannerData:
     # It is diagnostic only; route_event is the validity pulse for this field.
     learned_foothold_route_outcome: torch.Tensor | None = None
     learned_foothold_safety_score: torch.Tensor | None = None
+    learned_foothold_safety_margin_score: torch.Tensor | None = None
+    learned_foothold_minimum_signed_clearance: torch.Tensor | None = None
     learned_foothold_penetrating_point_count: torch.Tensor | None = None
     learned_foothold_penetrating_point_ratio: torch.Tensor | None = None
     learned_foothold_total_penetration_depth: torch.Tensor | None = None

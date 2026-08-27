@@ -1099,7 +1099,7 @@ class G1Rewards:
     )
     no_fly = RewTerm(
         func=instinct_mdp.no_fly,
-        weight=-1.0,
+        weight=-3.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
             "threshold": 1.0,
@@ -1239,7 +1239,9 @@ class LearnedFootholdPlanningRewards:
             "nominal_step_width_m": (
                 _DEFAULT_FLAT_PROVIDER_CFG.nominal_step_width
             ),
-            "velocity_std": 0.5,
+            "safety_margin_reference_m": 0.04,
+            "safe_nominal_weight": 0.15,
+            "unsafe_nominal_weight": 0.05,
         },
     )
 
@@ -1416,9 +1418,10 @@ class ParkourEnvCfg(ManagerBasedRLEnvCfg):
             )
         self.scene.foothold_planner.enable_learned_foothold = True
         # The learned route must never use the legacy analytic recovery step:
-        # recovery is owned by the existing motor policy and only returns to a
-        # fresh HOLD transaction after both feet regain confirmed contact. An
-        # explicit calibration path is retained for motion diagnostics.
+        # recovery is owned by the existing motor policy until at least one
+        # foot is confirmed as support. Contact-adaptive recovery then opens a
+        # fresh single-support HOLD transaction for the other foot. An explicit
+        # calibration path is retained for motion diagnostics.
         if not self.scene.foothold_planner.enable_contact_adaptive_recovery:
             self.enable_contact_adaptive_recovery(
                 _FOOTHOLD_RECOVERY_STABILITY_SEED_PATH

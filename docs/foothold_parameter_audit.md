@@ -49,7 +49,7 @@
 
 | 参数 | 当前值 | 位置 | 当前来源 | 应该对齐到 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| `outer_radius_x` | `0.42` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | G1 腿部运动学可达范围扫描 | 需要标定 |
+| `outer_radius_x` | `1.00` | `instinctlab_foothold/flat_provider.py` | 固定前后可达半轴 | G1 腿部运动学可达范围扫描 | 临时固定，仍需实机标定 |
 | `outer_radius_y` | `0.25` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | G1 腿部运动学可达范围扫描 | 需要标定 |
 | `min_lateral_separation` | `0.06` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | 左右脚防交叉安全间距，至少要结合脚宽和脚间距 | 需要标定 |
 | `nominal_step_width` | `0.18` | `instinctlab_foothold/flat_provider.py` | 临时保守值；active G1 shoe URDF 静态链路粗算左右 sole 中心距约 `0.237 m`，说明当前值不是直接来自模型 | reset 初始站姿左右脚中心距离，或 gait/reference 中的默认脚宽 | 需要标定 |
@@ -57,8 +57,8 @@
 当前边界：`min_lateral_separation=0.06` 仍只属于解析平地名义目标生成器的临时参数；学习式落点的几何有效性不再使用它作左右脚硬拒绝。学习式目标只检查有限性、世界地形高度、最大步高和可达椭圆，横向偏离通过名义点距离代价和真实安全评分学习。
 | `flat_target_lookahead_phase` | `0.8` | `sensors/foothold_planner/foothold_planner_cfg.py` | 临时标定比例：预计在 swing phase 的 80% 处触地 | 真实 touchdown phase 分布、`last_air_time / swing_duration_s` 分布 | 需要标定 |
 | `velocity_lookahead_s` | `flat_target_lookahead_phase * swing_duration_s = 0.256` | `sensors/foothold_planner/foothold_planner.py` | 由 planner 标称摆动时间推导，不再使用独立 `0.10` 临时值 | `flat_target_lookahead_phase` 的标定结果 | 临时已对齐，仍需验证 |
-| `curriculum_radius_x` | `(0.04, 0.08, 0.12)` | `instinctlab_foothold/flat_provider.py` | 训练课程设计 | 外椭圆和训练阶段；最终档不应超过可达范围 | 可保留，但需说明 |
-| `curriculum_radius_y` | `(0.02, 0.04, 0.06)` | `instinctlab_foothold/flat_provider.py` | 训练课程设计 | 外椭圆、脚宽和训练阶段 | 可保留，但需说明 |
+| `curriculum_radius_x` | `(0.0, 0.0, 0.0)` | `instinctlab_foothold/flat_provider.py` | 已取消 XY 随机课程，仅保留兼容字段 | 名义落点不再随等级随机偏移 | 已停用 |
+| `curriculum_radius_y` | `(0.0, 0.0, 0.0)` | `instinctlab_foothold/flat_provider.py` | 已取消 XY 随机课程，仅保留兼容字段 | 名义落点不再随等级随机偏移 | 已停用 |
 | `curriculum_yaw_limit_rad` | `(0.0, 0.10, 0.20)` | `instinctlab_foothold/flat_provider.py` | 训练课程设计 | yaw 命令范围、策略转向能力和落足误差 | 可保留，但需监控 |
 | `swing_duration_s` | `0.32` | `sensors/foothold_planner/foothold_planner_cfg.py` | planner 设定 | TensorBoard 的 `mean_swing_duration_steps` × `step_dt`，以及接触传感器 `last_air_time` | 需要对齐 |
 | `contact_confirm_s` | `0.04` | `sensors/foothold_planner/foothold_planner_cfg.py` | 接触去抖设定 | 环境控制步长和 contact sensor 噪声 | 基本合理，但需记录 dt |
@@ -77,7 +77,7 @@
 | `safe_target_foot_length_m` | `0.186` | `sensors/foothold_planner/foothold_planner_cfg.py` | 和 active G1 shoe URDF 脚底外包络长度一致 | 若后续要加安全余量，应单独记录 margin，不混进物理脚长 | 已对齐 |
 | `safe_target_foot_width_m` | `0.072` | `sensors/foothold_planner/foothold_planner_cfg.py` | 和 active G1 shoe URDF 脚底外包络宽度一致 | 若后续要加安全余量，应单独记录 margin，不混进物理脚宽 | 已对齐 |
 | `swing_apex_height_m` | `0.08` | `sensors/foothold_planner/foothold_planner_cfg.py` | planner 默认抬脚高度 | 原始 gait/策略脚高、地形高度和 clearance 需求 | 需要统计验证 |
-| `clearance_max_apex_height_m` | `0.30` | `sensors/foothold_planner/foothold_planner_cfg.py` | clearance 上限 | 机器人抬脚运动学能力和训练稳定性 | 需要标定 |
+| `clearance_max_apex_height_m` | `0.14` | `sensors/foothold_planner/foothold_planner_cfg.py` | clearance 上限 | 机器人抬脚运动学能力和训练稳定性 | 临时固定，仍需标定 |
 | `clearance_apex_step_m` | `0.03` | `sensors/foothold_planner/foothold_planner_cfg.py` | clearance 搜索分辨率 | 地形高度分辨率和控制平滑性 | 可保留，但需说明 |
 | `clearance_sample_spacing_m` | `0.03` | `sensors/foothold_planner/foothold_planner_cfg.py` | clearance 采样分辨率 | 障碍尺寸、footprint 和地形网格分辨率 | 可保留，但需说明 |
 | `touchdown_xy_tolerance_m` | `0.08` | `sensors/foothold_planner/foothold_planner_cfg.py` | 监控/奖励容忍范围 | 训练后落足误差分布 | 需要统计验证 |

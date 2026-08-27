@@ -40,9 +40,10 @@ class FootholdPlannerCfg(SensorBaseCfg):
     hold_contact_lost_confirm_s: float = 0.10
     early_contact_phase: float = 0.65
     overdue_s: float = 0.12
-    # Legacy non-adaptive callers use this fallback timer. The learned
-    # contact-adaptive path exits as soon as both feet pass the existing
-    # per-foot ``contact_confirm_s`` filter and does not use this second timer.
+    # Legacy non-adaptive callers use this fallback timer. In the learned
+    # contact-adaptive path, one confirmed support opens the recovery HOLD;
+    # zero confirmed supports remain in RECOVERY and no second dwell timer is
+    # imposed.
     recovery_hold_s: float = 0.04
     step_hold_s: float = 0.04
     step_hold_min_s: float = 0.0
@@ -81,14 +82,15 @@ class FootholdPlannerCfg(SensorBaseCfg):
     enable_learned_foothold: bool = False
 
     # Contact-adaptive recovery is opt-in until a calibration file is
-    # available. Its motion/slip fields remain diagnostics; Recovery exits
-    # when both feet have confirmed contact, without extra motion thresholds
-    # or a second dwell interval.
+    # available. Its motion/slip fields remain diagnostics; one confirmed
+    # support foot opens a single-support recovery HOLD, while zero support
+    # keeps RECOVERY active. No extra motion thresholds or second dwell are
+    # imposed here.
     enable_contact_adaptive_recovery: bool = False
     recovery_stability_calibration_path: str = ""
 
     enable_edge_clearance: bool = True
-    clearance_max_apex_height_m: float = 0.30
+    clearance_max_apex_height_m: float = 0.14
     clearance_apex_step_m: float = 0.03
     clearance_sample_spacing_m: float = 0.03
 
@@ -105,6 +107,9 @@ class FootholdPlannerCfg(SensorBaseCfg):
         (-1.0, -1.0),
     )
     safe_target_search_margin_m: float = 0.0
+    # Distance at which a clear sole-perimeter target receives full safety
+    # margin reward. This matches the 4 cm virtual edge-cylinder radius.
+    safe_target_clearance_reference_m: float = 0.04
     # Endpoint execution may tolerate at most two penetrating sole-perimeter
     # samples. Their safety score remains negative; three or more are invalid.
     safe_target_max_penetrating_points: int = 2

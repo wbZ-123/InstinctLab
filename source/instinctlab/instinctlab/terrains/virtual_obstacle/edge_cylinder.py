@@ -139,6 +139,18 @@ class EdgeCylinder(VirtualObstacleBase):
             else torch.zeros_like(points, device=self.device)
         )
 
+    def get_points_signed_clearance(self, points, max_clearance: float = 0.04):
+        return (
+            self.cylinders.get_points_signed_clearance(points, max_clearance)
+            if self.cylinders is not None
+            else torch.full(
+                (points.shape[0],),
+                max_clearance,
+                device=points.device,
+                dtype=points.dtype,
+            )
+        )
+
     def process_edges(self, edge_coords: np.ndarray) -> np.ndarray:
         """Process the edge coordinates.
 
@@ -650,6 +662,18 @@ class RayEdgeCylinder(VirtualObstacleBase):
             else torch.zeros_like(points, device=self.device)
         )
 
+    def get_points_signed_clearance(self, points, max_clearance: float = 0.04):
+        return (
+            self.cylinders.get_points_signed_clearance(points, max_clearance)
+            if self.cylinders is not None
+            else torch.full(
+                (points.shape[0],),
+                max_clearance,
+                device=points.device,
+                dtype=points.dtype,
+            )
+        )
+
 
 class FeatureEdgeCylinder(VirtualObstacleBase):
     """class for feature-extracted edge detectors."""
@@ -768,6 +792,18 @@ class FeatureEdgeCylinder(VirtualObstacleBase):
             self.cylinders.get_points_penetration_offset(points)
             if self.cylinders is not None
             else torch.zeros_like(points, device=self.device)
+        )
+
+    def get_points_signed_clearance(self, points, max_clearance: float = 0.04):
+        return (
+            self.cylinders.get_points_signed_clearance(points, max_clearance)
+            if self.cylinders is not None
+            else torch.full(
+                (points.shape[0],),
+                max_clearance,
+                device=points.device,
+                dtype=points.dtype,
+            )
         )
 
 

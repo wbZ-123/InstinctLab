@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 from instinctlab_foothold.clearance import (
@@ -5,6 +7,20 @@ from instinctlab_foothold.clearance import (
     check_swing_centerline_penetration,
     sample_swing_centerline,
 )
+
+
+def test_runtime_planner_limits_automatic_apex_height_to_14cm():
+    cfg_path = (
+        Path(__file__).resolve().parents[3]
+        / "source"
+        / "instinctlab"
+        / "instinctlab"
+        / "sensors"
+        / "foothold_planner"
+        / "foothold_planner_cfg.py"
+    )
+
+    assert "clearance_max_apex_height_m: float = 0.14" in cfg_path.read_text()
 
 
 class FakeVerticalCylinderObstacle:

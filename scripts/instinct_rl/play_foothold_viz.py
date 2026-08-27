@@ -52,6 +52,37 @@ def _is_active_swing_mode(gait_mode: int | None) -> bool:
     }
 
 
+def _visible_planner_target_w(
+    data: Any,
+    *,
+    env_id: int,
+    gait_mode: int | None,
+) -> torch.Tensor | None:
+    """Return the latest planner proposal, even when it was not executable."""
+
+    transaction_evaluated = _select_env_int(
+        _safe_getattr(data, "learned_foothold_transaction_evaluated"),
+        env_id,
+    )
+    proposal_w = _select_env_tensor(
+        _safe_getattr(data, "learned_foothold_prepared_w"),
+        env_id,
+    )
+    if (
+        transaction_evaluated
+        and proposal_w is not None
+        and proposal_w.numel() == 3
+        and bool(torch.isfinite(proposal_w).all().item())
+    ):
+        return proposal_w
+
+    if _is_active_swing_mode(gait_mode):
+        return _select_env_tensor(
+            _safe_getattr(data, "target_foothold_w"), env_id
+        )
+    return None
+
+
 def _build_trajectory_points(
     *,
     start_w: torch.Tensor,
@@ -86,8 +117,22 @@ def build_foothold_marker_batch(
     swing_duration_s: float = 0.8,
 ) -> FootholdMarkerBatch | None:
     gait_mode = _select_env_int(_safe_getattr(data, "gait_mode"), env_id)
+    visible_target_w = _visible_planner_target_w(
+        data,
+        env_id=env_id,
+        gait_mode=gait_mode,
+    )
     if not _is_active_swing_mode(gait_mode):
-        return None
+        if visible_target_w is None:
+            return None
+        return FootholdMarkerBatch(
+            translations=visible_target_w.reshape(1, 3),
+            marker_indices=torch.tensor(
+                [MARKER_TARGET],
+                device=visible_target_w.device,
+                dtype=torch.long,
+            ),
+        )
 
     target_w = _select_env_tensor(_safe_getattr(data, "target_foothold_w"), env_id)
     reference_w = _select_env_tensor(_safe_getattr(data, "swing_reference_pos_w"), env_id)
@@ -95,10 +140,18 @@ def build_foothold_marker_batch(
     start_w = _select_env_tensor(_safe_getattr(data, "swing_start_pos_w"), env_id)
     apex_height = _select_env_tensor(_safe_getattr(data, "swing_apex_height"), env_id)
 
-    required = (target_w, reference_w, actual_w, start_w, apex_height)
+    required = (
+        visible_target_w,
+        target_w,
+        reference_w,
+        actual_w,
+        start_w,
+        apex_height,
+    )
     if any(value is None for value in required):
         return None
 
+    assert visible_target_w is not None
     assert target_w is not None
     assert reference_w is not None
     assert actual_w is not None
@@ -115,7 +168,7 @@ def build_foothold_marker_batch(
 
     translations = torch.cat(
         (
-            target_w.reshape(1, 3),
+            visible_target_w.reshape(1, 3),
             reference_w.reshape(1, 3),
             actual_w.reshape(1, 3),
             start_w.reshape(1, 3),

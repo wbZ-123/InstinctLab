@@ -4,7 +4,10 @@ from collections import defaultdict
 
 import warp as wp
 
-from .kernels import points_penetrate_cylinder_kernel
+from .kernels import (
+    points_penetrate_cylinder_kernel,
+    points_signed_clearance_cylinder_kernel,
+)
 
 
 class CylinderSpatialGrid:
@@ -156,3 +159,50 @@ class CylinderSpatialGrid:
         )
 
         return penetration_offset.to(output_device)
+
+    def get_points_signed_clearance(
+        self,
+        points: torch.Tensor,
+        max_clearance: float = 0.04,
+    ) -> torch.Tensor:
+        """Return the nearest signed cylinder-surface distance for each point.
+
+        Positive values are clearance outside the obstacle, negative values
+        are penetration depth, and values are capped at ``max_clearance`` so
+        distant cylinders do not dominate the planner reward.
+        """
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points must have shape (N, 3).")
+        if max_clearance <= 0.0:
+            raise ValueError("max_clearance must be positive.")
+
+        points_wp = wp.from_torch(points, dtype=wp.vec3)
+        signed_clearance = torch.empty(
+            points.shape[0],
+            device=points.device,
+            dtype=points.dtype,
+        )
+        signed_clearance_wp = wp.from_torch(
+            signed_clearance,
+            dtype=wp.float32,
+        )
+
+        wp.launch(
+            points_signed_clearance_cylinder_kernel,
+            dim=points.shape[0],
+            inputs=[
+                points_wp,
+                self.cylinder_start_wp,
+                self.cylinder_end_wp,
+                self.cylinder_thickness_wp,
+                self.cell_offsets_wp,
+                self.cell_indices_wp,
+                self.grid_res_wp,
+                self.bbox_min_wp,
+                self.cell_size_wp,
+                float(max_clearance),
+                signed_clearance_wp,
+            ],
+            device=str(points.device),
+        )
+        return signed_clearance

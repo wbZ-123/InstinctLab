@@ -10,7 +10,13 @@ from instinctlab_foothold.flat_provider import (
 
 
 def test_default_velocity_lookahead_is_short_enough_for_training_curriculum():
-    assert FlatProviderConfig().velocity_lookahead_s == 0.10
+    cfg = FlatProviderConfig()
+
+    assert cfg.velocity_lookahead_s == 0.10
+    assert cfg.outer_radius_x == 1.00
+    assert cfg.outer_radius_y == 0.25
+    assert cfg.curriculum_radius_x == (0.0, 0.0, 0.0)
+    assert cfg.curriculum_radius_y == (0.0, 0.0, 0.0)
 
 
 def test_targets_stay_reachable_and_do_not_cross_legs():
@@ -42,7 +48,7 @@ def test_targets_stay_reachable_and_do_not_cross_legs():
     assert torch.all(right_targets[:, 1] <= -cfg.min_lateral_separation)
 
 
-def test_sampling_is_repeatable_for_same_seed():
+def test_default_targets_are_deterministic_without_curriculum_residual():
     cfg = FlatProviderConfig()
     kwargs = {
         "stance_xy": torch.zeros((32, 2)),
@@ -66,7 +72,9 @@ def test_sampling_is_repeatable_for_same_seed():
     )
 
     torch.testing.assert_close(first.position_f, repeated.position_f)
-    assert not torch.equal(first.position_f, different.position_f)
+    torch.testing.assert_close(first.position_f, different.position_f)
+    torch.testing.assert_close(first.curriculum_residual_f, torch.zeros((32, 2)))
+    torch.testing.assert_close(first.curriculum_usage, torch.zeros(32))
 
 
 def test_curriculum_limits_residual_around_nominal_foothold():
@@ -223,7 +231,7 @@ def test_flat_provider_returns_complete_flat_contract():
     )
     torch.testing.assert_close(
         result.curriculum_radius_f,
-        torch.tensor([0.04, 0.02]).expand(num_envs, 2),
+        torch.zeros((num_envs, 2)),
     )
     assert torch.all(result.curriculum_usage <= 1.0 + 1.0e-6)
 

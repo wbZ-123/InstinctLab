@@ -631,10 +631,18 @@ def advance_gait(
         # cause the planner to synthesize an analytic foothold concurrently.
         recovery_step_pending[state.mode == GaitState.RECOVERY] = False
         recovery_step_active[state.mode == GaitState.RECOVERY] = False
-        exited_recovery = (
+        recovery_single_support = (
             (state.mode == GaitState.RECOVERY)
             & stabilization_ready
+            & any_confirmed_contact
+            & ~both_contacts_confirmed
         )
+        recovery_double_support = (
+            (state.mode == GaitState.RECOVERY)
+            & stabilization_ready
+            & both_contacts_confirmed
+        )
+        exited_recovery = recovery_single_support | recovery_double_support
         if torch.any(exited_recovery).item():
             _, next_swing = support_roles_from_contacts(
                 confirmed_contact,
@@ -645,22 +653,40 @@ def advance_gait(
             swing_side[valid_next_swing] = next_swing[valid_next_swing]
             elapsed_s[exited_recovery] = 0.0
             hold_elapsed_s[exited_recovery] = 0.0
-            # Both feet have already passed the per-foot contact confirmation.
-            # Resume through the same short HOLD handshake used after a normal
-            # touchdown; the long reset hold is reserved for episode startup.
+            # The confirmed support foot has passed the per-foot contact
+            # confirmation. Resume through the same short HOLD handshake used
+            # after a normal touchdown; the long reset hold is reserved for
+            # episode startup.
             hold_required_s[exited_recovery] = step_hold_s[exited_recovery]
             stabilization_elapsed_s[exited_recovery] = 0.0
-            recovery_step_pending[exited_recovery] = False
-            recovery_step_active[exited_recovery] = False
+            recovery_step_pending[recovery_single_support] = True
+            recovery_step_active[recovery_single_support] = False
+            recovery_step_pending[recovery_double_support] = False
+            recovery_step_active[recovery_double_support] = False
 
     planning_failure_state |= planning_failure
-    # A failed preflight is a planning transaction failure, not a physical
-    # contact failure.  Stay in HOLD and let the planner propose again.
-    mode[planning_failure] = GaitState.HOLD
-    elapsed_s[planning_failure] = 0.0
-    hold_elapsed_s[planning_failure] = 0.0
-    recovery_step_pending[planning_failure] = False
-    recovery_step_active[planning_failure] = False
+    # A failed normal preflight is a planning transaction failure, not a
+    # physical contact failure: stay in HOLD and let the planner propose the
+    # safe nominal fallback.  A geometrically invalid recovery proposal has
+    # no such fallback, so return to RECOVERY and require a fresh one-shot
+    # recovery transaction instead of leaving a pending HOLD latched forever.
+    recovery_plan_failure = (
+        contact_adaptive
+        & planning_failure
+        & state.recovery_step_pending
+    )
+    normal_plan_failure = planning_failure & ~recovery_plan_failure
+    mode[normal_plan_failure] = GaitState.HOLD
+    elapsed_s[normal_plan_failure] = 0.0
+    hold_elapsed_s[normal_plan_failure] = 0.0
+    recovery_step_pending[normal_plan_failure] = False
+    recovery_step_active[normal_plan_failure] = False
+    mode[recovery_plan_failure] = GaitState.RECOVERY
+    elapsed_s[recovery_plan_failure] = 0.0
+    hold_elapsed_s[recovery_plan_failure] = 0.0
+    recovery_step_pending[recovery_plan_failure] = False
+    recovery_step_active[recovery_plan_failure] = False
+    stabilization_elapsed_s[recovery_plan_failure] = 0.0
 
     # The late-contact timer belongs to one locked swing only.  It must never
     # leak through touchdown, recovery, or a fresh HOLD transaction.

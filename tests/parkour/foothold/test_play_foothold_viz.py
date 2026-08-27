@@ -79,3 +79,22 @@ def test_build_foothold_marker_batch_returns_none_when_not_active_swing():
     )
 
     assert module.build_foothold_marker_batch(data, env_id=0) is None
+
+
+def test_build_foothold_marker_batch_shows_unsafe_planner_proposal_during_hold():
+    module = _load_play_foothold_viz_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([0]),
+        learned_foothold_transaction_evaluated=torch.tensor([True]),
+        learned_foothold_prepared_w=torch.tensor([[1.2, -0.3, 0.25]]),
+        learned_foothold_safety_valid=torch.tensor([False]),
+    )
+
+    batch = module.build_foothold_marker_batch(data, env_id=0)
+
+    assert batch is not None
+    assert batch.translations.shape == (1, 3)
+    assert batch.marker_indices.tolist() == [module.MARKER_TARGET]
+    assert torch.allclose(
+        batch.translations[0], torch.tensor([1.2, -0.3, 0.25])
+    )

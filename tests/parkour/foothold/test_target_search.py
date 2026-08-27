@@ -5,6 +5,7 @@ from instinctlab_foothold.target_search import (
     evaluate_safe_foothold_target,
     make_sole_perimeter_points_xy,
     score_sole_perimeter_penetration,
+    score_sole_perimeter_safety_margin,
     search_safe_foothold_target,
 )
 
@@ -179,6 +180,18 @@ def test_any_sole_penetration_is_negative_and_worsens_with_count_or_depth():
     assert torch.all(result.score < 0.0)
     assert result.score[1] < result.score[0]
     assert result.score[2] < result.score[1]
+
+
+def test_safety_margin_keeps_clearance_continuous_and_penetration_negative():
+    score = score_sole_perimeter_safety_margin(
+        torch.tensor([[0.04, 0.02], [-0.01, -0.02]]),
+        penetrating_point_ratio=torch.tensor([0.0, 1.0]),
+        total_penetration_depth=torch.tensor([0.0, 0.03]),
+        full_penalty_depth_m=0.02,
+        reference_clearance_m=0.04,
+    )
+
+    torch.testing.assert_close(score, torch.tensor([0.5, -0.875]))
 
 
 def test_returns_nominal_target_when_sole_points_are_safe():
@@ -361,6 +374,8 @@ def test_evaluate_safe_foothold_target_treats_nonfinite_penetration_as_unsafe():
     assert not result.valid.item()
     assert not result.obstacle_safe.item()
     assert torch.isfinite(result.safety_score).all()
+    assert torch.isfinite(result.minimum_signed_clearance).all()
+    assert torch.isfinite(result.safety_margin_score).all()
     assert torch.isfinite(result.total_penetration_depth).all()
     torch.testing.assert_close(result.safety_score, torch.tensor([-1.0]))
     torch.testing.assert_close(

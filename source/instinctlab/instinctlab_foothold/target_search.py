@@ -11,6 +11,13 @@ class PenetrationObstacle(Protocol):
     def get_points_penetration_offset(self, points: torch.Tensor) -> torch.Tensor:
         ...
 
+    def get_points_signed_clearance(
+        self,
+        points: torch.Tensor,
+        max_clearance: float = 0.04,
+    ) -> torch.Tensor:
+        ...
+
 
 TerrainHeightQuery = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 
@@ -56,6 +63,8 @@ class SafeFootholdTargetEvaluation:
     penetrating_point_count: torch.Tensor
     penetrating_point_ratio: torch.Tensor
     safety_score: torch.Tensor
+    minimum_signed_clearance: torch.Tensor
+    safety_margin_score: torch.Tensor
 
 
 @dataclass
@@ -64,6 +73,46 @@ class SolePerimeterPenetrationScore:
     penetrating_point_count: torch.Tensor
     penetrating_point_ratio: torch.Tensor
     total_penetration_depth: torch.Tensor
+
+
+def score_sole_perimeter_safety_margin(
+    signed_clearances: torch.Tensor,
+    *,
+    penetrating_point_ratio: torch.Tensor,
+    total_penetration_depth: torch.Tensor,
+    full_penalty_depth_m: float = 0.02,
+    reference_clearance_m: float = 0.04,
+) -> torch.Tensor:
+    """Score clearance continuously while keeping penetration negative.
+
+    ``signed_clearances`` is positive outside the nearest danger cylinder and
+    negative inside.  Safe targets receive a capped minimum-clearance score;
+    penetrating targets retain the existing count/depth penalty semantics.
+    """
+    if signed_clearances.ndim < 2 or signed_clearances.shape[-1] < 1:
+        raise ValueError("signed_clearances must contain sole points.")
+    if full_penalty_depth_m <= 0.0 or reference_clearance_m <= 0.0:
+        raise ValueError("clearance scales must be positive.")
+
+    minimum_clearance = torch.min(signed_clearances, dim=-1).values
+    penetrating = minimum_clearance < 0.0
+    normalized_depth = torch.clamp(
+        total_penetration_depth
+        / (signed_clearances.shape[-1] * full_penalty_depth_m),
+        min=0.0,
+        max=1.0,
+    )
+    unsafe_score = -torch.clamp(
+        0.5 * penetrating_point_ratio + 0.5 * normalized_depth,
+        min=0.0,
+        max=1.0,
+    )
+    safe_score = torch.clamp(
+        minimum_clearance / reference_clearance_m,
+        min=0.0,
+        max=1.0,
+    )
+    return torch.where(penetrating, unsafe_score, safe_score)
 
 
 def score_sole_perimeter_penetration(
@@ -234,6 +283,85 @@ def _target_penetration_depths(
         num_foot_points,
     )
     return penetration
+
+
+def _target_signed_clearances(
+    *,
+    target_f: torch.Tensor,
+    target_origin_w: torch.Tensor,
+    target_yaw_w: torch.Tensor,
+    foot_points_xy: torch.Tensor,
+    obstacle: PenetrationObstacle,
+    max_clearance: float,
+) -> torch.Tensor:
+    """Return signed clearance for every target sole-perimeter point."""
+    foot_points_f = _expand_foot_points(target_f, foot_points_xy)
+    foot_points_w = (
+        target_origin_w[:, None, :]
+        + _rotate_points_yaw(foot_points_f, target_yaw_w[:, None])
+    )
+    num_targets = foot_points_w.shape[0]
+    num_foot_points = foot_points_w.shape[1]
+    flat_foot_points_w = foot_points_w.reshape(num_targets * num_foot_points, 3)
+    clearance_query = getattr(obstacle, "get_points_signed_clearance", None)
+    if clearance_query is None:
+        penetration = _target_penetration_depths(
+            target_f=target_f,
+            target_origin_w=target_origin_w,
+            target_yaw_w=target_yaw_w,
+            foot_points_xy=foot_points_xy,
+            obstacle=obstacle,
+        )
+        penetration = torch.nan_to_num(
+            penetration,
+            nan=max_clearance,
+            posinf=max_clearance,
+            neginf=0.0,
+        )
+        return torch.where(
+            penetration > 0.0,
+            -penetration,
+            torch.zeros_like(penetration),
+        )
+
+    try:
+        signed = clearance_query(flat_foot_points_w, max_clearance)
+    except NotImplementedError:
+        # ``VirtualObstacleBase`` exposes the optional method so concrete
+        # obstacles have a stable interface.  Older/custom obstacles may
+        # inherit the default implementation; retain the penetration-only
+        # fallback instead of turning that optional capability into a hard
+        # requirement.
+        penetration = _target_penetration_depths(
+            target_f=target_f,
+            target_origin_w=target_origin_w,
+            target_yaw_w=target_yaw_w,
+            foot_points_xy=foot_points_xy,
+            obstacle=obstacle,
+        )
+        penetration = torch.nan_to_num(
+            penetration,
+            nan=max_clearance,
+            posinf=max_clearance,
+            neginf=0.0,
+        )
+        return torch.where(
+            penetration > 0.0,
+            -penetration,
+            torch.zeros_like(penetration),
+        )
+    if signed.ndim != 1 or signed.shape[0] != flat_foot_points_w.shape[0]:
+        raise ValueError("signed clearance query must return shape (N,).")
+    signed = torch.nan_to_num(
+        signed.to(device=target_f.device, dtype=target_f.dtype),
+        nan=-max_clearance,
+        posinf=max_clearance,
+        neginf=-max_clearance,
+    )
+    return signed.reshape(num_targets, num_foot_points).clamp(
+        min=-max_clearance,
+        max=max_clearance,
+    )
 
 
 def _target_max_penetration_depth(
@@ -490,6 +618,7 @@ def evaluate_safe_foothold_target(
     max_penetrating_points: int = 0,
     terrain_height_query_w: TerrainHeightQuery | None = None,
     max_step_height_m: float | None = None,
+    clearance_reference_m: float = 0.04,
 ) -> SafeFootholdTargetEvaluation:
     """Evaluate one terrain-aware foothold target without fallback search.
 
@@ -501,6 +630,8 @@ def evaluate_safe_foothold_target(
 
     if max_penetrating_points < 0:
         raise ValueError("max_penetrating_points must be non-negative.")
+    if clearance_reference_m <= 0.0:
+        raise ValueError("clearance_reference_m must be positive.")
 
     foot_points_xy = foot_points_xy.to(device=target_f.device, dtype=target_f.dtype)
     if target_origin_w is None:
@@ -541,6 +672,21 @@ def evaluate_safe_foothold_target(
     penetration_score = score_sole_perimeter_penetration(
         positive_penetration_depths,
     )
+    signed_clearances = _target_signed_clearances(
+        target_f=lifted_target_f,
+        target_origin_w=target_origin_w,
+        target_yaw_w=target_yaw_w,
+        foot_points_xy=foot_points_xy,
+        obstacle=obstacle,
+        max_clearance=clearance_reference_m,
+    )
+    minimum_signed_clearance = torch.min(signed_clearances, dim=-1).values
+    safety_margin_score = score_sole_perimeter_safety_margin(
+        signed_clearances,
+        penetrating_point_ratio=penetration_score.penetrating_point_ratio,
+        total_penetration_depth=penetration_score.total_penetration_depth,
+        reference_clearance_m=clearance_reference_m,
+    )
     mean_penetration_depth = torch.mean(positive_penetration_depths, dim=-1)
     finite_penetration = torch.isfinite(penetration_depths).all(dim=-1)
     hard_penetrating_point_count = (
@@ -568,6 +714,8 @@ def evaluate_safe_foothold_target(
             penetration_score.penetrating_point_ratio
         ),
         safety_score=penetration_score.score,
+        minimum_signed_clearance=minimum_signed_clearance,
+        safety_margin_score=safety_margin_score,
     )
 
 

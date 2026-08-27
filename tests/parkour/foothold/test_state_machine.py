@@ -1284,6 +1284,75 @@ def test_contact_adaptive_recovery_requires_stability_and_rebuilds_swing_role():
     assert state.mode.item() == GaitState.HOLD
     assert state.swing_side.item() == 1
     torch.testing.assert_close(state.hold_required_s, torch.tensor([0.04]))
+    assert state.recovery_step_pending.item()
+
+
+def test_contact_adaptive_recovery_with_no_confirmed_contact_stays_in_recovery():
+    state = initial_gait_state(1, device="cpu")
+    state.mode.fill_(GaitState.RECOVERY)
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[False, False]]),
+        touchdown_accepted=torch.tensor([False]),
+        planner_valid=torch.tensor([True]),
+        dt=0.02,
+        cfg=GaitMachineConfig(),
+        event_response=torch.tensor([EventResponse.STABILIZE]),
+        stabilization_ready=torch.tensor([True]),
+        stability_current=torch.tensor([True]),
+    )
+
+    assert state.mode.item() == GaitState.RECOVERY
+    assert not state.recovery_step_pending.item()
+
+
+def test_contact_adaptive_recovery_double_support_exits_without_recovery_step():
+    state = initial_gait_state(1, device="cpu")
+    state.mode.fill_(GaitState.RECOVERY)
+    state.contact_elapsed_s.fill_(0.04)
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[True, True]]),
+        touchdown_accepted=torch.tensor([False]),
+        planner_valid=torch.tensor([True]),
+        dt=0.02,
+        cfg=GaitMachineConfig(),
+        event_response=torch.tensor([EventResponse.STABILIZE]),
+        stabilization_ready=torch.tensor([True]),
+        stability_current=torch.tensor([True]),
+    )
+
+    assert state.mode.item() == GaitState.HOLD
+    assert not state.recovery_step_pending.item()
+
+
+def test_contact_adaptive_invalid_recovery_plan_returns_to_recovery():
+    state = initial_gait_state(1, device="cpu")
+    state.mode.fill_(GaitState.HOLD)
+    state.recovery_step_pending.fill_(True)
+    state.hold_required_s.fill_(0.0)
+    state.contact_elapsed_s[:, 0] = 0.04
+
+    state = advance_gait(
+        state=state,
+        contact=torch.tensor([[True, False]]),
+        touchdown_accepted=torch.tensor([False]),
+        planner_valid=torch.tensor([True]),
+        dt=0.02,
+        cfg=GaitMachineConfig(),
+        event_response=torch.tensor([EventResponse.NONE]),
+        stabilization_ready=torch.tensor([True]),
+        stability_current=torch.tensor([True]),
+        swing_ready=torch.tensor([False]),
+        hold_contact_ready=torch.tensor([True]),
+        plan_wait_expired=torch.tensor([True]),
+        planning_failure=torch.tensor([True]),
+    )
+
+    assert state.mode.item() == GaitState.RECOVERY
+    assert not state.recovery_step_pending.item()
 
 
 def test_contact_adaptive_recovery_dwell_does_not_accumulate_across_unstable_frames():
@@ -1379,6 +1448,7 @@ def test_late_search_timer_is_cleared_before_the_next_swing_transaction():
     state = initial_gait_state(1, device="cpu")
     state.mode.fill_(GaitState.RECOVERY)
     state.late_search_elapsed_s.fill_(0.12)
+    state.contact_elapsed_s[0, 0] = 0.04
 
     state = advance_gait(
         state=state,

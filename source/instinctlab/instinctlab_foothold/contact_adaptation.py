@@ -188,8 +188,8 @@ def response_for_event(
     response[
         late & ~late_touchdown_confirmed.bool() & ~late_search_available.bool()
     ] = EventResponse.STABILIZE
-    # A lost stance is a physical gait failure.  Even if one foot remains in
-    # contact, let the motor policy restore double support; do not create a
-    # separate single-support planner/recovery step here.
+    # A lost stance is a physical gait failure.  Recovery first belongs to the
+    # motor policy; if one foot is later confirmed, the state machine may open
+    # one single-support learned-planner transaction.
     response[support_lost] = EventResponse.STABILIZE
     return response

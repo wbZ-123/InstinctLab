@@ -224,7 +224,7 @@ def test_late_touchdown_search_is_limited_to_existing_touchdown_z_tolerance():
     assert "self.cfg.max_foothold_step_height_m / late_speed" not in planner_text
 
 
-def test_learned_recovery_cannot_create_or_execute_an_analytic_recovery_step():
+def test_contact_adaptive_recovery_allows_learned_recovery_transaction():
     planner_text = _planner_source_path("foothold_planner.py").read_text()
     learned_block = planner_text[
         planner_text.index("if self.cfg.enable_learned_foothold:") :
@@ -232,7 +232,8 @@ def test_learned_recovery_cannot_create_or_execute_an_analytic_recovery_step():
     ]
 
     assert "make_recovery_foothold_target" not in learned_block
-    assert "recovery_step.zero_()" in planner_text
+    assert "recovery_step_pending" in learned_block
+    assert "lock_recovery_step" in planner_text
 
 
 def test_environment_enables_nominal_observation_only_with_learned_action():
@@ -662,7 +663,7 @@ def test_safe_learned_proposal_remains_swing_ready_after_event_pulse_clears():
     assert ready.tolist() == [True]
 
 
-def test_recovery_swing_does_not_wait_for_or_use_learned_evaluation():
+def test_recovery_swing_waits_for_geometrically_valid_learned_evaluation():
     ready = learned_foothold_swing_ready(
         nominal_route_ready=torch.tensor([True, False]),
         transaction_evaluated=torch.tensor([False, True]),
@@ -672,10 +673,10 @@ def test_recovery_swing_does_not_wait_for_or_use_learned_evaluation():
         recovery_step=torch.tensor([True, True]),
     )
 
-    assert ready.tolist() == [True, False]
+    assert ready.tolist() == [False, True]
 
 
-def test_execution_route_executes_geometric_unsafe_learned_but_blocks_recovery():
+def test_execution_route_keeps_danger_gate_for_normal_walk_but_not_recovery():
     route = route_nominal_and_learned_footholds(
         nominal_geometric_valid=torch.tensor([False, False]),
         nominal_safety_valid=torch.tensor([False, False]),
@@ -685,11 +686,11 @@ def test_execution_route_executes_geometric_unsafe_learned_but_blocks_recovery()
         recovery_step=torch.tensor([False, True]),
     )
 
-    # Danger-cylinder safety remains a PPO event signal, but an unsafe target
-    # cannot enter a locked swing transaction.
+    # Normal walking retains the safety gate, while Recovery uses the learned
+    # geometrically valid point so the event can be learned from execution.
     assert route.use_nominal.tolist() == [False, False]
-    assert route.use_learned.tolist() == [False, False]
-    assert route.executable.tolist() == [False, False]
+    assert route.use_learned.tolist() == [False, True]
+    assert route.executable.tolist() == [False, True]
 
 
 def test_lock_requires_execution_safety_even_when_geometry_is_valid():
@@ -713,7 +714,7 @@ def test_lock_requires_execution_safety_even_when_geometry_is_valid():
     assert data.learned_foothold_locked.tolist() == [True, False]
 
 
-def test_recovery_route_uses_geometric_analytic_target_even_if_soft_unsafe():
+def test_recovery_route_uses_geometric_learned_target_even_if_soft_unsafe():
     route = route_nominal_and_learned_footholds(
         nominal_geometric_valid=torch.tensor([True]),
         nominal_safety_valid=torch.tensor([False]),
@@ -724,8 +725,8 @@ def test_recovery_route_uses_geometric_analytic_target_even_if_soft_unsafe():
     )
 
     assert route.use_nominal.tolist() == [False]
-    assert route.use_learned.tolist() == [False]
-    assert route.executable.tolist() == [False]
+    assert route.use_learned.tolist() == [True]
+    assert route.executable.tolist() == [True]
 
 
 def test_prepare_target_queries_world_xy_and_applies_existing_height_limit():

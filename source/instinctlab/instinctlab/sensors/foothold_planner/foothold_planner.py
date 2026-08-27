@@ -681,6 +681,11 @@ class FootholdPlanner(SensorBase):
             penetrating_point_count = torch.zeros_like(safety_score)
             penetrating_point_ratio = torch.zeros_like(safety_score)
             total_penetration_depth = torch.zeros_like(safety_score)
+            safety_margin_score = torch.ones_like(safety_score)
+            minimum_signed_clearance = torch.full_like(
+                safety_score,
+                self.cfg.safe_target_clearance_reference_m,
+            )
         else:
             evaluation = evaluate_safe_foothold_target(
                 target_f=preparation.target_f,
@@ -699,6 +704,9 @@ class FootholdPlanner(SensorBase):
                 max_penetrating_points=(
                     self.cfg.safe_target_max_penetrating_points
                 ),
+                clearance_reference_m=(
+                    self.cfg.safe_target_clearance_reference_m
+                ),
             )
             safety_valid = evaluation.obstacle_safe
             safety_score = evaluation.safety_score
@@ -711,6 +719,8 @@ class FootholdPlanner(SensorBase):
             total_penetration_depth = (
                 evaluation.total_penetration_depth
             )
+            safety_margin_score = evaluation.safety_margin_score
+            minimum_signed_clearance = evaluation.minimum_signed_clearance
 
         store_learned_foothold_preparation(
             data=self._data,
@@ -721,6 +731,8 @@ class FootholdPlanner(SensorBase):
             penetrating_point_count=penetrating_point_count,
             penetrating_point_ratio=penetrating_point_ratio,
             total_penetration_depth=total_penetration_depth,
+            safety_margin_score=safety_margin_score,
+            minimum_signed_clearance=minimum_signed_clearance,
         )
 
     def _prepare_nominal_footholds(
@@ -1428,6 +1440,14 @@ class FootholdPlanner(SensorBase):
             dtype=torch.long,
         )
         self._data.learned_foothold_safety_score = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.learned_foothold_safety_margin_score = torch.zeros(
+            self._num_envs,
+            device=self._device,
+        )
+        self._data.learned_foothold_minimum_signed_clearance = torch.zeros(
             self._num_envs,
             device=self._device,
         )
@@ -2247,20 +2267,16 @@ class FootholdPlanner(SensorBase):
                 nominal_ready=nominal_ready_before_update,
                 startup_hold=startup_hold_mask,
             )
-            # In contact-adaptive recovery the motor policy owns recovery.
-            # Do not create an analytic recovery target that can race the
-            # autonomous stabilization behavior.
+            # A single-support recovery HOLD is a real one-shot planning
+            # transaction.  Its nominal recovery target is prepared with the
+            # same frozen support frame as a normal HOLD; the learned route
+            # may then replace it after the next control-cycle evaluation.
             if self.cfg.enable_contact_adaptive_recovery:
                 prepare_nominal &= ~recovery_mode
             if torch.any(prepare_nominal).item():
                 recovery_step = previous_gait_state.recovery_step_pending[
                     prepare_nominal
                 ].clone()
-                if self.cfg.enable_contact_adaptive_recovery:
-                    # Keep this as a boolean mask.  Applying Python's ``~``
-                    # to a bool produces an integer (-1/-2), which would be
-                    # interpreted as row indices by torch advanced indexing.
-                    recovery_step.zero_()
                 self._prepare_nominal_footholds(
                     env_ids=selected_env_ids[prepare_nominal],
                     swing_side=previous_gait_state.swing_side[
@@ -2280,15 +2296,18 @@ class FootholdPlanner(SensorBase):
             enable=self.cfg.enable_learned_foothold,
         )
         prepare_learned &= ~startup_hold_mask
-        # Recovery uses only the analytic target.  Do not evaluate a learned
-        # proposal that cannot be executed; it would add an unconsumed PPO
-        # event and waste a control-step terrain/safety computation.
-        prepare_learned &= ~previous_gait_state.recovery_step_pending
+        # Legacy recovery steps remain analytic-only.  Contact-adaptive
+        # recovery is different: after a confirmed single support it enters a
+        # HOLD transaction and evaluates one learned proposal for the other
+        # foot.
+        if not self.cfg.enable_contact_adaptive_recovery:
+            prepare_learned &= ~previous_gait_state.recovery_step_pending
         if self.cfg.enable_contact_adaptive_recovery:
             prepare_learned &= ~recovery_mode
         # Evaluate at most one learned action per HOLD transaction. An unsafe
-        # action keeps its single PPO penalty while routing falls back to the
-        # safe nominal target; ordinary control updates must not resample it.
+        # action keeps its single PPO penalty; recovery may execute it when
+        # its 3-D geometry is valid, while ordinary walking retains the
+        # danger-cylinder gate.
         if self.cfg.enable_learned_foothold:
             assert (
                 self._data.learned_foothold_transaction_evaluated is not None
@@ -2321,6 +2340,18 @@ class FootholdPlanner(SensorBase):
                     selected_env_ids
                 ],
             )
+            if self.cfg.enable_contact_adaptive_recovery:
+                # A recovery transaction is one-shot even when its learned
+                # proposal is geometrically invalid.  Re-sampling it every
+                # control step would sever the action-to-outcome relation and
+                # flood PPO with duplicate events.
+                already_usable = torch.where(
+                    previous_gait_state.recovery_step_pending,
+                    self._data.learned_foothold_transaction_evaluated[
+                        selected_env_ids
+                    ],
+                    already_usable,
+                )
             prepare_learned &= ~already_usable
         if torch.any(prepare_learned).item():
             prepare_env_ids = selected_env_ids[prepare_learned]
@@ -2436,10 +2467,10 @@ class FootholdPlanner(SensorBase):
                 ),
                 recovery_step=previous_gait_state.recovery_step_pending,
             )
-            # Preserve a failed preflight through the reward step that owns
-            # the learned event. On the following HOLD update, discard only
-            # the cached trajectory result and preflight the safe nominal
-            # fallback without sampling another learned action.
+            # Preserve a failed normal-walk preflight through the reward step
+            # that owns the learned event. Recovery treats obstacle clearance
+            # as a soft learning signal, so it is not converted into a failed
+            # route below.
             retry_failed_preflight = (
                 preflight_window
                 & self._data.learned_foothold_transaction_evaluated[
@@ -2464,6 +2495,9 @@ class FootholdPlanner(SensorBase):
             )
             if torch.any(preflight_candidate).item():
                 preflight_env_ids = selected_env_ids[preflight_candidate]
+                preflight_recovery = previous_gait_state.recovery_step_pending[
+                    preflight_candidate
+                ]
                 preflight_target_w = select_preflight_target_w(
                     route_use_learned=(
                         preflight_route.use_learned[preflight_candidate]
@@ -2526,7 +2560,12 @@ class FootholdPlanner(SensorBase):
                             self.cfg.safe_target_max_penetrating_points
                         ),
                     )
-                    preflight_safe = adjustment.is_safe
+                    obstacle_preflight_safe = adjustment.is_safe
+                    preflight_safe = torch.where(
+                        preflight_recovery,
+                        torch.ones_like(obstacle_preflight_safe),
+                        obstacle_preflight_safe,
+                    )
                     preflight_apex = adjustment.apex_height
                     preflight_penetration = (
                         adjustment.penetration.max_penetration_depth
@@ -2572,12 +2611,17 @@ class FootholdPlanner(SensorBase):
                 self._data.swing_clearance_start_escape_safe[
                     preflight_env_ids
                 ] = preflight_start_escape_safe
-                failed_preflight = preflight_env_ids[~preflight_safe]
+                failed_preflight = preflight_env_ids[
+                    ~preflight_safe & ~preflight_recovery
+                ]
                 if failed_preflight.numel() > 0:
                     # Keep the learned action's single PPO outcome, but remove
-                    # it from execution routing. The persistent HOLD latch
-                    # prevents resampling; the next cycle preflights the safe
-                    # nominal fallback instead.
+                    # a failed normal-walk action from execution routing. The
+                    # persistent HOLD latch prevents resampling; the next
+                    # cycle preflights the safe nominal fallback instead. A
+                    # recovery proposal never has that fallback: an invalid
+                    # 3-D target is handled as a fresh recovery attempt by
+                    # the state machine below.
                     self._data.learned_foothold_prepared_valid[
                         failed_preflight
                     ] = False
@@ -2620,10 +2664,11 @@ class FootholdPlanner(SensorBase):
             assert self._data.body_horizontal_speed_m_s is not None
             assert self._data.support_slip_m_s is not None
             # Each foot has already passed the existing contact-confirmation
-            # interval before appearing in ``confirmed_contact``.  Recovery is
-            # only a contact resynchronization phase, so do not impose a second
-            # dwell after both confirmed contacts are available.
-            stabilization_ready = recovery_contact_stable
+            # interval before appearing in ``confirmed_contact``.  A single
+            # confirmed support is enough to open the one-shot recovery HOLD;
+            # zero confirmed supports remain in RECOVERY.  Double support is
+            # still reported for diagnostics and normal gait hand-off.
+            stabilization_ready = support_available
             event = torch.full_like(
                 previous_gait_state.mode,
                 ContactEvent.NONE,
@@ -2767,6 +2812,11 @@ class FootholdPlanner(SensorBase):
             | (gait_state.mode == GaitState.RIGHT_SWING)
         )
         new_swing = active_swing & (gait_state.elapsed_s <= 1.0e-6)
+        # Snapshot the recovery role before any route-locking logic consumes
+        # it.  Keep the full selected-environment mask for the lock route and
+        # slice it to the new-swing batch below; mixing those two shapes would
+        # misclassify recovery targets in partially active batches.
+        recovery_step_by_env = gait_state.recovery_step_active
         learned_use = torch.zeros_like(new_swing)
         if self.cfg.enable_learned_foothold:
             _, lock_learned = learned_foothold_event_masks(
@@ -2778,20 +2828,29 @@ class FootholdPlanner(SensorBase):
             )
             if torch.any(lock_learned).item():
                 lock_env_ids = selected_env_ids[lock_learned]
+                lock_recovery_step = recovery_step_by_env[lock_learned]
+                lock_safety_valid = self._data.learned_foothold_safety_valid[
+                    lock_env_ids
+                ]
+                # Recovery deliberately executes geometrically valid learned
+                # targets even when their danger-cylinder score is negative;
+                # normal walking keeps the existing safety gate.
+                lock_safety_valid = torch.where(
+                    lock_recovery_step,
+                    torch.ones_like(lock_safety_valid),
+                    lock_safety_valid,
+                )
                 learned_use[lock_learned] = (
                     lock_prepared_learned_foothold(
                         data=self._data,
                         env_ids=lock_env_ids,
-                        safety_valid=(
-                            self._data.learned_foothold_safety_valid[
-                                lock_env_ids
-                            ]
-                        ),
+                        safety_valid=lock_safety_valid,
                     )
                 )
 
         if torch.any(new_swing).item():
             new_swing_env_ids = selected_env_ids[new_swing]
+            recovery_step = recovery_step_by_env[new_swing]
             new_swing_stance_pos_w = stance_pos_w[new_swing].clone()
             new_swing_side = gait_state.swing_side[new_swing]
             new_swing_count = new_swing_stance_pos_w.shape[0]
@@ -2855,7 +2914,6 @@ class FootholdPlanner(SensorBase):
                 self._data.swing_start_pos_w[new_swing_env_ids],
                 live_swing_start_w,
             )
-            recovery_step = gait_state.recovery_step_active[new_swing]
             if self.cfg.enable_learned_foothold:
                 assert self._data.nominal_foothold_prepared is not None
                 missing_nominal = ~self._data.nominal_foothold_prepared[

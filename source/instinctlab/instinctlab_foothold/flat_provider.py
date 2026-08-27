@@ -5,15 +5,18 @@ import torch
 
 @dataclass(frozen=True)
 class FlatProviderConfig:
-    # 临时保守值，后续由 G1 运动学扫描标定。
-    outer_radius_x: float = 0.42
+    # Fixed reachability ellipse in the frozen support-foot frame.
+    outer_radius_x: float = 1.00
     outer_radius_y: float = 0.25
     min_lateral_separation: float = 0.06
 
     nominal_step_width: float = 0.18
     velocity_lookahead_s: float = 0.10
-    curriculum_radius_x: tuple[float, ...] = (0.04, 0.08, 0.12)
-    curriculum_radius_y: tuple[float, ...] = (0.02, 0.04, 0.06)
+    # Kept as zero-valued compatibility fields for existing telemetry and
+    # checkpoints. The nominal XY foothold no longer receives curriculum
+    # random residuals at any level.
+    curriculum_radius_x: tuple[float, ...] = (0.0, 0.0, 0.0)
+    curriculum_radius_y: tuple[float, ...] = (0.0, 0.0, 0.0)
 
     curriculum_yaw_limit_rad: tuple[float, ...] = (
         0.0,

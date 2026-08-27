@@ -346,7 +346,7 @@ def test_planner_uses_event_gated_hold_contact_readiness():
         planner_text.index("recovery_contact_stable = torch.all(") :
         planner_text.index("event = torch.full_like(", planner_text.index("recovery_contact_stable = torch.all("))
     ]
-    assert "stabilization_ready = recovery_contact_stable" in recovery_gate_block
+    assert "stabilization_ready = support_available" in recovery_gate_block
     assert "stability_ready(" not in recovery_gate_block
     assert planner_text.count("hold_contact_ready=hold_contact_ready") >= 2
     assert "hold_contact_lost=hold_contact_lost" in planner_text

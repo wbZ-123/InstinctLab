@@ -219,8 +219,10 @@ def route_nominal_and_learned_footholds(
 
     During normal walking, a learned proposal must pass both geometry and
     danger-cylinder safety before it can be executed. A safe nominal target is
-    the fallback when the learned proposal is not executable. Recovery steps
-    remain analytic and nominal-only, but still require the same safety gate.
+    the fallback when the learned proposal is not executable. A
+    contact-adaptive recovery step may execute a geometrically valid learned
+    target even when its danger-cylinder score is negative; that score remains
+    a PPO learning signal rather than an execution gate.
     """
 
     if not (
@@ -245,20 +247,31 @@ def route_nominal_and_learned_footholds(
         learned_safety_valid = torch.ones_like(learned_geometric_valid)
     if learned_safety_valid.shape != learned_geometric_valid.shape:
         raise ValueError("learned_safety_valid must match the route masks.")
-    learned_available = (
+    learned_available_safe = (
         learned_prepared.bool()
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    use_learned = ~recovery_mask & learned_available
+    learned_available_recovery = (
+        learned_prepared.bool()
+        & learned_geometric_valid.bool()
+    )
+    use_learned = torch.where(
+        recovery_mask,
+        learned_available_recovery,
+        learned_available_safe,
+    )
 
-    # Both normal walking and legacy analytic recovery require the same safety
-    # gate. A target that reaches SWING must already be safe; a failed
-    # preflight stays in HOLD for a fresh proposal rather than being accepted
-    # here and rejected later by the trajectory checker.
+    # Normal walking retains the danger-cylinder gate. Recovery deliberately
+    # treats that gate as a learning signal: a geometrically valid learned
+    # point may be executed even when its safety score is negative. Geometry
+    # remains a hard boundary because an invalid 3-D target cannot be a useful
+    # training action.
     safe_nominal = nominal_geometric_valid.bool() & nominal_safety_valid.bool()
-    use_nominal = (recovery_mask & safe_nominal) | (
-        ~recovery_mask & ~use_learned & safe_nominal
+    use_nominal = (
+        ~recovery_mask
+        & ~use_learned
+        & safe_nominal
     )
     return LearnedFootholdRoute(
         use_nominal=use_nominal,
@@ -277,6 +290,8 @@ def store_learned_foothold_preparation(
     penetrating_point_count: torch.Tensor,
     penetrating_point_ratio: torch.Tensor,
     total_penetration_depth: torch.Tensor,
+    safety_margin_score: torch.Tensor | None = None,
+    minimum_signed_clearance: torch.Tensor | None = None,
 ) -> None:
     """Store a proposal and its score without silently replacing unsafe data."""
 
@@ -298,6 +313,16 @@ def store_learned_foothold_preparation(
         preparation.geometric_valid
     )
     data.learned_foothold_safety_score[env_ids] = safety_score
+    if safety_margin_score is not None and getattr(
+        data, "learned_foothold_safety_margin_score", None
+    ) is not None:
+        data.learned_foothold_safety_margin_score[env_ids] = safety_margin_score
+    if minimum_signed_clearance is not None and getattr(
+        data, "learned_foothold_minimum_signed_clearance", None
+    ) is not None:
+        data.learned_foothold_minimum_signed_clearance[env_ids] = (
+            minimum_signed_clearance
+        )
     data.learned_foothold_penetrating_point_count[env_ids] = (
         penetrating_point_count
     )
@@ -351,6 +376,8 @@ def clear_learned_foothold_buffers(
         "learned_foothold_target_f",
         "learned_foothold_target_w",
         "learned_foothold_safety_score",
+        "learned_foothold_safety_margin_score",
+        "learned_foothold_minimum_signed_clearance",
         "learned_foothold_penetrating_point_count",
         "learned_foothold_penetrating_point_ratio",
         "learned_foothold_total_penetration_depth",
@@ -501,8 +528,10 @@ def learned_foothold_swing_ready(
     Normal walking gets one control cycle to evaluate the learned proposal.
     A cached learned proposal that has passed the execution gate remains ready
     for the rest of the HOLD transaction. An unsafe proposal may fall back to a
-    safe nominal route only after it has been evaluated. Recovery uses the
-    analytic nominal route immediately and never waits for learned output.
+    safe nominal route only after it has been evaluated. A contact-adaptive
+    recovery step also waits for one evaluated learned proposal, but its
+    danger-cylinder score is a soft learning signal; only 3-D geometry is
+    required before the swing can start.
     """
 
     if not (
@@ -517,15 +546,20 @@ def learned_foothold_swing_ready(
 
     nominal_ready = nominal_route_ready.bool()
     recovery = recovery_step.bool()
-    learned_ready = (
+    learned_ready_safe = (
         learned_prepared_valid.bool()
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    normal_ready = transaction_evaluated.bool() & (
-        learned_ready | nominal_ready
+    learned_ready_recovery = (
+        learned_prepared_valid.bool()
+        & learned_geometric_valid.bool()
     )
-    return torch.where(recovery, nominal_ready, normal_ready)
+    normal_ready = transaction_evaluated.bool() & (
+        learned_ready_safe | nominal_ready
+    )
+    recovery_ready = transaction_evaluated.bool() & learned_ready_recovery
+    return torch.where(recovery, recovery_ready, normal_ready)
 
 
 def learned_foothold_transaction_ready(

@@ -296,6 +296,45 @@ def _normalized_nominal_deviation_cost(
     ).clamp(0.0, 2.0) / 2.0
 
 
+def _nominal_excess_deviation_cost(
+    delta_xy: torch.Tensor,
+    *,
+    reachability_radius_x: float,
+    reachability_radius_y: float,
+    tolerance_m: float = FOOTHOLD_NOMINAL_DEVIATION_TOLERANCE_M,
+) -> torch.Tensor:
+    """Return zero through the 2 cm deadband and a bounded excess cost."""
+    if delta_xy.shape[-1] != 2:
+        raise ValueError("delta_xy must have two coordinates.")
+    if (
+        reachability_radius_x <= 0.0
+        or reachability_radius_y <= 0.0
+        or tolerance_m < 0.0
+    ):
+        raise ValueError("reachability radii must be positive.")
+
+    radii = delta_xy.new_tensor((reachability_radius_x, reachability_radius_y))
+    distance_m = torch.linalg.vector_norm(delta_xy, dim=-1)
+    safe_distance = distance_m.clamp_min(torch.finfo(delta_xy.dtype).eps)
+    direction = delta_xy / safe_distance.unsqueeze(-1)
+    directional_radius = 1.0 / torch.sqrt(
+        (direction / radii).square().sum(dim=-1)
+    )
+    directional_radius = torch.where(
+        distance_m > 0.0,
+        directional_radius,
+        torch.full_like(
+            directional_radius,
+            min(reachability_radius_x, reachability_radius_y),
+        ),
+    )
+    excess = (distance_m - tolerance_m).clamp_min(0.0)
+    available = (directional_radius - tolerance_m).clamp_min(
+        torch.finfo(delta_xy.dtype).eps
+    )
+    return (excess / available).clamp(0.0, 1.0)
+
+
 def _nominal_deviation_reward(
     delta_xy: torch.Tensor,
     *,
@@ -346,6 +385,56 @@ def _nominal_deviation_reward(
     return torch.where(inside_tolerance, positive, negative).clamp(-1.0, 1.0)
 
 
+def _signed_command_progress_score(
+    learned_velocity: torch.Tensor,
+    desired_velocity: torch.Tensor,
+) -> torch.Tensor:
+    """Score progress along a frozen command, including reverse motion.
+
+    The normalized projection is +1 for the desired velocity, 0 for no
+    progress, and negative for motion in the opposite direction.  A zero
+    command has no direction to score, so it returns a neutral value instead
+    of manufacturing a direction from numerical noise.
+    """
+
+    if learned_velocity.shape != desired_velocity.shape:
+        raise ValueError("learned and desired velocities must share shape.")
+    if learned_velocity.shape[-1] != 2:
+        raise ValueError("command velocities must contain two coordinates.")
+    desired_norm_sq = torch.sum(torch.square(desired_velocity), dim=-1)
+    projection = torch.sum(learned_velocity * desired_velocity, dim=-1)
+    eps = torch.finfo(learned_velocity.dtype).eps
+    score = (projection / desired_norm_sq.clamp_min(eps)).clamp(-1.0, 1.0)
+    return torch.where(
+        desired_norm_sq > eps,
+        score,
+        torch.zeros_like(score),
+    )
+
+
+def _reasonable_step_score(
+    learned_velocity: torch.Tensor,
+    desired_velocity: torch.Tensor,
+) -> torch.Tensor:
+    """Prefer the command-predicted step, not arbitrarily large progress."""
+    if learned_velocity.shape != desired_velocity.shape:
+        raise ValueError("learned and desired velocities must share shape.")
+    if learned_velocity.shape[-1] != 2:
+        raise ValueError("command velocities must contain two coordinates.")
+
+    desired_norm_sq = torch.sum(torch.square(desired_velocity), dim=-1)
+    projection_ratio = torch.sum(
+        learned_velocity * desired_velocity,
+        dim=-1,
+    ) / desired_norm_sq.clamp_min(torch.finfo(learned_velocity.dtype).eps)
+    score = (1.0 - torch.abs(projection_ratio - 1.0)).clamp(-1.0, 1.0)
+    return torch.where(
+        desired_norm_sq > torch.finfo(learned_velocity.dtype).eps,
+        score,
+        torch.zeros_like(score),
+    )
+
+
 def learned_foothold_planning_event_reward(
     env,
     sensor_name: str = "foothold_planner",
@@ -354,11 +443,17 @@ def learned_foothold_planning_event_reward(
     velocity_lookahead_s: float = 0.10,
     nominal_step_width_m: float = 0.18,
     velocity_std: float = 0.5,
+    safety_margin_reference_m: float = 0.04,
+    safe_nominal_weight: float = 0.15,
+    unsafe_nominal_weight: float = 0.05,
 ) -> torch.Tensor:
-    """Train identity on safe nominals and safety correction otherwise.
+    """Score learned footholds with safety, progress, and reasonable steps.
 
-    Nominal deviation is normalized by the same reachability ellipse that
-    decodes the learned action, avoiding a second arbitrary meter threshold.
+    Every planner evaluation receives the signed command-progress signal. The
+    nominal-point term is stronger when the nominal target is safe and weaker
+    when the network must move toward a safer target. ``velocity_std`` remains
+    accepted for checkpoint/config compatibility; the signed projection and
+    step-shape terms replace the old exponential velocity-consistency score.
     """
 
     if (
@@ -367,8 +462,11 @@ def learned_foothold_planning_event_reward(
         or velocity_lookahead_s <= 0.0
         or nominal_step_width_m < 0.0
         or velocity_std <= 0.0
+        or safety_margin_reference_m <= 0.0
+        or not 0.0 <= safe_nominal_weight <= 1.0
+        or not 0.0 <= unsafe_nominal_weight <= 1.0
     ):
-        raise ValueError("reachability radii must be positive.")
+        raise ValueError("planner reward scales and weights must be valid.")
 
     data = _foothold_planner_data(env, sensor_name)
     event = data.learned_foothold_evaluated.bool()
@@ -376,15 +474,17 @@ def learned_foothold_planning_event_reward(
         data.learned_foothold_decoded_f[:, :2]
         - data.raw_unclipped_foothold_f[:, :2]
     )
-    nominal_deviation_reward = _nominal_deviation_reward(
+    nominal_affinity = _nominal_deviation_reward(
+        delta_xy,
+        reachability_radius_x=reachability_radius_x,
+        reachability_radius_y=reachability_radius_y,
+    ).clamp_min(0.0)
+    nominal_excess_cost = _nominal_excess_deviation_cost(
         delta_xy,
         reachability_radius_x=reachability_radius_x,
         reachability_radius_y=reachability_radius_y,
     )
-    nominal_deviation_cost = ((1.0 - nominal_deviation_reward) / 2.0).clamp(
-        0.0,
-        1.0,
-    )
+    nominal_term = nominal_affinity - nominal_excess_cost
 
     runtime_lookahead_s = getattr(data, "velocity_lookahead_s", None)
     if runtime_lookahead_s is None:
@@ -422,14 +522,14 @@ def learned_foothold_planning_event_reward(
         ),
         dim=-1,
     )
-    command_error = torch.sum(
-        torch.square(
-            learned_velocity
-            - data.nominal_feasible_velocity_f[:, :2]
-        ),
-        dim=-1,
+    signed_command_progress = _signed_command_progress_score(
+        learned_velocity,
+        data.nominal_feasible_velocity_f[:, :2],
     )
-    command_consistency = torch.exp(-command_error / velocity_std**2)
+    reasonable_step = _reasonable_step_score(
+        learned_velocity,
+        data.nominal_feasible_velocity_f[:, :2],
+    )
 
     learned_safety = data.learned_foothold_safety_score.clamp(
         -1.0,
@@ -457,28 +557,91 @@ def learned_foothold_planning_event_reward(
         data.nominal_geometric_valid.bool()
         & data.nominal_safety_valid.bool()
     )
-    safe_learned_score = torch.where(
+    safety_margin = getattr(data, "learned_foothold_safety_margin_score", None)
+    minimum_clearance = getattr(
+        data,
+        "learned_foothold_minimum_signed_clearance",
+        None,
+    )
+    if safety_margin is None and minimum_clearance is not None:
+        safety_margin = torch.clamp(
+            minimum_clearance / safety_margin_reference_m,
+            min=-1.0,
+            max=1.0,
+        )
+    if safety_margin is None:
+        # Older rollout buffers have no signed-clearance field. Their
+        # penetration score is still a conservative negative fallback. A
+        # non-penetrating legacy buffer has no outside-distance information,
+        # so retain its previous fully-clear interpretation.
+        safety_margin = torch.where(
+            learned_safety < 0.0,
+            learned_safety,
+            torch.ones_like(learned_safety),
+        )
+    safety_margin = safety_margin.to(
+        device=learned_safety.device,
+        dtype=learned_safety.dtype,
+    )
+    safety_margin = torch.nan_to_num(
+        safety_margin,
+        nan=-1.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1.0, 1.0)
+    penetrating_count = getattr(
+        data,
+        "learned_foothold_penetrating_point_count",
+        None,
+    )
+    if penetrating_count is None:
+        penetrating = learned_safety < 0.0
+    else:
+        penetrating = penetrating_count > 0.0
+    # A failed obstacle gate is never allowed to look like a clear target just
+    # because a legacy buffer omitted its per-point penetration statistics.
+    penetrating = penetrating | ~learned_safety_valid
+    nominal_weight = torch.where(
         nominal_safe,
-        nominal_deviation_reward,
-        # For an unsafe nominal target, safety has priority over closeness.
-        # The multiplicative form keeps every safe correction non-negative,
-        # while still preferring command-consistent corrections near the
-        # nominal intent.  A stationary safe point receives nearly zero from
-        # command_consistency, and cannot outrank a useful forward step.
-        command_consistency * (1.0 - nominal_deviation_cost),
+        torch.full_like(learned_safety, safe_nominal_weight),
+        torch.full_like(learned_safety, unsafe_nominal_weight),
+    )
+    safety_weight = torch.where(
+        nominal_safe,
+        torch.full_like(learned_safety, 0.40),
+        torch.full_like(learned_safety, 0.45),
+    )
+    progress_weight = torch.where(
+        nominal_safe,
+        torch.full_like(learned_safety, 0.25),
+        torch.full_like(learned_safety, 0.30),
+    )
+    clear_raw_score = (
+        safety_weight * safety_margin
+        + progress_weight * signed_command_progress
+        + 0.20 * reasonable_step
+        + nominal_weight * nominal_term
+    )
+    # Keep forward/step information on unsafe events, but do not let it
+    # overwhelm the count/depth safety penalty. This branch is still a soft
+    # learning signal, not an execution rejection.
+    penetrating_raw_score = (
+        0.70 * safety_margin
+        + 0.15 * signed_command_progress
+        + 0.10 * reasonable_step
+        + 0.05 * nominal_term
+    )
+    raw_score = torch.where(penetrating, penetrating_raw_score, clear_raw_score)
+    score = raw_score.clamp(-1.0, 1.0)
+    score = torch.where(
+        penetrating,
+        torch.minimum(score, torch.full_like(score, -0.05)),
+        score,
     )
     score = torch.where(
-        ~execution_safe,
+        ~execution_safe | ~learned_geometry_valid,
         torch.full_like(learned_safety, -1.0),
-        torch.where(
-            ~learned_geometry_valid,
-            torch.full_like(learned_safety, -1.0),
-            torch.where(
-                learned_safety_valid,
-                safe_learned_score,
-                learned_safety,
-            ),
-        ),
+        score,
     )
     return _mask_stabilization_reward(
         torch.where(event, score, torch.zeros_like(score)),

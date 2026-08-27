@@ -317,7 +317,7 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
             [True, True, True, True, False]
         ),
         learned_foothold_geometric_valid=torch.tensor(
-            [True, True, True, False, True]
+            [True, False, True, False, True]
         ),
         learned_foothold_safety_valid=torch.tensor(
             [True, True, False, False, True]
@@ -383,7 +383,7 @@ def test_learned_planning_reward_keeps_safe_nominal_and_scores_unsafe_nominal():
 
     torch.testing.assert_close(reward[0], torch.tensor(1.0))
     torch.testing.assert_close(reward[1], torch.tensor(-1.0))
-    torch.testing.assert_close(reward[2], torch.tensor(-0.4))
+    assert -1.0 <= reward[2].item() < 0.0
     assert reward[3].item() == -1.0
     assert reward[4].item() == 0.0
 
@@ -432,6 +432,75 @@ def test_nominal_deviation_reward_has_two_cm_deadband_and_full_match_bonus():
     )
 
 
+def test_signed_command_progress_orders_forward_stationary_and_reverse():
+    foothold = _load_foothold_reward_module()
+    desired = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    learned = torch.tensor([[1.0, 0.0], [0.0, 0.0], [-1.0, 0.0]])
+
+    score = foothold._signed_command_progress_score(learned, desired)
+
+    assert score[0] > score[1] > score[2]
+    torch.testing.assert_close(score, torch.tensor([1.0, 0.0, -1.0]))
+
+
+def test_reasonable_step_score_peaks_at_command_step_and_penalizes_overshoot():
+    foothold = _load_foothold_reward_module()
+    desired = torch.tensor([[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 0.0]])
+    learned = torch.tensor([[2.0, 0.0], [0.0, 0.0], [-2.0, 0.0], [4.0, 0.0]])
+
+    score = foothold._reasonable_step_score(learned, desired)
+
+    torch.testing.assert_close(score, torch.tensor([1.0, 0.0, -1.0, 0.0]))
+
+
+def test_nominal_excess_deviation_cost_has_two_cm_deadband():
+    foothold = _load_foothold_reward_module()
+    delta = torch.tensor([[0.0, 0.0], [0.01, 0.0], [0.02, 0.0], [0.22, 0.0]])
+
+    cost = foothold._nominal_excess_deviation_cost(
+        delta,
+        reachability_radius_x=0.42,
+        reachability_radius_y=0.25,
+    )
+
+    torch.testing.assert_close(
+        cost,
+        torch.tensor([0.0, 0.0, 0.0, (0.22 - 0.02) / (0.42 - 0.02)]),
+    )
+
+
+def test_penetrating_learned_target_cannot_receive_positive_planner_reward():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True]),
+        learned_foothold_geometric_valid=torch.tensor([True]),
+        learned_foothold_safety_valid=torch.tensor([True]),
+        learned_foothold_safety_score=torch.tensor([-0.05]),
+        learned_foothold_safety_margin_score=torch.tensor([-0.05]),
+        learned_foothold_penetrating_point_count=torch.tensor([1.0]),
+        nominal_geometric_valid=torch.tensor([False]),
+        nominal_safety_valid=torch.tensor([False]),
+        raw_unclipped_foothold_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        learned_foothold_decoded_f=torch.tensor([[0.20, 0.18, 0.0]]),
+        nominal_feasible_velocity_f=torch.tensor([[2.0, 0.0, 0.0]]),
+        velocity_lookahead_s=torch.tensor([0.10]),
+        swing_side=torch.tensor([0]),
+        swing_preflight_ready=torch.tensor([False]),
+        swing_preflight_safe=torch.tensor([True]),
+        stabilization_active=torch.zeros(1, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={"foothold_planner": SimpleNamespace(data=planner_data)},
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(env)
+
+    assert reward.item() <= -0.05
+    assert reward.item() >= -1.0
+
+
 def test_safe_learned_target_on_unsafe_nominal_uses_command_consistency():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(
@@ -470,7 +539,7 @@ def test_safe_learned_target_on_unsafe_nominal_uses_command_consistency():
     torch.testing.assert_close(reward, torch.tensor([1.0]))
 
 
-def test_safe_correction_never_scores_below_zero_for_unsafe_nominal():
+def test_safe_reverse_correction_scores_below_zero_for_unsafe_nominal():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(
         learned_foothold_evaluated=torch.tensor([True]),
@@ -480,9 +549,8 @@ def test_safe_correction_never_scores_below_zero_for_unsafe_nominal():
         nominal_geometric_valid=torch.tensor([True]),
         nominal_safety_valid=torch.tensor([False]),
         raw_unclipped_foothold_f=torch.tensor([[0.20, 0.18, 0.0]]),
-        # A large safe correction with poor command consistency.  The old
-        # subtractive score became negative even though the point was safe.
-        learned_foothold_decoded_f=torch.tensor([[0.40, 0.18, 0.0]]),
+        # A safe point that moves opposite to the desired forward direction.
+        learned_foothold_decoded_f=torch.tensor([[-0.20, 0.18, 0.0]]),
         nominal_feasible_velocity_f=torch.tensor([[2.0, 0.0, 0.0]]),
         velocity_lookahead_s=torch.tensor([0.10]),
         swing_side=torch.tensor([0]),
@@ -507,7 +575,7 @@ def test_safe_correction_never_scores_below_zero_for_unsafe_nominal():
         velocity_std=0.5,
     )
 
-    assert 0.0 <= reward.item() <= 1.0
+    assert reward.item() < 0.0
 
 
 def test_safe_correction_combines_command_and_deviation_quality():
@@ -547,13 +615,8 @@ def test_safe_correction_combines_command_and_deviation_quality():
         velocity_std=0.5,
     )
 
-    command_consistency = torch.exp(torch.tensor(-0.04 / 0.25))
-    torch.testing.assert_close(
-        reward,
-        (command_consistency * 0.5).expand_as(reward),
-        atol=1.0e-6,
-        rtol=1.0e-6,
-    )
+    assert reward.item() > 0.0
+    torch.testing.assert_close(reward, torch.tensor([0.93]), rtol=1e-5, atol=1e-5)
 
 
 def test_planning_reward_uses_runtime_lookahead_for_velocity_consistency():
