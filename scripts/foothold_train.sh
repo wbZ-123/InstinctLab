@@ -18,9 +18,10 @@ set -euo pipefail
 #   DRY_RUN=1 ./scripts/foothold_train.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISAACLAB_ROOT="${ISAACLAB_ROOT:-${REPO_ROOT}/../IsaacLab}"
+ISAACLAB_ROOT="${ISAACLAB_ROOT:-${REPO_ROOT}/third_party/IsaacLab}"
+INSTINCT_RL_ROOT="${INSTINCT_RL_ROOT:-${REPO_ROOT}/third_party/instinct_rl}"
 
-export PYTHONPATH="${REPO_ROOT}/source/instinctlab:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/source/instinctlab:${INSTINCT_RL_ROOT}:${PYTHONPATH:-}"
 export PARKOUR_MOTION_REFERENCE_DIR="${PARKOUR_MOTION_REFERENCE_DIR:-/home/zhangweibo/Datasets/hiking_in_the_wild/data&model/parkour_motion_reference}"
 export PARKOUR_MOTION_SELECTION_FILE="${PARKOUR_MOTION_SELECTION_FILE:-${PARKOUR_MOTION_REFERENCE_DIR}/parkour_motion_without_run.yaml}"
 
@@ -36,7 +37,15 @@ export FOOTHOLD_DEBUG_EVENT_PATH="${FOOTHOLD_DEBUG_EVENT_PATH:-${REPO_ROOT}/logs
 
 if [[ ! -f "${ISAACLAB_ROOT}/isaaclab.sh" ]]; then
     echo "[foothold_train] IsaacLab launcher not found: ${ISAACLAB_ROOT}/isaaclab.sh" >&2
+    echo "[foothold_train] Run: git submodule update --init --recursive" >&2
     echo "[foothold_train] Set ISAACLAB_ROOT=/path/to/IsaacLab if needed." >&2
+    exit 1
+fi
+
+if [[ ! -f "${INSTINCT_RL_ROOT}/instinct_rl/__init__.py" ]]; then
+    echo "[foothold_train] Instinct-RL source not found: ${INSTINCT_RL_ROOT}" >&2
+    echo "[foothold_train] Run: git submodule update --init --recursive" >&2
+    echo "[foothold_train] Set INSTINCT_RL_ROOT=/path/to/instinct_rl if needed." >&2
     exit 1
 fi
 
@@ -77,6 +86,8 @@ if [[ -n "${LEARNED_FOOTHOLD_BASE_CHECKPOINT}" ]]; then
 fi
 
 echo "[foothold_train] repo: ${REPO_ROOT}"
+echo "[foothold_train] isaaclab_root: ${ISAACLAB_ROOT}"
+echo "[foothold_train] instinct_rl_root: ${INSTINCT_RL_ROOT}"
 echo "[foothold_train] task: ${TASK}"
 echo "[foothold_train] num_envs: ${NUM_ENVS}"
 echo "[foothold_train] max_iterations: ${MAX_ITERATIONS}"
@@ -87,7 +98,7 @@ echo "[foothold_train] learned_foothold_algorithm: ${LEARNED_FOOTHOLD_ALGORITHM}
 echo "[foothold_train] learned_foothold_base_checkpoint: ${LEARNED_FOOTHOLD_BASE_CHECKPOINT:-none}"
 echo "[foothold_train] motion_reference_dir: ${PARKOUR_MOTION_REFERENCE_DIR}"
 echo "[foothold_train] motion_selection_file: ${PARKOUR_MOTION_SELECTION_FILE}"
-echo "[foothold_train] pythonpath_prefix: ${REPO_ROOT}/source/instinctlab"
+echo "[foothold_train] pythonpath_prefix: ${REPO_ROOT}/source/instinctlab:${INSTINCT_RL_ROOT}"
 echo "[foothold_train] foothold_debug_event_path: ${FOOTHOLD_DEBUG_EVENT_PATH}"
 echo "[foothold_train] foothold_debug_event_max_count: ${FOOTHOLD_DEBUG_EVENT_MAX_COUNT:-0}"
 

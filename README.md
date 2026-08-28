@@ -33,6 +33,42 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 
 ## Installation
 
+### Reproducible setup for the foothold-planner branch
+
+The foothold branch pins the compatible IsaacLab and Instinct-RL source trees
+as Git submodules. Clone it recursively so that both dependencies are checked
+out at the audited commits:
+
+```bash
+git clone --recurse-submodules \
+  --branch feat/foothold-01-flat-tracking \
+  git@github.com:wbZ-123/InstinctLab.git InstinctLab-foothold
+cd InstinctLab-foothold
+```
+
+If the repository was cloned without `--recurse-submodules`, initialize the
+dependencies afterwards:
+
+```bash
+git submodule update --init --recursive
+```
+
+Activate the Python environment that contains Isaac Sim 5.1, configure the
+external parkour motion data, and run the setup check:
+
+```bash
+conda activate hiking
+export PARKOUR_MOTION_REFERENCE_DIR="/path/to/parkour_motion_reference"
+export PARKOUR_MOTION_SELECTION_FILE="${PARKOUR_MOTION_REFERENCE_DIR}/parkour_motion_without_run.yaml"
+./scripts/bootstrap_foothold.sh --check-only
+```
+
+The submodules provide source code only. **Isaac Sim 5.1, the Python/CUDA
+environment, parkour motion data, checkpoints, and logs are not stored in this
+Git repository.** The training and stair-Play wrappers default to the pinned
+sources under `third_party/`; `ISAACLAB_ROOT` and `INSTINCT_RL_ROOT` may still
+override those paths when required.
+
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) and **Switch to 5.1.0 version**. We recommend using the conda installation as it simplifies calling Python scripts from the terminal. The IsaacLab commit we are using is `f73c331738` on origin/main (post-v2.3.2).
 
 - Install Instinct-RL by following the [installation guide](https://github.com/project-instinct/instinct_rl/blob/main/README.md).

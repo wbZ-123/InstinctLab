@@ -78,7 +78,7 @@
 | 调试 | 通用 Play / TensorBoard | 台阶专用 Play、双环境上下楼、目标/轨迹 Marker、逐级路由与 Recovery 诊断 |
 | 测试 | 原项目测试 | 增加 `tests/parkour/foothold/` 的纯逻辑、集成、日志和配置测试 |
 
-必须注意：本仓库 **没有复制或修改外部 Instinct-RL 包本体**。对网络和 PPO 的扩展都放在本项目的 `source/instinctlab/instinctlab/learning/` 下，通过配置动态注册和调用外部包接口。因此，新电脑除了克隆本仓库，还必须安装匹配版本的 IsaacLab、Isaac Sim 和 Instinct-RL。
+必须注意：本仓库 **没有复制或修改 Instinct-RL 包本体**。IsaacLab 与 Instinct-RL 源码现在通过 `third_party/` 下的 Git submodule 固定版本；对网络和 PPO 的扩展仍全部放在本项目的 `source/instinctlab/instinctlab/learning/` 下。新电脑使用递归克隆即可取得两份源码，但仍必须单独准备 Isaac Sim、Python/CUDA 环境和运动数据。
 
 ---
 
@@ -459,8 +459,8 @@ Planner 只在新的落足事务中产生一次有效决策。如果把每个仿
 
 - Ubuntu 22.04；
 - Isaac Sim 5.1；
-- IsaacLab 提交：`f73c331738`；
-- 外部 Instinct-RL 提交：`f870ead0953fa0e3c3da3349b0aece1c74bfb421`；
+- IsaacLab 子模块：`third_party/IsaacLab`，提交 `f73c33173801f5f8afea4142482e47b7710c2b75`；
+- Instinct-RL 子模块：`third_party/instinct_rl`，提交 `f870ead0953fa0e3c3da3349b0aece1c74bfb421`；
 - Conda 环境名通常为 `hiking`；
 - AMASS / Parkour motion reference 数据集；
 - 运动筛选文件 `parkour_motion_without_run.yaml`。
@@ -468,11 +468,33 @@ Planner 只在新的落足事务中产生一次有效决策。如果把每个仿
 ### 12.2 克隆代码
 
 ```bash
-git clone --branch feat/foothold-01-flat-tracking \
+git clone --recurse-submodules \
+  --branch feat/foothold-01-flat-tracking \
   git@github.com:wbZ-123/InstinctLab.git InstinctLab-foothold
 cd InstinctLab-foothold
 git log -1 --oneline
 ```
+
+如果已经用普通方式克隆：
+
+```bash
+git submodule update --init --recursive
+```
+
+源码子模块不等于完整运行环境。以下内容不会随 Git 下载：
+
+- Isaac Sim 5.1；
+- `hiking` Conda/Python/CUDA 环境；
+- AMASS/Parkour motion reference 数据；
+- checkpoint、训练日志与 TensorBoard 数据。
+
+进入正确环境并设置运动数据后运行：
+
+```bash
+./scripts/bootstrap_foothold.sh --check-only
+```
+
+最后一行出现 `Foothold project dependencies are ready.` 才表示源码、运行时和运动筛选文件均可见。
 
 ### 12.3 数据路径
 
@@ -675,7 +697,7 @@ https://github.com/wbZ-123/InstinctLab/tree/feat/foothold-01-flat-tracking
 1. 不要直接修改代码，先用 rg 和测试核对当前事实；
 2. 遇到异常先按“提案→几何→端点安全→轨迹预检→路由→实际跟踪→接触/Recovery”逐层定位；
 3. 不要把黄色提案 Marker 当作已执行落点；
-4. 不要修改外部 Instinct-RL 底层电机 PPO 行为；
+4. 不要直接修改 `third_party/instinct_rl` 中的底层电机 PPO；扩展应优先放在本项目 `source/instinctlab/instinctlab/learning/`；
 5. 任何 bugfix 先写失败测试；
 6. 不要同时改网络、奖励、状态机和参数；
 7. 所有结论给出源码行、日志或测试证据；
@@ -683,6 +705,8 @@ https://github.com/wbZ-123/InstinctLab/tree/feat/foothold-01-flat-tracking
 
 首先执行：
 cd ~/InstinctLab-foothold
+git submodule update --init --recursive
+./scripts/bootstrap_foothold.sh --check-only
 git status -sb
 git log -5 --oneline
 PYTHONPATH="$PWD/source/instinctlab:$PYTHONPATH" python -m pytest -q tests/parkour/foothold

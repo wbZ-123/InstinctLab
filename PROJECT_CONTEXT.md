@@ -40,42 +40,51 @@ git log -3 --oneline
 
 不要根据某个旧日志目录名推断当前代码版本。代码、训练脚本、测试和文档的实际状态以 Git 为准。
 
-## 3. 外部依赖
+## 3. 依赖与子模块
 
-本仓库不是完整的 IsaacLab 和 Instinct-RL 源码镜像。运行训练至少需要：
-
-- Isaac Sim 5.1.0；
-- IsaacLab 对应提交：`f73c331738`；
-- Python 3.11、匹配的 PyTorch/CUDA 环境；
-- 外部 Instinct-RL；当前复现实验使用的提交：
-  `f870ead0953fa0e3c3da3349b0aece1c74bfb421`；
-- parkour motion reference 数据集及其筛选 YAML。
-
-Instinct-RL 通常位于本仓库旁边：
+本仓库通过 Git submodule 固定 IsaacLab 和 Instinct-RL 源码版本：
 
 ```text
-~/IsaacLab
-~/instinct_rl
-~/InstinctLab-foothold
+third_party/IsaacLab
+third_party/instinct_rl
 ```
 
-Instinct-RL 没有被本项目复制进来，也没有修改外部仓库。项目内的学习扩展通过继承外部 Instinct-RL 的 PPO、MoE、RolloutStorage 等基础类实现。换电脑时必须安装与上述提交兼容的 Instinct-RL；只克隆本仓库而不安装外部依赖不能运行训练。
+它们不是复制进主仓库的源码快照，而是指向官方仓库固定提交的引用。递归克隆后会自动得到：
 
-安装外部 Instinct-RL：
+- IsaacLab 对应提交：`f73c331738`；
+- Instinct-RL 对应提交：
+  `f870ead0953fa0e3c3da3349b0aece1c74bfb421`；
+
+以下内容仍然不在 Git 仓库中，必须在新机器单独准备：
+
+- Isaac Sim 5.1.0；
+- Python 3.11、匹配的 PyTorch/CUDA 环境；
+- parkour motion reference 数据集及其筛选 YAML。
+- 训练 checkpoint、日志和 TensorBoard 数据。
+
+推荐克隆方式：
 
 ```bash
-git clone https://github.com/project-instinct/instinct_rl.git
-cd instinct_rl
-git checkout f870ead0953fa0e3c3da3349b0aece1c74bfb421
-python -m pip install -e .
+git clone --recurse-submodules \
+  --branch feat/foothold-01-flat-tracking \
+  git@github.com:wbZ-123/InstinctLab.git InstinctLab-foothold
+cd InstinctLab-foothold
 ```
 
-安装本项目：
+如果已经使用普通 `git clone`：
 
 ```bash
-cd ~/InstinctLab-foothold
-python -m pip install -e source/instinctlab
+git submodule update --init --recursive
 ```
+
+进入已安装 Isaac Sim 5.1 的环境后检查依赖：
+
+```bash
+conda activate hiking
+./scripts/bootstrap_foothold.sh --check-only
+```
+
+训练和台阶 Play 脚本默认使用 `third_party/` 中的版本，并自动设置 Python 路径。项目内的学习扩展仍位于 `source/instinctlab/instinctlab/learning/`；没有直接修改子模块中的 Instinct-RL。必要时可通过 `ISAACLAB_ROOT` 和 `INSTINCT_RL_ROOT` 覆盖默认路径。
 
 ## 4. 数据准备
 
@@ -174,7 +183,7 @@ MoE 是原有 Instinct-RL 电机策略的结构，不是新增 planner 的专用
 
 MoE 不是时间记忆网络，也不等同于 LSTM/GRU。它增加的是行为表达和条件分工能力；是否比单一 MLP 更好，需要公平对照实验验证，不能仅凭专家编号或“记忆性”下结论。
 
-当前项目没有直接修改外部 Instinct-RL 的 MoE 实现；项目内只通过配置和独立 planner 扩展使用它。
+当前项目没有直接修改 Instinct-RL 子模块中的 MoE 实现；项目内只通过配置和独立 planner 扩展使用它。
 
 ## 6. 状态机和异常边界
 
@@ -331,10 +340,9 @@ git diff --check
 - 4096 环境长训单次迭代可能约 8 秒，必须分别看 collection 和 learning 时间；
 - Recovery、提前触地、轨迹 clearance 失败需要通过 play 日志分相位诊断；
 - MoE 是否优于单一 MLP 尚未通过严格对照实验确认；
-- 运动参考数据、IsaacLab、Instinct-RL 和训练 checkpoint 不由本仓库自动提供。
+- IsaacLab 和 Instinct-RL 源码由 Git submodule 固定并可递归拉取；Isaac Sim 运行时、运动参考数据和训练 checkpoint 不由本仓库提供。
 
 如果这些约束或依赖发生变化，先更新本文件和对应实现文档，再开始新的长训。
 
 当前交接状态、最近训练指标、已知问题和未实施的 planner PPO 分支平衡方案，统一记录在
 [`docs/foothold_project_status.md`](docs/foothold_project_status.md)。
-

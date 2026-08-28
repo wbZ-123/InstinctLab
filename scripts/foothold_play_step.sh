@@ -15,9 +15,10 @@ set -euo pipefail
 #   STEP_TERRAIN_NAME=pyramid_stairs,pyramid_stairs_inv NUM_ENVS=2 ./scripts/foothold_play_step.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISAACLAB_ROOT="${ISAACLAB_ROOT:-${REPO_ROOT}/../IsaacLab}"
+ISAACLAB_ROOT="${ISAACLAB_ROOT:-${REPO_ROOT}/third_party/IsaacLab}"
+INSTINCT_RL_ROOT="${INSTINCT_RL_ROOT:-${REPO_ROOT}/third_party/instinct_rl}"
 
-export PYTHONPATH="${REPO_ROOT}/source/instinctlab:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/source/instinctlab:${INSTINCT_RL_ROOT}:${PYTHONPATH:-}"
 export PARKOUR_MOTION_REFERENCE_DIR="${PARKOUR_MOTION_REFERENCE_DIR:-/home/zhangweibo/Datasets/hiking_in_the_wild/data&model/parkour_motion_reference}"
 export PARKOUR_MOTION_SELECTION_FILE="${PARKOUR_MOTION_SELECTION_FILE:-${PARKOUR_MOTION_REFERENCE_DIR}/parkour_motion_without_run.yaml}"
 
@@ -36,10 +37,21 @@ FOOTHOLD_TRAJECTORY_SAMPLES="${FOOTHOLD_TRAJECTORY_SAMPLES:-8}"
 
 if [[ ! -f "${ISAACLAB_ROOT}/isaaclab.sh" ]]; then
     echo "[foothold_play_step] IsaacLab launcher not found: ${ISAACLAB_ROOT}/isaaclab.sh" >&2
+    echo "[foothold_play_step] Run: git submodule update --init --recursive" >&2
+    echo "[foothold_play_step] Set ISAACLAB_ROOT=/path/to/IsaacLab if needed." >&2
+    exit 1
+fi
+
+if [[ ! -f "${INSTINCT_RL_ROOT}/instinct_rl/__init__.py" ]]; then
+    echo "[foothold_play_step] Instinct-RL source not found: ${INSTINCT_RL_ROOT}" >&2
+    echo "[foothold_play_step] Run: git submodule update --init --recursive" >&2
+    echo "[foothold_play_step] Set INSTINCT_RL_ROOT=/path/to/instinct_rl if needed." >&2
     exit 1
 fi
 
 echo "[foothold_play_step] repo=${REPO_ROOT}"
+echo "[foothold_play_step] isaaclab_root=${ISAACLAB_ROOT}"
+echo "[foothold_play_step] instinct_rl_root=${INSTINCT_RL_ROOT}"
 echo "[foothold_play_step] task=${TASK} load_run=${LOAD_RUN}"
 echo "[foothold_play_step] terrain=${STEP_TERRAIN_NAME} rows=${STEP_TERRAIN_ROWS} cols=${STEP_TERRAIN_COLS} level=${STEP_TERRAIN_LEVEL}"
 

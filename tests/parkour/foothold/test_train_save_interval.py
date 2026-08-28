@@ -48,6 +48,20 @@ def test_foothold_train_script_passes_save_interval_from_environment():
     assert 'echo "[foothold_train] save_interval: ${SAVE_INTERVAL}"' in script
 
 
+@pytest.mark.parametrize(
+    "script_name",
+    ["foothold_train.sh", "foothold_play_step.sh"],
+)
+def test_foothold_wrappers_default_to_vendored_submodules(script_name):
+    script = (REPO_ROOT / "scripts" / script_name).read_text()
+
+    assert '${REPO_ROOT}/third_party/IsaacLab' in script
+    assert '${REPO_ROOT}/third_party/instinct_rl' in script
+    assert 'ISAACLAB_ROOT="${ISAACLAB_ROOT:-' in script
+    assert 'INSTINCT_RL_ROOT="${INSTINCT_RL_ROOT:-' in script
+    assert '${INSTINCT_RL_ROOT}:${PYTHONPATH:-}' in script
+
+
 def test_training_has_explicit_learned_foothold_planner_opt_in():
     train_script = (
         REPO_ROOT / "scripts" / "instinct_rl" / "train.py"
