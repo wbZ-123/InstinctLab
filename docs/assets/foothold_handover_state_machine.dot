@@ -1,0 +1,29 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.35", nodesep="0.55", ranksep="0.6", splines=spline, fontname="Noto Sans CJK SC"];
+  node [shape=ellipse, style="filled", fontname="Noto Sans CJK SC", fontsize=12, color="#334155", penwidth=1.4, margin="0.12,0.08"];
+  edge [fontname="Noto Sans CJK SC", fontsize=10, color="#475569", penwidth=1.2, arrowsize=0.75];
+
+  reset [label="RESET / 启动保持", fillcolor="#E2E8F0"];
+  hold [label="HOLD\n建立并预检落足事务", fillcolor="#DBEAFE"];
+  left [label="左脚 SWING", fillcolor="#DDD6FE"];
+  right [label="右脚 SWING", fillcolor="#DDD6FE"];
+  touchdown [label="TOUCHDOWN\n确认接触与换脚", fillcolor="#BBF7D0"];
+  overdue [label="OVERDUE\n向下触地搜索", fillcolor="#FEF3C7"];
+  recovery [label="RECOVERY\n无支撑等待 / 单支撑恢复事务", fillcolor="#FECACA"];
+
+  reset -> hold [label="启动保持结束"];
+  hold -> left [label="左脚规划预检完成"];
+  hold -> right [label="右脚规划预检完成"];
+  left -> touchdown [label="确认触地"];
+  right -> touchdown [label="确认触地"];
+  touchdown -> hold [label="更新真实支撑关系"];
+  left -> overdue [label="超过名义摆动时间"];
+  right -> overdue [label="超过名义摆动时间"];
+  overdue -> touchdown [label="下探中确认触地"];
+  overdue -> recovery [label="搜索耗尽"];
+  left -> recovery [label="支撑丢失 / 异常"];
+  right -> recovery [label="支撑丢失 / 异常"];
+  hold -> recovery [label="接触关系失效"];
+  recovery -> hold [label="双脚接触"];
+  recovery -> hold [label="单脚支撑：标记恢复事务", style=dashed];
+}

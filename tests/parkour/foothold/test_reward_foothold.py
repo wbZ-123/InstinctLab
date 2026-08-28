@@ -262,7 +262,7 @@ def test_no_fly_penalizes_only_when_both_feet_are_airborne():
     )
 
 
-def test_parkour_config_registers_no_fly_with_minus_one_weight():
+def test_parkour_config_registers_no_fly_with_minus_three_weight():
     cfg_path = (
         Path(__file__).resolve().parents[3]
         / "source/instinctlab/instinctlab/tasks/parkour/config/parkour_env_cfg.py"
@@ -274,7 +274,7 @@ def test_parkour_config_registers_no_fly_with_minus_one_weight():
     )[1].split("    feet_slide = RewTerm(", 1)[0]
 
     assert "func=instinct_mdp.no_fly" in block
-    assert "weight=-1.0" in block
+    assert "weight=-3.0" in block
     assert (
         'SceneEntityCfg("contact_forces", '
         'body_names=".*_ankle_roll_link")'

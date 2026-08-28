@@ -1,0 +1,61 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.35", nodesep="0.42", ranksep="0.75", splines=ortho, fontname="Noto Sans CJK SC"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=12, color="#334155", penwidth=1.3, margin="0.16,0.10"];
+  edge [fontname="Noto Sans CJK SC", fontsize=10, color="#64748B", penwidth=1.3, arrowsize=0.75];
+
+  subgraph cluster_input {
+    label="观测与先验"; color="#BFDBFE"; style="rounded,filled"; fillcolor="#EFF6FF"; fontcolor="#1D4ED8";
+    depth [label="头部深度图", fillcolor="#DBEAFE"];
+    state [label="机器人状态\n接触 / 速度 / 姿态", fillcolor="#DBEAFE"];
+    command [label="速度与航向命令", fillcolor="#DBEAFE"];
+    nominal [label="解析名义落足点", fillcolor="#DBEAFE"];
+  }
+
+  subgraph cluster_policy {
+    label="联合策略（31 维输出）"; color="#C4B5FD"; style="rounded,filled"; fillcolor="#F5F3FF"; fontcolor="#6D28D9";
+    motor_encoder [label="原有视觉编码器 + MoE", fillcolor="#EDE9FE"];
+    planner_encoder [label="Planner 专用深度编码器\n64 维特征", fillcolor="#EDE9FE"];
+    motor_head [label="电机动作头\n29 维", fillcolor="#DDD6FE"];
+    planner_head [label="学习式落足点头\n绝对 XY，2 维", fillcolor="#DDD6FE"];
+  }
+
+  subgraph cluster_plan {
+    label="显式落足事务"; color="#86EFAC"; style="rounded,filled"; fillcolor="#F0FDF4"; fontcolor="#15803D";
+    zquery [label="世界坐标地形查询\n补齐 Z", fillcolor="#DCFCE7"];
+    safety [label="几何与脚掌安全评分\n可达 / 高差 / 边缘侵入", fillcolor="#DCFCE7"];
+    traj [label="摆动轨迹生成与预检\n自动抬高，最高 0.14 m", fillcolor="#DCFCE7"];
+    lock [label="进入 SWING 后锁定\n支撑原点 / 朝向 / 起点 / 终点", fillcolor="#DCFCE7"];
+  }
+
+  subgraph cluster_env {
+    label="仿真闭环"; color="#FDBA74"; style="rounded,filled"; fillcolor="#FFF7ED"; fontcolor="#C2410C";
+    env [label="Isaac Sim / IsaacLab\nG1 + Parkour 地形", fillcolor="#FFEDD5"];
+    reward0 [label="电机执行奖励\nreward_0", fillcolor="#FFEDD5"];
+    reward1 [label="落足规划事件奖励\nreward_1", fillcolor="#FFEDD5"];
+    ppo [label="事件门控双优化器 PPO\n独立 KL / 学习率", fillcolor="#FED7AA"];
+  }
+
+  depth -> motor_encoder;
+  depth -> planner_encoder;
+  state -> motor_encoder;
+  state -> planner_head;
+  command -> motor_encoder;
+  command -> planner_head;
+  nominal -> planner_head;
+  motor_encoder -> motor_head;
+  planner_encoder -> planner_head;
+  planner_head -> zquery;
+  zquery -> safety;
+  safety -> traj;
+  traj -> lock;
+  lock -> motor_encoder [label="参考轨迹与目标观测"];
+  motor_head -> env;
+  env -> state;
+  env -> depth;
+  env -> reward0;
+  safety -> reward1;
+  reward0 -> ppo;
+  reward1 -> ppo;
+  ppo -> motor_head [label="更新电机分支"];
+  ppo -> planner_head [label="仅事件样本更新"];
+}

@@ -1,0 +1,36 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.3", nodesep="0.28", ranksep="0.42", splines=ortho, fontname="Noto Sans CJK SC"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=12, color="#334155", penwidth=1.2, margin="0.15,0.09", fillcolor="#F8FAFC"];
+  edge [fontname="Noto Sans CJK SC", fontsize=10, color="#64748B", penwidth=1.2, arrowsize=0.7];
+
+  start [label="进入 HOLD\n依据真实接触确定支撑脚与下一摆动脚", fillcolor="#DBEAFE"];
+  freeze [label="冻结本步快照\n支撑脚世界位置、身体朝向、速度命令", fillcolor="#EDE9FE"];
+  nominal [label="生成解析名义落足点\n不叠加课程随机偏移", fillcolor="#EDE9FE"];
+  proposal [label="下一控制周期\n学习式 Planner 输出绝对 XY", fillcolor="#DDD6FE"];
+  terrain [label="转换到世界坐标并查询地形高度 Z", fillcolor="#DCFCE7"];
+  geometric [shape=diamond, label="几何有效？\n高度有效 / 高差 < 0.27 m / 可达", fillcolor="#FEF3C7"];
+  safety [label="脚掌外围点与危险圆柱评分\n允许最多 2 个侵入点执行，但仍负奖励", fillcolor="#DCFCE7"];
+  route [shape=diamond, label="可构造并完成路由？", fillcolor="#FEF3C7"];
+  preflight [label="HOLD 内生成整条摆动轨迹\n检查中段净空并逐级抬高", fillcolor="#DCFCE7"];
+  ready [shape=diamond, label="轨迹预检完成？", fillcolor="#FEF3C7"];
+  lock [label="锁定整笔规划并进入 SWING\n后续不再重解释旧落点", fillcolor="#BBF7D0"];
+  execute [label="电机策略跟踪参考轨迹\n接触事件结束摆动", fillcolor="#FFEDD5"];
+  retry [label="保持 HOLD / 本次提案记负奖励\n等待下一笔有效事务", fillcolor="#FEE2E2"];
+  recovery [label="物理异常 → RECOVERY\n根据真实接触重新建立事务", fillcolor="#FECACA"];
+
+  start -> freeze -> nominal -> proposal -> terrain -> geometric;
+  geometric -> safety [label="是"];
+  geometric -> retry [label="否"];
+  safety -> route;
+  route -> preflight [label="是"];
+  route -> retry [label="否"];
+  preflight -> ready;
+  ready -> lock [label="是"];
+  ready -> retry [label="否"];
+  lock -> execute;
+  execute -> start [label="正常触地换脚"];
+  execute -> recovery [label="支撑丢失 / 超时 / 异常接触"];
+  recovery -> start [label="双脚恢复接触"];
+  recovery -> freeze [label="单脚可靠支撑：一次恢复落足事务"];
+  retry -> nominal [label="新事务"];
+}
