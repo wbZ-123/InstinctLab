@@ -22,14 +22,15 @@ def configure_learned_foothold_play(
 ) -> bool:
     """Match the play environment and algorithm to the saved checkpoint."""
 
-    if _algorithm_class_name(saved_agent_cfg) != "EventGatedWasabiPPO":
+    algorithm_name = _algorithm_class_name(saved_agent_cfg)
+    if algorithm_name not in {"EventGatedWasabiPPO", "EventGatedWasabiSAC"}:
         return False
     enable_planner = getattr(
         env_cfg, "enable_learned_foothold_planner", None
     )
     if not callable(enable_planner):
         raise RuntimeError(
-            "Checkpoint uses EventGatedWasabiPPO, but the selected task "
+            f"Checkpoint uses {algorithm_name}, but the selected task "
             "does not support the learned foothold planner."
         )
     enable_planner()

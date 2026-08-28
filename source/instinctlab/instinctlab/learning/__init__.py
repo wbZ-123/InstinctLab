@@ -7,8 +7,10 @@ from .foothold_rollout_storage import (
 )
 from .event_gated_foothold_ppo import (
     EventGatedWasabiPPO,
+    EventGatedWasabiSAC,
     register_event_gated_foothold_algorithm,
 )
+from .foothold_sac import FootholdSAC, FootholdSACConfig
 from .foothold_checkpoint import (
     build_legacy_input_column_map,
     FootholdCheckpointMigrationReport,
@@ -24,6 +26,9 @@ from .foothold_depth_encoder import FootholdDepthEncoder
 
 __all__ = [
     "EventGatedWasabiPPO",
+    "EventGatedWasabiSAC",
+    "FootholdSAC",
+    "FootholdSACConfig",
     "build_legacy_input_column_map",
     "FootholdCheckpointMigrationReport",
     "FootholdMiniBatch",

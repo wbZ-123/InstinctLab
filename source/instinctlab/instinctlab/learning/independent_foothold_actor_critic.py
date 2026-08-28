@@ -128,6 +128,72 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         foothold_mean = self.foothold_actor(foothold_input)
         return torch.cat((motor_mean, foothold_mean), dim=-1)
 
+    def planner_features(
+        self,
+        observations: torch.Tensor,
+        *,
+        detach_shared: bool = True,
+    ) -> torch.Tensor:
+        """Return the feature vector consumed by the planner actor.
+
+        The ordinary encoder is shared with the motor policy and is detached
+        by default so planner SAC updates cannot change motor parameters.  The
+        dedicated planner depth encoder remains differentiable.
+        """
+
+        if hasattr(self, "encoders"):
+            shared_features = self.encoders(observations)
+        else:
+            shared_features = observations
+        if detach_shared:
+            shared_features = shared_features.detach()
+        if not self.foothold_depth_output_size:
+            return shared_features
+        if not hasattr(self, "foothold_depth_encoder"):
+            raise RuntimeError("Planner depth encoder is not initialized.")
+        depth_image = get_subobs_by_components(
+            observations,
+            ["depth_image"],
+            self.obs_segments,
+        ).reshape(-1, *self._foothold_depth_input_shape)
+        depth_features = self.foothold_depth_encoder(depth_image)
+        return torch.cat((shared_features, depth_features), dim=-1)
+
+    def planner_distribution_from_features(
+        self,
+        features: torch.Tensor,
+    ) -> Normal:
+        """Build the planner's raw-action Gaussian from planner features."""
+
+        if features.shape[-1] != self.foothold_actor[0].in_features:
+            raise ValueError(
+                "Planner feature width does not match the planner actor: "
+                f"{features.shape[-1]} != {self.foothold_actor[0].in_features}."
+            )
+        mean = self.foothold_actor(features)
+        # SAC updates this parameter directly; keep the distribution valid
+        # between the existing post-update physical-bound clamps.
+        scale = self.foothold_std.clamp_min(1.0e-4).expand_as(mean)
+        return Normal(mean, scale)
+
+    def sample_planner_action(
+        self,
+        observations: torch.Tensor,
+        *,
+        deterministic: bool = False,
+        detach_shared: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a raw planner action and its Gaussian log probability."""
+
+        features = self.planner_features(
+            observations,
+            detach_shared=detach_shared,
+        )
+        distribution = self.planner_distribution_from_features(features)
+        action = distribution.mean if deterministic else distribution.rsample()
+        log_prob = distribution.log_prob(action).sum(dim=-1)
+        return action, log_prob
+
     def update_distribution(self, observations):
         mean = self._action_mean(observations)
         std = torch.cat((self.motor_std, self.foothold_std), dim=0)
@@ -179,6 +245,23 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
                 "foothold_depth_encoder",
                 "foothold_std",
                 "critics.1",
+            ),
+            include=True,
+        )
+
+    def planner_policy_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return only planner actor/encoder parameters, excluding value heads.
+
+        The legacy event-gated PPO optimizer also owned ``critics.1``.  SAC
+        replaces that value update with its twin Q networks, so its actor
+        optimizer must not mutate the old planner value head.
+        """
+
+        return self._parameters_with_prefixes(
+            (
+                "foothold_actor",
+                "foothold_depth_encoder",
+                "foothold_std",
             ),
             include=True,
         )

@@ -73,6 +73,19 @@ class AmpAlgoCfg(InstinctRlPpoAlgorithmCfg):
     lam = 0.95
     desired_kl = 0.01
     max_grad_norm = 1.0
+    # Planner-only SAC defaults.  Motor PPO/AMP values above are unchanged.
+    sac_hidden_dims = [128, 128]
+    sac_replay_capacity = 100000
+    sac_batch_size = 256
+    sac_warmup_events = 1024
+    sac_updates_per_rollout = 2
+    sac_actor_learning_rate = 1.0e-4
+    sac_critic_learning_rate = 1.0e-4
+    sac_alpha_learning_rate = 1.0e-4
+    sac_gamma = 0.99
+    sac_tau = 0.005
+    sac_target_entropy = -2.0
+    sac_max_grad_norm = 1.0
 
 
 @configclass
@@ -90,7 +103,28 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
     def enable_event_gated_foothold_ppo(
         self, reachability_radii_m: tuple[float, float]
     ) -> None:
-        """Select sparse high-level PPO while preserving legacy defaults."""
+        """Select the legacy sparse planner PPO comparison mode."""
+        self._enable_event_gated_foothold(
+            reachability_radii_m,
+            algorithm_class_name="EventGatedWasabiPPO",
+        )
+
+    def enable_event_gated_foothold_sac(
+        self, reachability_radii_m: tuple[float, float]
+    ) -> None:
+        """Select planner SAC while preserving motor PPO/AMP behavior."""
+        self._enable_event_gated_foothold(
+            reachability_radii_m,
+            algorithm_class_name="EventGatedWasabiSAC",
+        )
+
+    def _enable_event_gated_foothold(
+        self,
+        reachability_radii_m: tuple[float, float],
+        *,
+        algorithm_class_name: str,
+    ) -> None:
+        """Configure the shared 29-D motor + 2-D planner architecture."""
 
         if (
             len(reachability_radii_m) != 2
@@ -99,7 +133,15 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
             raise ValueError(
                 "reachability_radii_m must contain positive XY radii."
             )
-        self.algorithm.class_name = "EventGatedWasabiPPO"
+        if algorithm_class_name not in {
+            "EventGatedWasabiPPO",
+            "EventGatedWasabiSAC",
+        }:
+            raise ValueError(
+                "algorithm_class_name must select EventGatedWasabiPPO or "
+                "EventGatedWasabiSAC."
+            )
+        self.algorithm.class_name = algorithm_class_name
         self.policy.class_name = (
             "instinctlab.learning.independent_foothold_actor_critic:"
             "IndependentFootholdEncoderMoEActorCritic"

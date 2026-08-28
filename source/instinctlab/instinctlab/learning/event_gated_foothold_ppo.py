@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Normal
 
 import instinct_rl.modules as instinct_modules
 from instinct_rl.algorithms.ppo import PPO
@@ -20,6 +21,7 @@ from .foothold_rollout_storage import (
     FootholdRolloutStorage,
     FootholdTransition,
 )
+from .foothold_sac import FootholdSAC, FootholdSACConfig
 
 
 def normalized_foothold_std(
@@ -348,6 +350,9 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         self.motor_entropy_coef = self.entropy_coef
         self.motor_value_loss_coef = self.value_loss_coef
         self.foothold_value_loss_coef = self.value_loss_coef
+        # SAC subclasses can disable the legacy planner PPO branch while
+        # retaining the motor/AMP implementation and diagnostics.
+        self.use_foothold_ppo = True
 
         motor_parameters = tuple(self.actor_critic.motor_parameters())
         foothold_parameters = tuple(self.actor_critic.foothold_parameters())
@@ -553,6 +558,9 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         self.transition.foothold_nominal_unsafe_event = (
             unsafe_event.detach().clone()
         )
+        # SAC needs the post-step policy observation.  It is copied into the
+        # rollout before the upstream method clears the transition object.
+        self.transition.next_observations = next_obs.detach().clone()
         super().process_env_step(
             rewards,
             dones,
@@ -1013,7 +1021,7 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
                 stats["foothold_event_count"].detach().item() > 0
             )
             run_foothold = False
-            if has_foothold_event:
+            if self.use_foothold_ppo and has_foothold_event:
                 if foothold_updates_stopped or not self._foothold_update_allowed(
                     stats["foothold_kl"],
                     event_count=stats["foothold_event_count"],
@@ -1181,9 +1189,221 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
             group["lr"] = self.foothold_learning_rate
 
 
+class EventGatedWasabiSAC(EventGatedWasabiPPO):
+    """Hybrid learner: unchanged motor/AMP PPO plus event-only planner SAC.
+
+    The existing actor-critic still owns the 29-D motor head and the 2-D
+    planner head used at rollout time.  SAC supplies the planner optimizer and
+    twin Q critics; the legacy planner PPO objective is disabled explicitly.
+    """
+
+    def __init__(
+        self,
+        *args,
+        sac_hidden_dims: Sequence[int] = (128, 128),
+        sac_replay_capacity: int = 100_000,
+        sac_batch_size: int = 256,
+        sac_warmup_events: int = 1_024,
+        sac_updates_per_rollout: int = 2,
+        sac_actor_learning_rate: float = 1.0e-4,
+        sac_critic_learning_rate: float = 1.0e-4,
+        sac_alpha_learning_rate: float = 1.0e-4,
+        sac_gamma: float = 0.99,
+        sac_tau: float = 0.005,
+        sac_target_entropy: float = -2.0,
+        sac_max_grad_norm: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.use_foothold_ppo = False
+        self._sac_constructor_config = {
+            "hidden_dims": tuple(int(width) for width in sac_hidden_dims),
+            "replay_capacity": int(sac_replay_capacity),
+            "batch_size": int(sac_batch_size),
+            "warmup_events": int(sac_warmup_events),
+            "updates_per_rollout": int(sac_updates_per_rollout),
+            "actor_lr": float(sac_actor_learning_rate),
+            "critic_lr": float(sac_critic_learning_rate),
+            "alpha_lr": float(sac_alpha_learning_rate),
+            "gamma": float(sac_gamma),
+            "tau": float(sac_tau),
+            "target_entropy": float(sac_target_entropy),
+            "max_grad_norm": float(sac_max_grad_norm),
+        }
+        self.sac: FootholdSAC | None = None
+
+    def init_storage(
+        self,
+        num_envs,
+        num_transitions_per_env,
+        obs_format,
+        num_actions,
+        num_rewards=1,
+    ):
+        super().init_storage(
+            num_envs,
+            num_transitions_per_env,
+            obs_format,
+            num_actions,
+            num_rewards,
+        )
+        feature_dim = int(self.actor_critic.foothold_actor[0].in_features)
+        replay_obs_dim = int(self.storage.observations.shape[-1])
+        sac_config = FootholdSACConfig(
+            obs_dim=feature_dim,
+            replay_obs_dim=replay_obs_dim,
+            action_dim=2,
+            **self._sac_constructor_config,
+        )
+        planner_parameters = (
+            self.actor_critic.planner_policy_parameters()
+            if hasattr(self.actor_critic, "planner_policy_parameters")
+            else self.actor_critic.foothold_parameters()
+        )
+        self.sac = FootholdSAC(
+            sac_config,
+            device=self.device,
+            actor_distribution_fn=self.actor_critic.planner_distribution_from_features,
+            actor_parameters=planner_parameters,
+            feature_fn=lambda observations: self.actor_critic.planner_features(
+                observations,
+                detach_shared=True,
+            ),
+        )
+
+    def _require_sac(self) -> FootholdSAC:
+        if self.sac is None:
+            raise RuntimeError("Planner SAC must be initialized with init_storage.")
+        return self.sac
+
+    def act(self, obs, critic_obs):
+        """Keep the motor PPO sample and replace only the planner action."""
+
+        actions = super().act(obs, critic_obs)
+        sac = self._require_sac()
+        with torch.no_grad():
+            features = self.actor_critic.planner_features(
+                obs,
+                detach_shared=True,
+            )
+            planner_action = sac.act(features)
+            planner_distribution = (
+                self.actor_critic.planner_distribution_from_features(features)
+            )
+        actions = actions.clone()
+        actions[..., self.motor_action_dim :] = planner_action
+        self.transition.actions = actions.detach()
+        # Keep rollout diagnostics and legacy storage fields consistent with
+        # the actual raw planner action sent to the environment.
+        self.transition.action_mean = self.transition.action_mean.clone()
+        self.transition.action_sigma = self.transition.action_sigma.clone()
+        self.transition.action_mean[..., self.motor_action_dim :] = (
+            planner_distribution.mean
+        )
+        self.transition.action_sigma[..., self.motor_action_dim :] = (
+            planner_distribution.scale
+        )
+        motor_distribution = Normal(
+            self.transition.action_mean[..., : self.motor_action_dim],
+            self.transition.action_sigma[..., : self.motor_action_dim],
+        )
+        self.transition.actions_log_prob = (
+            motor_distribution.log_prob(actions[..., : self.motor_action_dim]).sum(
+                dim=-1,
+                keepdim=True,
+            )
+            + planner_distribution.log_prob(planner_action).sum(
+                dim=-1,
+                keepdim=True,
+            )
+        ).detach()
+        return self.transition.actions
+
+    def _append_event_replay(self) -> int:
+        sac = self._require_sac()
+        event = self.storage.foothold_action_event.reshape(-1)
+        count = int(event.sum().item())
+        if count == 0:
+            return 0
+        observations = self.storage.observations.reshape(
+            -1,
+            self.storage.observations.shape[-1],
+        )[event]
+        next_observations = self.storage.next_observations.reshape(
+            -1,
+            self.storage.next_observations.shape[-1],
+        )[event]
+        actions = self.storage.actions.reshape(
+            -1,
+            self.storage.actions.shape[-1],
+        )[event, self.motor_action_dim :]
+        rewards = self.storage.rewards.reshape(
+            -1,
+            self.storage.rewards.shape[-1],
+        )[event, self.foothold_reward_index]
+        dones = self.storage.dones.reshape(-1)[event].bool()
+        sac.observe(observations, actions, rewards, next_observations, dones)
+        return count
+
+    def update(self, current_learning_iteration):
+        # Pull event transitions before the inherited PPO update clears the
+        # on-policy storage.  Empty events do not block motor/AMP learning.
+        event_count = self._append_event_replay()
+        mean_losses, average_stats = super().update(current_learning_iteration)
+        sac = self._require_sac()
+        sac_stats = sac.update()
+        for key, value in sac_stats.items():
+            average_stats[key] = torch.tensor(float(value), device=self.device)
+        average_stats["sac_event_count"] = torch.tensor(
+            float(event_count),
+            device=self.device,
+        )
+        # Keep normalized planner exploration within the physical bounds that
+        # the existing configuration already validated.
+        self._clip_foothold_std_to_physical_bounds()
+        return mean_losses, average_stats
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["foothold_sac_version"] = 1
+        if self.sac is not None:
+            state["foothold_sac"] = self.sac.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        sac = self._require_sac()
+        if "foothold_sac" in state_dict:
+            sac.load_state_dict(state_dict["foothold_sac"])
+        elif "foothold_sac_version" in state_dict:
+            raise KeyError(
+                "SAC checkpoint is missing foothold_sac state."
+            )
+        else:
+            print(
+                "[Warning] PPO planner checkpoint loaded; SAC critics, "
+                "temperature, and replay start fresh."
+            )
+
+    def distributed_data_parallel(self):
+        super().distributed_data_parallel()
+        if not dist.is_initialized() or self.sac is None:
+            return
+        for module in (
+            self.sac.critic_1,
+            self.sac.critic_2,
+            self.sac.target_critic_1,
+            self.sac.target_critic_2,
+        ):
+            for parameter in module.parameters():
+                dist.broadcast(parameter.data, src=0)
+        dist.broadcast(self.sac.log_alpha.data, src=0)
+
+
 def register_event_gated_foothold_algorithm() -> None:
     """Register explicitly without changing legacy import behavior."""
 
     import instinct_rl.algorithms as algorithms
 
     algorithms.EventGatedWasabiPPO = EventGatedWasabiPPO
+    algorithms.EventGatedWasabiSAC = EventGatedWasabiSAC

@@ -44,6 +44,23 @@ def test_event_gated_checkpoint_enables_matching_play_environment():
     assert calls == ["env", "algorithm"]
 
 
+def test_event_gated_sac_checkpoint_enables_matching_play_environment():
+    module = _load_module()
+    calls: list[str] = []
+    env_cfg = SimpleNamespace(
+        enable_learned_foothold_planner=lambda: calls.append("env")
+    )
+
+    enabled = module.configure_learned_foothold_play(
+        env_cfg,
+        {"algorithm": {"class_name": "EventGatedWasabiSAC"}},
+        register_algorithm=lambda: calls.append("algorithm"),
+    )
+
+    assert enabled is True
+    assert calls == ["env", "algorithm"]
+
+
 def test_legacy_checkpoint_preserves_legacy_play_environment():
     module = _load_module()
     calls: list[str] = []

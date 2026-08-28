@@ -12,6 +12,7 @@ class FootholdTransition(RolloutStorage.Transition):
 
     def __init__(self):
         super().__init__()
+        self.next_observations: torch.Tensor | None = None
         self.foothold_action_event: torch.Tensor | None = None
         self.foothold_nominal_safe_event: torch.Tensor | None = None
         self.foothold_nominal_unsafe_event: torch.Tensor | None = None
@@ -71,6 +72,7 @@ class FootholdRolloutStorage(RolloutStorage):
             dtype=torch.bool,
             device=self.device,
         )
+        self.next_observations = torch.zeros_like(self.observations)
 
     def add_transitions(self, transition: FootholdTransition):
         event = transition.foothold_action_event
@@ -121,6 +123,17 @@ class FootholdRolloutStorage(RolloutStorage):
 
         step = self.step
         super().add_transitions(transition)
+        # Older PPO-only callers do not provide next observations.  Keeping a
+        # same-state fallback preserves their storage contract; the hybrid SAC
+        # algorithm always supplies the true post-step observation.
+        next_observations = transition.next_observations
+        if next_observations is None:
+            next_observations = transition.observations
+        if next_observations.shape != self.observations[step].shape:
+            raise ValueError(
+                "next observations must match the policy observation shape."
+            )
+        self.next_observations[step].copy_(next_observations)
         self.foothold_action_event[step].copy_(event)
         self.foothold_nominal_safe_event[step].copy_(safe_event)
         self.foothold_nominal_unsafe_event[step].copy_(unsafe_event)

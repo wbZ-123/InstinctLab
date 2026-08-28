@@ -97,7 +97,8 @@ def test_learned_planner_opt_in_selects_algorithm_in_causal_order():
 def test_foothold_train_reports_selected_algorithm():
     wrapper = (REPO_ROOT / "scripts" / "foothold_train.sh").read_text()
 
-    assert 'LEARNED_FOOTHOLD_ALGORITHM="EventGatedWasabiPPO"' in wrapper
+    assert 'LEARNED_FOOTHOLD_ALGORITHM="${LEARNED_FOOTHOLD_ALGORITHM:-sac}"' in wrapper
+    assert 'cmd+=(--learned_foothold_algorithm "${LEARNED_FOOTHOLD_ALGORITHM}")' in wrapper
     assert (
         'echo "[foothold_train] learned_foothold_algorithm: '
         '${LEARNED_FOOTHOLD_ALGORITHM}"'

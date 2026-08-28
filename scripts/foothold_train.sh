@@ -32,7 +32,7 @@ RUN_NAME="${RUN_NAME:-foothold_planner}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 ENABLE_LEARNED_FOOTHOLD_PLANNER="${ENABLE_LEARNED_FOOTHOLD_PLANNER:-0}"
 LEARNED_FOOTHOLD_BASE_CHECKPOINT="${LEARNED_FOOTHOLD_BASE_CHECKPOINT:-}"
-LEARNED_FOOTHOLD_ALGORITHM="WasabiPPO"
+LEARNED_FOOTHOLD_ALGORITHM="${LEARNED_FOOTHOLD_ALGORITHM:-sac}"
 export FOOTHOLD_DEBUG_EVENT_PATH="${FOOTHOLD_DEBUG_EVENT_PATH:-${REPO_ROOT}/logs/foothold_debug_events/${RUN_NAME}.jsonl}"
 
 if [[ ! -f "${ISAACLAB_ROOT}/isaaclab.sh" ]]; then
@@ -71,8 +71,12 @@ cmd=(
 )
 
 if [[ "${ENABLE_LEARNED_FOOTHOLD_PLANNER}" == "1" ]]; then
+    if [[ "${LEARNED_FOOTHOLD_ALGORITHM}" != "sac" && "${LEARNED_FOOTHOLD_ALGORITHM}" != "ppo" ]]; then
+        echo "[foothold_train] LEARNED_FOOTHOLD_ALGORITHM must be sac or ppo." >&2
+        exit 1
+    fi
     cmd+=(--enable_learned_foothold_planner)
-    LEARNED_FOOTHOLD_ALGORITHM="EventGatedWasabiPPO"
+    cmd+=(--learned_foothold_algorithm "${LEARNED_FOOTHOLD_ALGORITHM}")
 fi
 if [[ -n "${LEARNED_FOOTHOLD_BASE_CHECKPOINT}" ]]; then
     if [[ "${ENABLE_LEARNED_FOOTHOLD_PLANNER}" != "1" ]]; then

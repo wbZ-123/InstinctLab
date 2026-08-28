@@ -48,6 +48,13 @@ parser.add_argument(
     default=False,
     help="Add the learned 2D foothold action and nominal-prior observation.",
 )
+parser.add_argument(
+    "--learned_foothold_algorithm",
+    type=str,
+    choices=("sac", "ppo"),
+    default="sac",
+    help="Planner optimizer: event-only SAC (default) or legacy PPO.",
+)
 # train.py specific arguments
 parser.add_argument("--cprofile", action="store_true", default=False, help="Enable cProfile.")
 # append Instinct-RL cli arguments
@@ -148,14 +155,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "Selected task does not support the learned foothold planner."
             )
         reachability_radii_m = env_cfg.enable_learned_foothold_planner()
-        if not hasattr(agent_cfg, "enable_event_gated_foothold_ppo"):
+        if not hasattr(agent_cfg, "enable_event_gated_foothold_sac"):
             raise RuntimeError(
-                "Selected agent config does not support event-gated "
-                "foothold PPO."
+                "Selected agent config does not support learned foothold "
+                "planner optimization."
             )
-        agent_cfg.enable_event_gated_foothold_ppo(
-            reachability_radii_m
-        )
+        if args_cli.learned_foothold_algorithm == "sac":
+            agent_cfg.enable_event_gated_foothold_sac(reachability_radii_m)
+        else:
+            agent_cfg.enable_event_gated_foothold_ppo(reachability_radii_m)
         register_event_gated_foothold_algorithm()
 
     # set the environment seed
@@ -233,12 +241,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.enable_learned_foothold_planner:
         if env.num_actions != 31:
             raise RuntimeError(
-                "Learned foothold PPO requires 31 actions "
+                "Learned foothold planner requires 31 actions "
                 f"(29 motor + 2 foothold), got {env.num_actions}."
             )
         if env.num_rewards != 2:
             raise RuntimeError(
-                "Learned foothold PPO requires two reward groups "
+                "Learned foothold planner requires two reward groups "
                 f"(execution + foothold), got {env.num_rewards}."
             )
         foothold_std_m = agent_cfg.algorithm.foothold_initial_std_m
@@ -246,7 +254,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             agent_cfg.algorithm.foothold_reachability_radii_m
         )
         print(
-            "[INFO]: Learned foothold PPO: "
+            "[INFO]: Learned foothold planner: "
+            f"algorithm={agent_cfg.algorithm.class_name} "
             "motor_actions=29 foothold_actions=2"
         )
         print(
@@ -256,16 +265,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"y={foothold_std_m[1]:g}m/{foothold_radii_m[1]:g}m="
             f"{foothold_std_m[1] / foothold_radii_m[1]:.6f}"
         )
-        print(
-            "[INFO]: Independent foothold optimizer: "
-            f"lr={agent_cfg.algorithm.foothold_learning_rate:g} "
-            f"desired_kl={agent_cfg.algorithm.foothold_desired_kl:g} "
-            "stop_kl="
-            f"{agent_cfg.algorithm.foothold_desired_kl * agent_cfg.algorithm.foothold_kl_stop_multiplier:g} "
-            f"entropy_coef={agent_cfg.algorithm.foothold_entropy_coef:g} "
-            f"std_bounds_m={agent_cfg.algorithm.foothold_min_std_m}.."
-            f"{agent_cfg.algorithm.foothold_max_std_m}"
-        )
+        if agent_cfg.algorithm.class_name == "EventGatedWasabiSAC":
+            print(
+                "[INFO]: Planner SAC settings: "
+                f"batch={agent_cfg.algorithm.sac_batch_size} "
+                f"warmup_events={agent_cfg.algorithm.sac_warmup_events} "
+                f"updates_per_rollout={agent_cfg.algorithm.sac_updates_per_rollout} "
+                f"actor_lr={agent_cfg.algorithm.sac_actor_learning_rate:g} "
+                f"critic_lr={agent_cfg.algorithm.sac_critic_learning_rate:g} "
+                f"alpha_lr={agent_cfg.algorithm.sac_alpha_learning_rate:g} "
+                f"replay_capacity={agent_cfg.algorithm.sac_replay_capacity} "
+                f"std_bounds_m={agent_cfg.algorithm.foothold_min_std_m}.."
+                f"{agent_cfg.algorithm.foothold_max_std_m}"
+            )
+        else:
+            print(
+                "[INFO]: Planner PPO compatibility settings: "
+                f"lr={agent_cfg.algorithm.foothold_learning_rate:g} "
+                f"desired_kl={agent_cfg.algorithm.foothold_desired_kl:g} "
+                "stop_kl="
+                f"{agent_cfg.algorithm.foothold_desired_kl * agent_cfg.algorithm.foothold_kl_stop_multiplier:g} "
+                f"entropy_coef={agent_cfg.algorithm.foothold_entropy_coef:g} "
+                f"std_bounds_m={agent_cfg.algorithm.foothold_min_std_m}.."
+                f"{agent_cfg.algorithm.foothold_max_std_m}"
+            )
 
     # create runner from instinct-rl
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

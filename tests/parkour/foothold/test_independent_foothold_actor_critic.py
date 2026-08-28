@@ -121,6 +121,14 @@ def test_motor_and_foothold_parameter_groups_are_disjoint_and_exhaustive():
     assert motor_ids | foothold_ids == all_ids
 
 
+def test_planner_policy_parameters_exclude_planner_value_head():
+    policy = _make_policy()
+    planner_ids = _parameter_ids(policy.planner_policy_parameters())
+    value_ids = _parameter_ids(policy.critics[1].parameters())
+    assert planner_ids.isdisjoint(value_ids)
+    assert planner_ids < _parameter_ids(policy.foothold_parameters())
+
+
 def test_foothold_actor_backward_does_not_reach_motor_parameters():
     policy = _make_policy()
     observations = torch.randn(3, 4)
@@ -215,4 +223,50 @@ def test_planner_depth_loss_updates_only_planner_depth_parameters():
             depth_before,
             policy.foothold_depth_encoder.parameters(),
         )
+    )
+
+
+def test_planner_features_and_distribution_have_two_action_dimensions():
+    policy = _make_policy()
+    observations = torch.randn(3, 4)
+
+    features = policy.planner_features(observations)
+    distribution = policy.planner_distribution_from_features(features)
+
+    assert features.shape == (3, policy.mlp_input_dim_a)
+    assert distribution.mean.shape == (3, 2)
+    assert distribution.scale.shape == (3, 2)
+
+
+def test_deterministic_planner_action_is_repeatable():
+    policy = _make_policy()
+    observations = torch.randn(3, 4)
+
+    first, first_log_prob = policy.sample_planner_action(
+        observations,
+        deterministic=True,
+    )
+    second, second_log_prob = policy.sample_planner_action(
+        observations,
+        deterministic=True,
+    )
+
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first_log_prob, second_log_prob)
+    assert first.shape == (3, 2)
+    assert first_log_prob.shape == (3,)
+
+
+def test_detached_planner_features_block_shared_encoder_gradients():
+    policy = _make_encoded_policy()
+    observations = torch.randn(3, 4 + 4 * 8 * 8)
+
+    features = policy.planner_features(observations, detach_shared=True)
+    policy.planner_distribution_from_features(features).mean.sum().backward()
+
+    _assert_no_gradient(policy.encoders.parameters())
+    assert any(
+        parameter.grad is not None
+        and torch.count_nonzero(parameter.grad) > 0
+        for parameter in policy.foothold_depth_encoder.parameters()
     )
