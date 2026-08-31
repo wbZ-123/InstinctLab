@@ -70,6 +70,205 @@ def _mlp(input_dim: int, output_dim: int, hidden_dims: Iterable[int]) -> nn.Sequ
     return nn.Sequential(*layers)
 
 
+def radial_squash(raw_action: torch.Tensor) -> torch.Tensor:
+    """Map an unconstrained vector bijectively into the open unit ball."""
+
+    if raw_action.ndim < 1 or raw_action.shape[-1] <= 0:
+        raise ValueError("raw_action must have a non-empty final dimension.")
+    squared_norm = raw_action.square().sum(dim=-1, keepdim=True)
+    return raw_action / torch.sqrt(1.0 + squared_norm)
+
+
+def radial_squash_log_abs_det_jacobian(raw_action: torch.Tensor) -> torch.Tensor:
+    """Return ``log|det(da/du)|`` for :func:`radial_squash`."""
+
+    if raw_action.ndim < 1 or raw_action.shape[-1] <= 0:
+        raise ValueError("raw_action must have a non-empty final dimension.")
+    dimension = raw_action.shape[-1]
+    squared_norm = raw_action.square().sum(dim=-1)
+    # Tangential eigenvalues have exponent -1/2 and the radial eigenvalue
+    # exponent -3/2, giving -(d + 2) / 2 in d dimensions.
+    return -0.5 * float(dimension + 2) * torch.log1p(squared_norm)
+
+
+class PlannerEventAccumulator:
+    """Close one SAC transition at the next planner decision event.
+
+    The low-level simulator steps much faster than the foothold planner.  A
+    planner action therefore remains pending while swing and touchdown are
+    executed; a normal control frame must never be used as its ``next_obs``.
+    ``record`` receives only completed event transitions.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_envs: int,
+        obs_dim: int,
+        action_dim: int,
+        device: torch.device | str,
+    ) -> None:
+        if int(num_envs) <= 0 or int(obs_dim) <= 0 or int(action_dim) <= 0:
+            raise ValueError("event accumulator dimensions must be positive.")
+        self.num_envs = int(num_envs)
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.device = torch.device(device)
+        self.pending = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.pending_obs = torch.zeros(
+            self.num_envs, self.obs_dim, device=self.device
+        )
+        self.pending_actions = torch.zeros(
+            self.num_envs, self.action_dim, device=self.device
+        )
+        self.pending_rewards = torch.zeros(self.num_envs, device=self.device)
+
+    def _batch(
+        self,
+        value: torch.Tensor,
+        *,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        tensor = torch.as_tensor(value, device=self.device, dtype=dtype)
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}.")
+        return tensor
+
+    def process_step(
+        self,
+        *,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_observations: torch.Tensor,
+        dones: torch.Tensor,
+        event_mask: torch.Tensor,
+        record: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            None,
+        ],
+    ) -> int:
+        """Consume one low-level step and return completed event count."""
+
+        obs = self._batch(
+            observations,
+            name="observations",
+            shape=(self.num_envs, self.obs_dim),
+            dtype=torch.float32,
+        )
+        action = self._batch(
+            actions,
+            name="actions",
+            shape=(self.num_envs, self.action_dim),
+            dtype=torch.float32,
+        )
+        reward = self._batch(
+            rewards,
+            name="rewards",
+            shape=(self.num_envs,),
+            dtype=torch.float32,
+        )
+        next_obs = self._batch(
+            next_observations,
+            name="next_observations",
+            shape=(self.num_envs, self.obs_dim),
+            dtype=torch.float32,
+        )
+        done = self._batch(
+            dones,
+            name="dones",
+            shape=(self.num_envs,),
+            dtype=torch.bool,
+        )
+        event = self._batch(
+            event_mask,
+            name="event_mask",
+            shape=(self.num_envs,),
+            dtype=torch.bool,
+        )
+        completed = 0
+
+        # The reward from a non-event step belongs to the currently pending
+        # high-level action.  A step that starts a new event belongs to the
+        # new action instead, so it is deliberately not added here.
+        continuing = self.pending & ~event
+        self.pending_rewards[continuing] += reward[continuing]
+
+        # The current observation is the state at which the next planner
+        # action is about to be selected.  It is the correct next state for
+        # the preceding event, not the post-step observation of this action.
+        boundary = self.pending & event
+        if torch.any(boundary):
+            indices = boundary.nonzero(as_tuple=False).flatten()
+            boundary_dones = done[indices]
+            boundary_next_obs = torch.where(
+                boundary_dones.unsqueeze(-1),
+                next_obs[indices],
+                obs[indices],
+            )
+            record(
+                self.pending_obs[indices],
+                self.pending_actions[indices],
+                self.pending_rewards[indices],
+                boundary_next_obs,
+                boundary_dones,
+            )
+            completed += int(indices.numel())
+            self.pending[indices] = False
+
+        # A reset/fall before another planner event closes the pending event
+        # with a real terminal next observation.
+        terminal = self.pending & ~event & done
+        if torch.any(terminal):
+            indices = terminal.nonzero(as_tuple=False).flatten()
+            record(
+                self.pending_obs[indices],
+                self.pending_actions[indices],
+                self.pending_rewards[indices],
+                next_obs[indices],
+                torch.ones(indices.numel(), dtype=torch.bool, device=self.device),
+            )
+            completed += int(indices.numel())
+            self.pending[indices] = False
+
+        # Start the new event after closing the previous one.  Its reward is
+        # initialized from the same simulator step as its action.
+        if torch.any(event):
+            indices = event.nonzero(as_tuple=False).flatten()
+            self.pending_obs[indices] = obs[indices]
+            self.pending_actions[indices] = action[indices]
+            self.pending_rewards[indices] = reward[indices]
+            self.pending[indices] = ~done[indices]
+
+            # If a planner event and reset happen in one simulator step, the
+            # event has a genuine terminal transition immediately.
+            event_terminal = done[indices]
+            if torch.any(event_terminal):
+                terminal_indices = indices[event_terminal]
+                record(
+                    self.pending_obs[terminal_indices],
+                    self.pending_actions[terminal_indices],
+                    self.pending_rewards[terminal_indices],
+                    next_obs[terminal_indices],
+                    torch.ones(
+                        terminal_indices.numel(),
+                        dtype=torch.bool,
+                        device=self.device,
+                    ),
+                )
+                completed += int(terminal_indices.numel())
+
+        return completed
+
+    def clear(self) -> None:
+        """Discard pending events, e.g. when rebuilding the environment."""
+
+        self.pending.zero_()
+        self.pending_rewards.zero_()
+
+
 @dataclass(frozen=True)
 class FootholdSACConfig:
     obs_dim: int
@@ -243,19 +442,64 @@ class FootholdSAC(nn.Module):
         *,
         deterministic: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        distribution = self._actor_distribution_fn(features)
-        action = distribution.mean if deterministic else distribution.rsample()
-        log_prob = distribution.log_prob(action).sum(dim=-1)
-        return action, log_prob
-
-    @torch.no_grad()
-    def act(self, features: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        features = self._check_features(features)
-        action, _ = self._sample_action_and_log_prob(
+        raw_action, log_prob = self._sample_raw_action_and_log_prob(
             features,
             deterministic=deterministic,
         )
+        return radial_squash(raw_action), log_prob
+
+    def _sample_raw_action_and_log_prob(
+        self,
+        features: torch.Tensor,
+        *,
+        deterministic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        distribution = self._actor_distribution_fn(features)
+        raw_action = distribution.mean if deterministic else distribution.rsample()
+        log_prob = (
+            distribution.log_prob(raw_action).sum(dim=-1)
+            - radial_squash_log_abs_det_jacobian(raw_action)
+        )
+        return raw_action, log_prob
+
+    @torch.no_grad()
+    def act(self, features: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        action, _ = self.act_with_log_prob(features, deterministic=deterministic)
         return action
+
+    @torch.no_grad()
+    def act_with_log_prob(
+        self,
+        features: torch.Tensor,
+        deterministic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a normalized planner action and its transformed log-prob."""
+
+        features = self._check_features(features)
+        return self._sample_action_and_log_prob(
+            features,
+            deterministic=deterministic,
+        )
+
+    @torch.no_grad()
+    def act_raw_with_log_prob(
+        self,
+        features: torch.Tensor,
+        deterministic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample the raw action expected by the environment action term.
+
+        The action term applies the same radial squash before the planner
+        consumes it.  SAC trains on the squashed action, but rollout must
+        still pass the unsquashed sample so that the transform is applied
+        exactly once.
+        """
+
+        features = self._check_features(features)
+        return self._sample_raw_action_and_log_prob(
+            features,
+            deterministic=deterministic,
+        )
 
     def observe(
         self,

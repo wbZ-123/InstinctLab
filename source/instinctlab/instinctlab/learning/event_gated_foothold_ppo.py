@@ -21,7 +21,12 @@ from .foothold_rollout_storage import (
     FootholdRolloutStorage,
     FootholdTransition,
 )
-from .foothold_sac import FootholdSAC, FootholdSACConfig
+from .foothold_sac import (
+    FootholdSAC,
+    FootholdSACConfig,
+    PlannerEventAccumulator,
+    radial_squash,
+)
 
 
 def normalized_foothold_std(
@@ -558,9 +563,6 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         self.transition.foothold_nominal_unsafe_event = (
             unsafe_event.detach().clone()
         )
-        # SAC needs the post-step policy observation.  It is copied into the
-        # rollout before the upstream method clears the transition object.
-        self.transition.next_observations = next_obs.detach().clone()
         super().process_env_step(
             rewards,
             dones,
@@ -1197,6 +1199,8 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
     twin Q critics; the legacy planner PPO objective is disabled explicitly.
     """
 
+    _SAC_STATE_VERSION = 2
+
     def __init__(
         self,
         *args,
@@ -1231,6 +1235,8 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
             "max_grad_norm": float(sac_max_grad_norm),
         }
         self.sac: FootholdSAC | None = None
+        self._planner_events: PlannerEventAccumulator | None = None
+        self._planner_events_since_update = 0
 
     def init_storage(
         self,
@@ -1270,11 +1276,70 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
                 detach_shared=True,
             ),
         )
+        self._planner_events = PlannerEventAccumulator(
+            num_envs=int(num_envs),
+            obs_dim=replay_obs_dim,
+            action_dim=2,
+            device=self.device,
+        )
+        self._planner_events_since_update = 0
 
     def _require_sac(self) -> FootholdSAC:
         if self.sac is None:
             raise RuntimeError("Planner SAC must be initialized with init_storage.")
         return self.sac
+
+    def process_env_step(
+        self,
+        rewards,
+        dones,
+        infos,
+        next_obs,
+        next_critic_obs,
+    ):
+        """Record planner transitions only at high-level event boundaries."""
+
+        accumulator = self._planner_events
+        if accumulator is None:
+            raise RuntimeError("Planner event accumulator is not initialized.")
+        event = infos.get("learned_foothold_action_event")
+        if event is None:
+            raise KeyError("Missing causal PPO transition key: learned_foothold_action_event")
+        planner_rewards = torch.as_tensor(
+            rewards,
+            device=self.device,
+            dtype=torch.float32,
+        )[..., self.foothold_reward_index]
+
+        def record_event(obs, action, reward, next_state, terminal):
+            self._require_sac().observe(obs, action, reward, next_state, terminal)
+
+        completed = accumulator.process_step(
+            observations=self.transition.observations.detach(),
+            # The environment action term performs this normalization before
+            # publishing the planner action to the sensor.  Replay must store
+            # the same bounded action consumed by the SAC critics, while the
+            # rollout transition itself remains the raw action sent to env.
+            actions=radial_squash(
+                self.transition.actions[..., self.motor_action_dim :].detach()
+            ),
+            rewards=planner_rewards.detach(),
+            next_observations=next_obs.detach(),
+            dones=torch.as_tensor(dones, device=self.device, dtype=torch.bool),
+            event_mask=torch.as_tensor(event, device=self.device, dtype=torch.bool),
+            record=record_event,
+        )
+        self._planner_events_since_update += completed
+
+        # The parent still records the ordinary motor/AMP PPO transition and
+        # clears the short-horizon transition object after doing so.
+        super().process_env_step(
+            rewards,
+            dones,
+            infos,
+            next_obs,
+            next_critic_obs,
+        )
 
     def act(self, obs, critic_obs):
         """Keep the motor PPO sample and replace only the planner action."""
@@ -1286,7 +1351,7 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
                 obs,
                 detach_shared=True,
             )
-            planner_action = sac.act(features)
+            planner_action, planner_log_prob = sac.act_raw_with_log_prob(features)
             planner_distribution = (
                 self.actor_critic.planner_distribution_from_features(features)
             )
@@ -1294,7 +1359,8 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         actions[..., self.motor_action_dim :] = planner_action
         self.transition.actions = actions.detach()
         # Keep rollout diagnostics and legacy storage fields consistent with
-        # the actual raw planner action sent to the environment.
+        # the planner distribution and transformed action sent to the
+        # environment.
         self.transition.action_mean = self.transition.action_mean.clone()
         self.transition.action_sigma = self.transition.action_sigma.clone()
         self.transition.action_mean[..., self.motor_action_dim :] = (
@@ -1312,46 +1378,19 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
                 dim=-1,
                 keepdim=True,
             )
-            + planner_distribution.log_prob(planner_action).sum(
-                dim=-1,
-                keepdim=True,
-            )
+            + planner_log_prob.unsqueeze(-1)
         ).detach()
         return self.transition.actions
 
-    def _append_event_replay(self) -> int:
-        sac = self._require_sac()
-        event = self.storage.foothold_action_event.reshape(-1)
-        count = int(event.sum().item())
-        if count == 0:
-            return 0
-        observations = self.storage.observations.reshape(
-            -1,
-            self.storage.observations.shape[-1],
-        )[event]
-        next_observations = self.storage.next_observations.reshape(
-            -1,
-            self.storage.next_observations.shape[-1],
-        )[event]
-        actions = self.storage.actions.reshape(
-            -1,
-            self.storage.actions.shape[-1],
-        )[event, self.motor_action_dim :]
-        rewards = self.storage.rewards.reshape(
-            -1,
-            self.storage.rewards.shape[-1],
-        )[event, self.foothold_reward_index]
-        dones = self.storage.dones.reshape(-1)[event].bool()
-        sac.observe(observations, actions, rewards, next_observations, dones)
-        return count
-
     def update(self, current_learning_iteration):
-        # Pull event transitions before the inherited PPO update clears the
-        # on-policy storage.  Empty events do not block motor/AMP learning.
-        event_count = self._append_event_replay()
+        # Event transitions are appended when their next high-level boundary
+        # is observed, so a rollout window ending in the middle of a swing
+        # does not create a fake 20ms next state.
+        event_count = self._planner_events_since_update
         mean_losses, average_stats = super().update(current_learning_iteration)
         sac = self._require_sac()
         sac_stats = sac.update()
+        self._planner_events_since_update = 0
         for key, value in sac_stats.items():
             average_stats[key] = torch.tensor(float(value), device=self.device)
         average_stats["sac_event_count"] = torch.tensor(
@@ -1365,7 +1404,7 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
 
     def state_dict(self):
         state = super().state_dict()
-        state["foothold_sac_version"] = 1
+        state["foothold_sac_version"] = self._SAC_STATE_VERSION
         if self.sac is not None:
             state["foothold_sac"] = self.sac.state_dict()
         return state
@@ -1374,7 +1413,21 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         super().load_state_dict(state_dict)
         sac = self._require_sac()
         if "foothold_sac" in state_dict:
-            sac.load_state_dict(state_dict["foothold_sac"])
+            version = int(state_dict.get("foothold_sac_version", 0))
+            if version < self._SAC_STATE_VERSION:
+                # Version 1 replay stored the unsquashed action and paired it
+                # with the immediate post-step observation.  Neither field
+                # can be repaired after saving, so silently loading it would
+                # train the new critic on a different MDP.  The actor itself
+                # is already restored by the parent checkpoint; start only
+                # the SAC critics, temperature, optimizer and replay fresh.
+                print(
+                    "[Warning] Legacy foothold SAC state detected; discarding "
+                    "its replay/critics because event transition semantics "
+                    "changed. Planner actor weights remain loaded."
+                )
+            else:
+                sac.load_state_dict(state_dict["foothold_sac"])
         elif "foothold_sac_version" in state_dict:
             raise KeyError(
                 "SAC checkpoint is missing foothold_sac state."

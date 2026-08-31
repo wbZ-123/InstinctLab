@@ -86,7 +86,7 @@ def test_hybrid_algorithm_is_registered_and_has_separate_planner_learner():
     algorithm = _make_sac_algorithm(module, policy_module)
     algorithm.init_storage(
         2,
-        1,
+        2,
         {
             "policy": {"obs": (4,)},
             "critic": {"obs": (4,)},
@@ -107,7 +107,7 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
     algorithm = _make_sac_algorithm(module, policy_module)
     algorithm.init_storage(
         2,
-        1,
+        2,
         {
             "policy": {"obs": (4,)},
             "critic": {"obs": (4,)},
@@ -122,6 +122,7 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
     algorithm.transition.observations = obs
     algorithm.transition.critic_observations = obs
     algorithm.transition.actions = torch.zeros(2, 31)
+    algorithm.transition.actions[1, 29:] = torch.tensor([3.0, 4.0])
     algorithm.transition.values = torch.zeros(2, 2)
     algorithm.transition.actions_log_prob = torch.zeros(2, 1)
     algorithm.transition.action_mean = torch.zeros(2, 31)
@@ -148,8 +149,40 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
         obs + 1.0,
         obs + 1.0,
     )
-    assert algorithm._append_event_replay() == 1
+    # The first event is pending; a post-step control frame is not a valid
+    # planner next state and must not enter replay yet.
+    assert len(algorithm.sac.replay) == 0
+
+    algorithm.transition.observations = obs + 1.0
+    algorithm.transition.critic_observations = obs + 1.0
+    algorithm.transition.actions = torch.zeros(2, 31)
+    algorithm.transition.values = torch.zeros(2, 2)
+    algorithm.transition.actions_log_prob = torch.zeros(2, 1)
+    algorithm.transition.action_mean = torch.zeros(2, 31)
+    algorithm.transition.action_sigma = torch.ones(2, 31)
+    algorithm.process_env_step(
+        torch.zeros(2, 2),
+        torch.zeros(2, dtype=torch.bool),
+        {
+            "observations": {
+                "policy": obs + 1.0,
+                "amp_policy": torch.zeros(2, 3),
+                "amp_reference": torch.zeros(2, 3),
+            },
+            "time_outs": torch.zeros(2),
+            "learned_foothold_action_event": torch.tensor([False, True]),
+            "learned_foothold_nominal_safe_event": torch.tensor([False, True]),
+            "learned_foothold_nominal_unsafe_event": torch.tensor([False, False]),
+            "step": {},
+        },
+        obs + 2.0,
+        obs + 2.0,
+    )
     assert len(algorithm.sac.replay) == 1
+    torch.testing.assert_close(
+        algorithm.sac.replay.actions[0],
+        torch.tensor([3.0, 4.0]) / 26.0**0.5,
+    )
 
 
 def test_hybrid_sac_updates_from_event_replay_without_ppo_planner_step():
@@ -245,3 +278,38 @@ def test_hybrid_sac_checkpoint_round_trip_restores_replay_and_temperature():
     assert restored.sac is not None
     assert len(restored.sac.replay) == 2
     assert restored.sac.log_alpha.item() == pytest.approx(-0.7)
+
+
+def test_legacy_event_sac_checkpoint_discards_incompatible_replay(capsys):
+    module, policy_module = _load_modules()
+    algorithm = _make_sac_algorithm(module, policy_module)
+    storage_kwargs = {
+        "num_envs": 2,
+        "num_transitions_per_env": 1,
+        "obs_format": {
+            "policy": {"obs": (4,)},
+            "critic": {"obs": (4,)},
+            "amp_policy": {"state": (3,)},
+            "amp_reference": {"state": (3,)},
+        },
+        "num_actions": 31,
+        "num_rewards": 2,
+    }
+    algorithm.init_storage(**storage_kwargs)
+    assert algorithm.sac is not None
+    algorithm.sac.observe(
+        torch.randn(2, 4),
+        torch.zeros(2, 2),
+        torch.ones(2),
+        torch.randn(2, 4),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    state = algorithm.state_dict()
+    state["foothold_sac_version"] = 1
+
+    restored = _make_sac_algorithm(module, policy_module)
+    restored.init_storage(**storage_kwargs)
+    restored.load_state_dict(state)
+    assert restored.sac is not None
+    assert len(restored.sac.replay) == 0
+    assert "Legacy foothold SAC state" in capsys.readouterr().out
