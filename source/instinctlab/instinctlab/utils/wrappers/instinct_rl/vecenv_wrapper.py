@@ -27,6 +27,37 @@ def foothold_event_from_generation(
     return after != before
 
 
+def read_foothold_event_reward(reward_manager) -> torch.Tensor:
+    """Read the weighted planner term before ``dt`` scaling.
+
+    The planner SAC consumes one score per high-level event.  The ordinary
+    reward tensor returned by the environment is intentionally time-step
+    scaled, so it must not be reused for this replay path.
+    """
+
+    getter = getattr(reward_manager, "get_termwise_reward", None)
+    if getter is None:
+        raise RuntimeError(
+            "A learned foothold event requires a reward manager exposing "
+            "get_termwise_reward()."
+        )
+    try:
+        value = getter(
+            "learned_foothold_planning",
+            group_name="foothold_planning",
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not read the raw learned foothold planner event reward."
+        ) from exc
+    value = torch.as_tensor(value).detach().clone()
+    if value.ndim != 1:
+        raise RuntimeError(
+            "Raw learned foothold planner event reward must have shape [num_envs]."
+        )
+    return value
+
+
 class InstinctRlVecEnvWrapper(VecEnv):
     """Wraps around Isaac Lab environment for Instinct-RL library
     Reference:
@@ -210,6 +241,17 @@ class InstinctRlVecEnvWrapper(VecEnv):
             extras["learned_foothold_nominal_unsafe_event"] = (
                 nominal_unsafe_event
             )
+            if torch.any(foothold_event):
+                extras["learned_foothold_event_reward"] = (
+                    read_foothold_event_reward(self.unwrapped.reward_manager)
+                    .to(device=self.device, dtype=torch.float32)
+                )
+            else:
+                extras["learned_foothold_event_reward"] = torch.zeros(
+                    self.num_envs,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
         obs_pack = self._flatten_all_obs_groups(obs_pack)
         # compute dones for compatibility with RSL-RL
         dones = (terminated | truncated).to(dtype=torch.long)

@@ -635,6 +635,7 @@ class FootholdPlanner(SensorBase):
             return
 
         assert self._data.learned_foothold_action_normalized is not None
+        assert self._data.raw_unclipped_foothold_f is not None
         assert self._data.learned_foothold_event_generation is not None
         self._data.learned_foothold_event_generation[env_ids] += 1
 
@@ -662,10 +663,13 @@ class FootholdPlanner(SensorBase):
             normalized_action=(
                 self._data.learned_foothold_action_normalized[env_ids]
             ),
+            nominal_xy_f=self._data.raw_unclipped_foothold_f[env_ids, :2],
             origin_w=stance_pos_w,
             yaw_w=base_yaw_w,
             radius_x=self._flat_provider_cfg.outer_radius_x,
             radius_y=self._flat_provider_cfg.outer_radius_y,
+            max_adjustment_x=self.cfg.learned_foothold_max_adjustment_x_m,
+            max_adjustment_y=self.cfg.learned_foothold_max_adjustment_y_m,
             max_step_height_m=self.cfg.max_foothold_step_height_m,
             terrain_height_query_w=terrain_query_w,
         )
@@ -2305,9 +2309,9 @@ class FootholdPlanner(SensorBase):
         if self.cfg.enable_contact_adaptive_recovery:
             prepare_learned &= ~recovery_mode
         # Evaluate at most one learned action per HOLD transaction. An unsafe
-        # action keeps its single PPO penalty; recovery may execute it when
-        # its 3-D geometry is valid, while ordinary walking retains the
-        # danger-cylinder gate.
+        # action keeps its single PPO penalty, but it never becomes an
+        # executable foothold. Recovery uses the same 3-D safety gate as
+        # normal walking; its separate responsibility is contact stabilization.
         if self.cfg.enable_learned_foothold:
             assert (
                 self._data.learned_foothold_transaction_evaluated is not None
@@ -2495,9 +2499,6 @@ class FootholdPlanner(SensorBase):
             )
             if torch.any(preflight_candidate).item():
                 preflight_env_ids = selected_env_ids[preflight_candidate]
-                preflight_recovery = previous_gait_state.recovery_step_pending[
-                    preflight_candidate
-                ]
                 preflight_target_w = select_preflight_target_w(
                     route_use_learned=(
                         preflight_route.use_learned[preflight_candidate]
@@ -2561,11 +2562,7 @@ class FootholdPlanner(SensorBase):
                         ),
                     )
                     obstacle_preflight_safe = adjustment.is_safe
-                    preflight_safe = torch.where(
-                        preflight_recovery,
-                        torch.ones_like(obstacle_preflight_safe),
-                        obstacle_preflight_safe,
-                    )
+                    preflight_safe = obstacle_preflight_safe
                     preflight_apex = adjustment.apex_height
                     preflight_penetration = (
                         adjustment.penetration.max_penetration_depth
@@ -2611,17 +2608,14 @@ class FootholdPlanner(SensorBase):
                 self._data.swing_clearance_start_escape_safe[
                     preflight_env_ids
                 ] = preflight_start_escape_safe
-                failed_preflight = preflight_env_ids[
-                    ~preflight_safe & ~preflight_recovery
-                ]
+                failed_preflight = preflight_env_ids[~preflight_safe]
                 if failed_preflight.numel() > 0:
                     # Keep the learned action's single PPO outcome, but remove
                     # a failed normal-walk action from execution routing. The
                     # persistent HOLD latch prevents resampling; the next
-                    # cycle preflights the safe nominal fallback instead. A
-                    # recovery proposal never has that fallback: an invalid
-                    # 3-D target is handled as a fresh recovery attempt by
-                    # the state machine below.
+                    # cycle preflights the safe nominal fallback instead.
+                    # If no safe fallback exists, the state machine handles
+                    # the failed recovery transaction explicitly below.
                     self._data.learned_foothold_prepared_valid[
                         failed_preflight
                     ] = False
@@ -2828,18 +2822,9 @@ class FootholdPlanner(SensorBase):
             )
             if torch.any(lock_learned).item():
                 lock_env_ids = selected_env_ids[lock_learned]
-                lock_recovery_step = recovery_step_by_env[lock_learned]
                 lock_safety_valid = self._data.learned_foothold_safety_valid[
                     lock_env_ids
                 ]
-                # Recovery deliberately executes geometrically valid learned
-                # targets even when their danger-cylinder score is negative;
-                # normal walking keeps the existing safety gate.
-                lock_safety_valid = torch.where(
-                    lock_recovery_step,
-                    torch.ones_like(lock_safety_valid),
-                    lock_safety_valid,
-                )
                 learned_use[lock_learned] = (
                     lock_prepared_learned_foothold(
                         data=self._data,

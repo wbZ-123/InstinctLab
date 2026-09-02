@@ -359,6 +359,7 @@ class FootholdSAC(nn.Module):
         device: torch.device | str,
         actor_distribution_fn: Callable[[torch.Tensor], Normal] | None = None,
         actor_parameters: Iterable[nn.Parameter] | None = None,
+        feature_parameters: Iterable[nn.Parameter] | None = None,
         feature_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
@@ -379,6 +380,14 @@ class FootholdSAC(nn.Module):
         actor_parameters = tuple(actor_parameters)
         if not actor_parameters:
             raise ValueError("planner actor must expose trainable parameters.")
+        feature_parameters = tuple(feature_parameters or ())
+        actor_parameter_ids = {id(parameter) for parameter in actor_parameters}
+        feature_parameter_ids = {id(parameter) for parameter in feature_parameters}
+        if actor_parameter_ids & feature_parameter_ids:
+            raise ValueError("planner actor and feature parameters must be disjoint.")
+        if feature_parameters and feature_fn is None:
+            raise ValueError("feature_parameters require a feature_fn.")
+        self._feature_parameters = feature_parameters
         self.critic_1 = _QNetwork(config).to(self.device)
         self.critic_2 = _QNetwork(config).to(self.device)
         self.target_critic_1 = _QNetwork(config).to(self.device)
@@ -393,7 +402,9 @@ class FootholdSAC(nn.Module):
         self.log_alpha = nn.Parameter(torch.zeros((), device=self.device))
         self.actor_optimizer = optim.Adam(actor_parameters, lr=config.actor_lr)
         self.critic_optimizer = optim.Adam(
-            tuple(self.critic_1.parameters()) + tuple(self.critic_2.parameters()),
+            tuple(self.critic_1.parameters())
+            + tuple(self.critic_2.parameters())
+            + feature_parameters,
             lr=config.critic_lr,
         )
         self.alpha_optimizer = optim.Adam((self.log_alpha,), lr=config.alpha_lr)
@@ -563,6 +574,11 @@ class FootholdSAC(nn.Module):
             "sac_alpha_loss": 0.0,
             "sac_alpha": float(self.alpha.detach().item()),
             "sac_q_mean": 0.0,
+            "sac_replay_reward_mean": 0.0,
+            "sac_replay_reward_min": 0.0,
+            "sac_replay_reward_max": 0.0,
+            "sac_target_q_mean": 0.0,
+            "sac_q_abs_max": 0.0,
         }
         if len(self.replay) < max(self.config.batch_size, self.config.warmup_events):
             self.skipped_updates += 1
@@ -583,6 +599,11 @@ class FootholdSAC(nn.Module):
         critic_loss_value = 0.0
         alpha_loss_value = 0.0
         q_value = 0.0
+        replay_reward_mean = 0.0
+        replay_reward_min = float("inf")
+        replay_reward_max = float("-inf")
+        target_q_mean = 0.0
+        q_abs_max = 0.0
         available_updates = len(self.replay) // self.config.batch_size
         updates = min(
             requested_updates,
@@ -609,11 +630,11 @@ class FootholdSAC(nn.Module):
             try:
                 batch = self.replay.sample(self.config.batch_size)
                 self._finite_batch(batch)
-                # The critic update must not backpropagate through the
-                # planner actor or its depth encoder.  Recompute those
-                # features below for the actor update, where their gradients
-                # are intentional.
-                features = self._features_from_replay(batch.obs).detach()
+                # The critic TD loss owns the dedicated planner feature
+                # encoder. Shared motor features are detached inside the
+                # policy feature function, so this cannot update the motor
+                # policy representation.
+                features = self._features_from_replay(batch.obs)
                 with torch.no_grad():
                     next_features = self._features_from_replay(batch.next_obs)
                     next_action, next_log_prob = self._sample_action_and_log_prob(
@@ -631,9 +652,24 @@ class FootholdSAC(nn.Module):
                         self.alpha.detach(),
                         self.config.gamma,
                     )
+                    target_q_mean += float(target.mean().item())
 
                 current_q1 = self.critic_1(features, batch.actions)
                 current_q2 = self.critic_2(features, batch.actions)
+                replay_reward_mean += float(batch.rewards.mean().item())
+                replay_reward_min = min(
+                    replay_reward_min,
+                    float(batch.rewards.min().item()),
+                )
+                replay_reward_max = max(
+                    replay_reward_max,
+                    float(batch.rewards.max().item()),
+                )
+                q_abs_max = max(
+                    q_abs_max,
+                    float(current_q1.abs().max().item()),
+                    float(current_q2.abs().max().item()),
+                )
                 critic_loss = 0.5 * (
                     (current_q1 - target).pow(2).mean()
                     + (current_q2 - target).pow(2).mean()
@@ -643,7 +679,8 @@ class FootholdSAC(nn.Module):
                 try:
                     nn.utils.clip_grad_norm_(
                         tuple(self.critic_1.parameters())
-                        + tuple(self.critic_2.parameters()),
+                        + tuple(self.critic_2.parameters())
+                        + self._feature_parameters,
                         self.config.max_grad_norm,
                         error_if_nonfinite=True,
                     )
@@ -651,10 +688,10 @@ class FootholdSAC(nn.Module):
                     raise FloatingPointError("SAC critic gradients must be finite.") from exc
                 self.critic_optimizer.step()
 
-                # Recompute features so the actor update has a fresh graph and
-                # can train a dedicated planner encoder without retaining the
-                # critic graph. Shared motor features remain detached by fn.
-                actor_features = self._features_from_replay(batch.obs)
+                # Actor optimization must not rewrite the visual
+                # representation learned by the critic. Shared motor features
+                # and the dedicated planner depth features are detached here.
+                actor_features = self._features_from_replay(batch.obs).detach()
                 action, log_prob = self._sample_action_and_log_prob(
                     actor_features,
                     deterministic=False,
@@ -726,6 +763,11 @@ class FootholdSAC(nn.Module):
             "sac_alpha_loss": alpha_loss_value / divisor,
             "sac_alpha": float(self.alpha.detach().item()),
             "sac_q_mean": q_value / divisor,
+            "sac_replay_reward_mean": replay_reward_mean / divisor,
+            "sac_replay_reward_min": replay_reward_min,
+            "sac_replay_reward_max": replay_reward_max,
+            "sac_target_q_mean": target_q_mean / divisor,
+            "sac_q_abs_max": q_abs_max,
         }
 
     def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]

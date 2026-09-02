@@ -667,9 +667,9 @@ def advance_gait(
     planning_failure_state |= planning_failure
     # A failed normal preflight is a planning transaction failure, not a
     # physical contact failure: stay in HOLD and let the planner propose the
-    # safe nominal fallback.  A geometrically invalid recovery proposal has
-    # no such fallback, so return to RECOVERY and require a fresh one-shot
-    # recovery transaction instead of leaving a pending HOLD latched forever.
+    # safe nominal fallback.  If the recovery transaction has no executable
+    # fallback, return to RECOVERY and require a fresh one-shot transaction
+    # instead of leaving a pending HOLD latched forever.
     recovery_plan_failure = (
         contact_adaptive
         & planning_failure

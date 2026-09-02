@@ -217,12 +217,11 @@ def route_nominal_and_learned_footholds(
 ) -> LearnedFootholdRoute:
     """Route privileged training targets without invoking candidate search.
 
-    During normal walking, a learned proposal must pass both geometry and
-    danger-cylinder safety before it can be executed. A safe nominal target is
-    the fallback when the learned proposal is not executable. A
-    contact-adaptive recovery step may execute a geometrically valid learned
-    target even when its danger-cylinder score is negative; that score remains
-    a PPO learning signal rather than an execution gate.
+    A learned proposal must pass both geometry and danger-cylinder safety
+    before it can be executed, including during contact-adaptive recovery. A
+    safe nominal target is the fallback when the learned proposal is not
+    executable. Recovery must not introduce a second, weaker definition of a
+    safe foothold.
     """
 
     if not (
@@ -252,25 +251,13 @@ def route_nominal_and_learned_footholds(
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    learned_available_recovery = (
-        learned_prepared.bool()
-        & learned_geometric_valid.bool()
-    )
-    use_learned = torch.where(
-        recovery_mask,
-        learned_available_recovery,
-        learned_available_safe,
-    )
+    use_learned = learned_available_safe
 
-    # Normal walking retains the danger-cylinder gate. Recovery deliberately
-    # treats that gate as a learning signal: a geometrically valid learned
-    # point may be executed even when its safety score is negative. Geometry
-    # remains a hard boundary because an invalid 3-D target cannot be a useful
-    # training action.
+    # The recovery mask remains part of the API for diagnostics, but it cannot
+    # bypass the same endpoint safety gate used during normal walking.
     safe_nominal = nominal_geometric_valid.bool() & nominal_safety_valid.bool()
     use_nominal = (
-        ~recovery_mask
-        & ~use_learned
+        ~use_learned
         & safe_nominal
     )
     return LearnedFootholdRoute(
@@ -436,13 +423,43 @@ def decode_normalized_foothold(
     return projected * radii
 
 
+def decode_residual_foothold(
+    normalized_action: torch.Tensor,
+    *,
+    nominal_xy_f: torch.Tensor,
+    max_adjustment_x: float,
+    max_adjustment_y: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode a normalized planner action as a residual around a nominal XY.
+
+    The nominal target is the action origin.  Keeping this anchor in the
+    decoder makes a zero action an identity adjustment, so the planner cannot
+    collapse both swing legs onto the support-foot centerline merely because
+    its policy mean is initially near zero.
+    """
+
+    if normalized_action.shape[-1] != 2:
+        raise ValueError("normalized_action must have two coordinates.")
+    if nominal_xy_f.shape != normalized_action.shape:
+        raise ValueError("nominal_xy_f must match normalized_action shape.")
+    if max_adjustment_x <= 0.0 or max_adjustment_y <= 0.0:
+        raise ValueError("planner adjustment bounds must be positive.")
+    normalized = torch.clamp(normalized_action, -1.0, 1.0)
+    limits = normalized.new_tensor((max_adjustment_x, max_adjustment_y))
+    residual_xy = normalized * limits
+    return nominal_xy_f + residual_xy, residual_xy
+
+
 def prepare_learned_foothold_target(
     *,
     normalized_action: torch.Tensor,
+    nominal_xy_f: torch.Tensor | None = None,
     origin_w: torch.Tensor,
     yaw_w: torch.Tensor,
     radius_x: float,
     radius_y: float,
+    max_adjustment_x: float | None = None,
+    max_adjustment_y: float | None = None,
     max_step_height_m: float,
     terrain_height_query_w: TerrainHeightQuery,
 ) -> LearnedFootholdPreparation:
@@ -451,11 +468,26 @@ def prepare_learned_foothold_target(
     if max_step_height_m <= 0.0:
         raise ValueError("max_step_height_m must be positive.")
 
-    decoded_xy_f = decode_normalized_foothold(
-        normalized_action,
-        radius_x=radius_x,
-        radius_y=radius_y,
-    )
+    # ``None`` preserves the source-file utility's old absolute-decoding API
+    # for standalone callers.  The simulator planner always supplies the
+    # frozen nominal target and explicit residual bounds below.
+    if nominal_xy_f is None:
+        decoded_xy_f = decode_normalized_foothold(
+            normalized_action,
+            radius_x=radius_x,
+            radius_y=radius_y,
+        )
+    else:
+        if max_adjustment_x is None:
+            max_adjustment_x = radius_x
+        if max_adjustment_y is None:
+            max_adjustment_y = radius_y
+        decoded_xy_f, _ = decode_residual_foothold(
+            normalized_action,
+            nominal_xy_f=nominal_xy_f,
+            max_adjustment_x=max_adjustment_x,
+            max_adjustment_y=max_adjustment_y,
+        )
     decoded_f = torch.cat(
         (
             decoded_xy_f,
@@ -528,10 +560,8 @@ def learned_foothold_swing_ready(
     Normal walking gets one control cycle to evaluate the learned proposal.
     A cached learned proposal that has passed the execution gate remains ready
     for the rest of the HOLD transaction. An unsafe proposal may fall back to a
-    safe nominal route only after it has been evaluated. A contact-adaptive
-    recovery step also waits for one evaluated learned proposal, but its
-    danger-cylinder score is a soft learning signal; only 3-D geometry is
-    required before the swing can start.
+    safe nominal route only after it has been evaluated. Recovery uses the same
+    safety gate and therefore cannot start a swing with an unsafe endpoint.
     """
 
     if not (
@@ -545,21 +575,15 @@ def learned_foothold_swing_ready(
         raise ValueError("learned foothold swing masks must share one shape.")
 
     nominal_ready = nominal_route_ready.bool()
-    recovery = recovery_step.bool()
     learned_ready_safe = (
         learned_prepared_valid.bool()
         & learned_geometric_valid.bool()
         & learned_safety_valid.bool()
     )
-    learned_ready_recovery = (
-        learned_prepared_valid.bool()
-        & learned_geometric_valid.bool()
-    )
     normal_ready = transaction_evaluated.bool() & (
         learned_ready_safe | nominal_ready
     )
-    recovery_ready = transaction_evaluated.bool() & learned_ready_recovery
-    return torch.where(recovery, recovery_ready, normal_ready)
+    return normal_ready
 
 
 def learned_foothold_transaction_ready(

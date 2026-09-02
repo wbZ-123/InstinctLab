@@ -1264,15 +1264,21 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
             **self._sac_constructor_config,
         )
         planner_parameters = (
-            self.actor_critic.planner_policy_parameters()
-            if hasattr(self.actor_critic, "planner_policy_parameters")
-            else self.actor_critic.foothold_parameters()
+            self.actor_critic.planner_actor_parameters()
+            if hasattr(self.actor_critic, "planner_actor_parameters")
+            else self.actor_critic.planner_policy_parameters()
+        )
+        planner_encoder_parameters = (
+            self.actor_critic.planner_encoder_parameters()
+            if hasattr(self.actor_critic, "planner_encoder_parameters")
+            else ()
         )
         self.sac = FootholdSAC(
             sac_config,
             device=self.device,
             actor_distribution_fn=self.actor_critic.planner_distribution_from_features,
             actor_parameters=planner_parameters,
+            feature_parameters=planner_encoder_parameters,
             feature_fn=lambda observations: self.actor_critic.planner_features(
                 observations,
                 detach_shared=True,
@@ -1307,11 +1313,27 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         event = infos.get("learned_foothold_action_event")
         if event is None:
             raise KeyError("Missing causal PPO transition key: learned_foothold_action_event")
+        raw_event_reward = infos.get("learned_foothold_event_reward")
+        if raw_event_reward is None:
+            raise KeyError(
+                "Missing unscaled planner event reward: "
+                "learned_foothold_event_reward"
+            )
         planner_rewards = torch.as_tensor(
-            rewards,
+            raw_event_reward,
             device=self.device,
             dtype=torch.float32,
-        )[..., self.foothold_reward_index]
+        )
+        expected_shape = (accumulator.num_envs,)
+        if tuple(planner_rewards.shape) != expected_shape:
+            raise ValueError(
+                "learned_foothold_event_reward must have shape "
+                f"{expected_shape}, got {tuple(planner_rewards.shape)}."
+            )
+        if not torch.isfinite(planner_rewards).all().item():
+            raise FloatingPointError(
+                "learned_foothold_event_reward must be finite."
+            )
 
         def record_event(obs, action, reward, next_state, terminal):
             self._require_sac().observe(obs, action, reward, next_state, terminal)

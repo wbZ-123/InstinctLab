@@ -89,6 +89,11 @@ def test_sac_uses_event_scaled_update_credit_and_respects_cap():
     assert diagnostics["sac_update_count"] == 1.0
     assert diagnostics["sac_requested_update_count"] == 1.0
     assert diagnostics["replay_size"] == 6.0
+    assert diagnostics["sac_replay_reward_mean"] == pytest.approx(1.0)
+    assert diagnostics["sac_replay_reward_min"] == pytest.approx(1.0)
+    assert diagnostics["sac_replay_reward_max"] == pytest.approx(1.0)
+    assert "sac_target_q_mean" in diagnostics
+    assert "sac_q_abs_max" in diagnostics
     torch.testing.assert_close(
         torch.tensor(diagnostics["sac_update_credit"]),
         torch.tensor(0.5),

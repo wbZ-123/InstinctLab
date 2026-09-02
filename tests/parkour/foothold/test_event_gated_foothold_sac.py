@@ -145,6 +145,7 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
             "learned_foothold_action_event": torch.tensor([False, True]),
             "learned_foothold_nominal_safe_event": torch.tensor([False, True]),
             "learned_foothold_nominal_unsafe_event": torch.tensor([False, False]),
+            "learned_foothold_event_reward": torch.tensor([0.0, 0.73]),
             "step": {},
         },
         obs + 1.0,
@@ -174,12 +175,17 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
             "learned_foothold_action_event": torch.tensor([False, True]),
             "learned_foothold_nominal_safe_event": torch.tensor([False, True]),
             "learned_foothold_nominal_unsafe_event": torch.tensor([False, False]),
+            "learned_foothold_event_reward": torch.tensor([0.0, 0.0]),
             "step": {},
         },
         obs + 2.0,
         obs + 2.0,
     )
     assert len(algorithm.sac.replay) == 1
+    torch.testing.assert_close(
+        algorithm.sac.replay.rewards[0],
+        torch.tensor(0.73),
+    )
     torch.testing.assert_close(
         algorithm.sac.replay.actions[0],
         torch.tensor([3.0, 4.0]) / 26.0**0.5,
@@ -217,6 +223,89 @@ def test_hybrid_sac_updates_from_event_replay_without_ppo_planner_step():
         not torch.equal(old, new)
         for old, new in zip(before, algorithm.actor_critic.planner_policy_parameters())
     )
+
+
+def test_planner_encoder_is_owned_by_critic_not_actor():
+    module, policy_module = _load_modules()
+    policy = policy_module.IndependentFootholdEncoderMoEActorCritic(
+        obs_format={
+            "policy": {"obs": (4,), "depth_image": (1, 8, 8)},
+            "critic": {"obs": (4,)},
+        },
+        num_actions=31,
+        motor_action_dim=29,
+        actor_hidden_dims=[8],
+        critic_hidden_dims=[8],
+        foothold_hidden_dims=[8, 4],
+        foothold_depth_output_size=4,
+        num_moe_experts=2,
+        init_noise_std=0.9,
+        num_rewards=2,
+        encoder_configs={
+            "depth": {
+                "class_name": "Conv2dHeadModel",
+                "component_names": ["depth_image"],
+                "output_size": 4,
+                "channels": [2],
+                "kernel_sizes": [3],
+                "strides": [1],
+                "paddings": [1],
+                "hidden_sizes": [4],
+                "nonlinearity": "ReLU",
+                "use_maxpool": False,
+                "takeout_input_components": True,
+            }
+        },
+    )
+    actor_params = policy.planner_actor_parameters()
+    encoder_params = policy.planner_encoder_parameters()
+    assert encoder_params
+    assert actor_params
+    assert not ({id(p) for p in actor_params} & {id(p) for p in encoder_params})
+
+
+def test_hybrid_sac_requires_unscaled_event_reward_extra():
+    module, policy_module = _load_modules()
+    algorithm = _make_sac_algorithm(module, policy_module)
+    algorithm.init_storage(
+        2,
+        1,
+        {
+            "policy": {"obs": (4,)},
+            "critic": {"obs": (4,)},
+            "amp_policy": {"state": (3,)},
+            "amp_reference": {"state": (3,)},
+        },
+        31,
+        num_rewards=2,
+    )
+    algorithm.transition.observations = torch.zeros(2, 4)
+    algorithm.transition.critic_observations = torch.zeros(2, 4)
+    algorithm.transition.actions = torch.zeros(2, 31)
+    algorithm.transition.values = torch.zeros(2, 2)
+    algorithm.transition.actions_log_prob = torch.zeros(2, 1)
+    algorithm.transition.action_mean = torch.zeros(2, 31)
+    algorithm.transition.action_sigma = torch.ones(2, 31)
+
+    with pytest.raises(KeyError, match="learned_foothold_event_reward"):
+        algorithm.process_env_step(
+            torch.zeros(2, 2),
+            torch.zeros(2, dtype=torch.bool),
+            {
+                "observations": {
+                    "policy": torch.zeros(2, 4),
+                    "amp_policy": torch.zeros(2, 3),
+                    "amp_reference": torch.zeros(2, 3),
+                },
+                "time_outs": torch.zeros(2),
+                "learned_foothold_action_event": torch.tensor([True, False]),
+                "learned_foothold_nominal_safe_event": torch.tensor([True, False]),
+                "learned_foothold_nominal_unsafe_event": torch.tensor([False, False]),
+                "step": {},
+            },
+            torch.zeros(2, 4),
+            torch.zeros(2, 4),
+        )
 
 
 def test_hybrid_act_keeps_motor_actions_and_replaces_only_planner_slice():

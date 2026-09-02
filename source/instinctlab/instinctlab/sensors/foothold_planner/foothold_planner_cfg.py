@@ -80,6 +80,11 @@ class FootholdPlannerCfg(SensorBaseCfg):
     # Learned XY actions reuse FlatProviderConfig.outer_radius_x/y and the
     # existing max_foothold_step_height_m instead of defining duplicate limits.
     enable_learned_foothold: bool = False
+    # Learned actions are residuals around the frozen analytic nominal point.
+    # Bounds are intentionally separate from the physical reachability ellipse:
+    # they limit how far the learned planner may alter the analytic gait.
+    learned_foothold_max_adjustment_x_m: float = 0.12
+    learned_foothold_max_adjustment_y_m: float = 0.10
 
     # Contact-adaptive recovery is opt-in until a calibration file is
     # available. Its motion/slip fields remain diagnostics; one confirmed

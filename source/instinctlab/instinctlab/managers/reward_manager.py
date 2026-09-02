@@ -172,6 +172,29 @@ class MultiRewardManager(RewardManager):
         index = self.__group_term_names[group_name].index(term_name)
         return self.__group_term_cfgs[group_name][index]
 
+    def get_termwise_reward(
+        self,
+        term_name: str,
+        group_name: str | None = None,
+    ) -> torch.Tensor:
+        """Return a snapshot of a term value before time-step scaling.
+
+        ``compute`` stores each weighted term in ``_termwise_reward_buf``
+        before multiplying it by the environment ``dt``.  This accessor is
+        intentionally read-only and returns a clone so consumers cannot
+        mutate the manager's current-step buffer.
+        """
+
+        if group_name is None:
+            group_name = list(self.__group_term_names.keys())[0]
+        if group_name not in self.__group_term_names:
+            raise ValueError(f"Group '{group_name}' not found.")
+        if term_name not in self.__group_term_names[group_name]:
+            raise ValueError(
+                f"Term '{term_name}' not found in group '{group_name}'."
+            )
+        return self._termwise_reward_buf[group_name][term_name].detach().clone()
+
     def get_active_iterable_terms(self, env_idx: int) -> Sequence[tuple[str, Sequence[float]]]:
         terms = []
         for group_name in self.__group_term_cfgs.keys():

@@ -20,6 +20,7 @@ from instinctlab_foothold.learned_target import (
     LearnedFootholdPreparation,
     clear_learned_foothold_buffers,
     decode_normalized_foothold,
+    decode_residual_foothold,
     learned_foothold_event_masks,
     learned_foothold_swing_ready,
     learned_foothold_transaction_ready,
@@ -224,7 +225,7 @@ def test_late_touchdown_search_is_limited_to_existing_touchdown_z_tolerance():
     assert "self.cfg.max_foothold_step_height_m / late_speed" not in planner_text
 
 
-def test_contact_adaptive_recovery_allows_learned_recovery_transaction():
+def test_contact_adaptive_recovery_uses_the_same_learned_safety_gate():
     planner_text = _planner_source_path("foothold_planner.py").read_text()
     learned_block = planner_text[
         planner_text.index("if self.cfg.enable_learned_foothold:") :
@@ -233,7 +234,9 @@ def test_contact_adaptive_recovery_allows_learned_recovery_transaction():
 
     assert "make_recovery_foothold_target" not in learned_block
     assert "recovery_step_pending" in learned_block
-    assert "lock_recovery_step" in planner_text
+    assert "recovery may execute it when" not in planner_text
+    assert "preflight_safe = obstacle_preflight_safe" in planner_text
+    assert "~preflight_safe & ~preflight_recovery" not in planner_text
 
 
 def test_environment_enables_nominal_observation_only_with_learned_action():
@@ -573,6 +576,34 @@ def test_decode_normalized_foothold_radially_projects_to_shared_ellipse():
     torch.testing.assert_close(ellipse_usage, torch.ones_like(ellipse_usage))
 
 
+def test_zero_residual_decodes_exactly_to_nominal_foothold():
+    nominal_xy = torch.tensor([[0.20, 0.18], [0.20, -0.18]])
+    final_xy, residual_xy = decode_residual_foothold(
+        normalized_action=torch.zeros(2, 2),
+        nominal_xy_f=nominal_xy,
+        max_adjustment_x=0.12,
+        max_adjustment_y=0.10,
+    )
+
+    torch.testing.assert_close(final_xy, nominal_xy)
+    torch.testing.assert_close(residual_xy, torch.zeros_like(nominal_xy))
+
+
+def test_residual_is_applied_in_support_frame_without_erasing_lateral_side():
+    nominal_xy = torch.tensor([[0.20, 0.18], [0.20, -0.18]])
+    final_xy, _ = decode_residual_foothold(
+        normalized_action=torch.tensor([[0.5, 0.5], [0.5, -0.5]]),
+        nominal_xy_f=nominal_xy,
+        max_adjustment_x=0.12,
+        max_adjustment_y=0.10,
+    )
+
+    torch.testing.assert_close(
+        final_xy,
+        torch.tensor([[0.26, 0.23], [0.26, -0.23]]),
+    )
+
+
 def test_event_masks_prepare_in_confirmed_hold_and_lock_only_on_new_swing():
     prepare, lock = learned_foothold_event_masks(
         hold=torch.tensor([True, True, False, False]),
@@ -676,7 +707,7 @@ def test_recovery_swing_waits_for_geometrically_valid_learned_evaluation():
     assert ready.tolist() == [False, True]
 
 
-def test_execution_route_keeps_danger_gate_for_normal_walk_but_not_recovery():
+def test_execution_route_keeps_danger_gate_for_normal_walk_and_recovery():
     route = route_nominal_and_learned_footholds(
         nominal_geometric_valid=torch.tensor([False, False]),
         nominal_safety_valid=torch.tensor([False, False]),
@@ -686,11 +717,11 @@ def test_execution_route_keeps_danger_gate_for_normal_walk_but_not_recovery():
         recovery_step=torch.tensor([False, True]),
     )
 
-    # Normal walking retains the safety gate, while Recovery uses the learned
-    # geometrically valid point so the event can be learned from execution.
+    # Recovery uses the same safety gate as normal walking. A negative safety
+    # score remains a learning signal, but cannot become an executed target.
     assert route.use_nominal.tolist() == [False, False]
-    assert route.use_learned.tolist() == [False, True]
-    assert route.executable.tolist() == [False, True]
+    assert route.use_learned.tolist() == [False, False]
+    assert route.executable.tolist() == [False, False]
 
 
 def test_lock_requires_execution_safety_even_when_geometry_is_valid():
@@ -714,7 +745,7 @@ def test_lock_requires_execution_safety_even_when_geometry_is_valid():
     assert data.learned_foothold_locked.tolist() == [True, False]
 
 
-def test_recovery_route_uses_geometric_learned_target_even_if_soft_unsafe():
+def test_recovery_route_does_not_bypass_foothold_safety_gate():
     route = route_nominal_and_learned_footholds(
         nominal_geometric_valid=torch.tensor([True]),
         nominal_safety_valid=torch.tensor([False]),
@@ -725,8 +756,8 @@ def test_recovery_route_uses_geometric_learned_target_even_if_soft_unsafe():
     )
 
     assert route.use_nominal.tolist() == [False]
-    assert route.use_learned.tolist() == [True]
-    assert route.executable.tolist() == [True]
+    assert route.use_learned.tolist() == [False]
+    assert route.executable.tolist() == [False]
 
 
 def test_prepare_target_queries_world_xy_and_applies_existing_height_limit():
@@ -756,6 +787,41 @@ def test_prepare_target_queries_world_xy_and_applies_existing_height_limit():
     )
     assert result.height_valid.tolist() == [True, True]
     assert result.geometric_valid.tolist() == [True, False]
+
+
+def test_prepare_target_residual_keeps_nominal_lateral_side_and_queries_world_xy():
+    queried = []
+
+    def terrain_query(points_xy_w):
+        queried.append(points_xy_w.clone())
+        return torch.tensor([0.55, 0.50]), torch.tensor([True, True])
+
+    result = prepare_learned_foothold_target(
+        normalized_action=torch.zeros(2, 2),
+        nominal_xy_f=torch.tensor([[0.20, 0.18], [0.20, -0.18]]),
+        origin_w=torch.tensor([[1.0, 2.0, 0.40], [3.0, 4.0, 0.40]]),
+        yaw_w=torch.zeros(2),
+        radius_x=0.42,
+        radius_y=0.25,
+        max_adjustment_x=0.12,
+        max_adjustment_y=0.10,
+        max_step_height_m=0.27,
+        terrain_height_query_w=terrain_query,
+    )
+
+    torch.testing.assert_close(
+        queried[0],
+        torch.tensor([[1.20, 2.18], [3.20, 3.82]]),
+    )
+    torch.testing.assert_close(
+        result.target_w,
+        torch.tensor([[1.20, 2.18, 0.55], [3.20, 3.82, 0.50]]),
+    )
+    torch.testing.assert_close(
+        result.target_f,
+        torch.tensor([[0.20, 0.18, 0.15], [0.20, -0.18, 0.10]]),
+    )
+    assert result.geometric_valid.tolist() == [True, True]
 
 
 def test_prepare_target_requires_height_difference_strictly_below_limit():

@@ -260,9 +260,29 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         return self._parameters_with_prefixes(
             (
                 "foothold_actor",
-                "foothold_depth_encoder",
                 "foothold_std",
             ),
+            include=True,
+        )
+
+    def planner_actor_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return planner actor and distribution parameters for SAC.
+
+        The dedicated visual encoder is deliberately excluded: SAC's critic
+        TD loss owns that representation, while the actor consumes detached
+        planner features.
+        """
+
+        return self._parameters_with_prefixes(
+            ("foothold_actor", "foothold_std"),
+            include=True,
+        )
+
+    def planner_encoder_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return only the dedicated planner depth-encoder parameters."""
+
+        return self._parameters_with_prefixes(
+            ("foothold_depth_encoder",),
             include=True,
         )
 
