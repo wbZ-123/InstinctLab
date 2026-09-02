@@ -81,6 +81,15 @@ parser.add_argument(
     help="Also print foothold debug on fresh safe-target planning events, even between interval samples.",
 )
 parser.add_argument(
+    "--diagnose_foothold_policy",
+    action="store_true",
+    default=False,
+    help=(
+        "Run one read-only counterfactual actor/critic foothold diagnostic "
+        "per selected debug environment."
+    ),
+)
+parser.add_argument(
     "--print_reset_debug",
     action="store_true",
     default=False,
@@ -188,6 +197,11 @@ from play_curriculum import (
     load_recorded_foothold_curriculum_scale,
 )
 from play_foothold_viz import make_foothold_visualizer, update_foothold_visualizer
+from foothold_policy_diagnostics import (
+    diagnose_foothold_policy,
+    format_policy_sensitivity,
+    format_q_sweep,
+)
 from play_learned_config import configure_learned_foothold_play
 from play_step_terrain import (
     configure_free_world_camera,
@@ -459,12 +473,14 @@ def main():
     timestep = 0
     foothold_visualizer = make_foothold_visualizer() if args_cli.show_foothold_debug_markers else None
     foothold_visualizer_warned = False
+    diagnosed_foothold_policy_env_ids: set[int] = set()
 
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
+            policy_observation = obs.detach().clone() if args_cli.diagnose_foothold_policy else None
             actions = policy(obs)
             zero_act_active = timestep < args_cli.zero_act_until
             reset_debug_snapshots = {}
@@ -502,7 +518,9 @@ def main():
                         )
 
         print_foothold_debug = (
-            args_cli.print_foothold_debug or args_cli.print_foothold_marker_debug
+            args_cli.print_foothold_debug
+            or args_cli.print_foothold_marker_debug
+            or args_cli.diagnose_foothold_policy
         )
         if print_foothold_debug:
             interval_tick = timestep % max(args_cli.print_foothold_debug_interval, 1) == 0
@@ -526,6 +544,73 @@ def main():
                             ),
                             flush=True,
                         )
+                    if (
+                        args_cli.diagnose_foothold_policy
+                        and learned_event
+                        and env_id not in diagnosed_foothold_policy_env_ids
+                    ):
+                        diagnosed_foothold_policy_env_ids.add(env_id)
+                        try:
+                            if policy_observation is None:
+                                raise RuntimeError(
+                                    "pre-step policy observation was not captured"
+                                )
+                            sac = getattr(ppo_runner.alg, "sac", None)
+                            if sac is None:
+                                raise RuntimeError(
+                                    "loaded algorithm has no foothold SAC learner"
+                                )
+                            foothold_sensor = env.unwrapped.scene.sensors[
+                                "foothold_planner"
+                            ]
+                            flat_provider_cfg = getattr(
+                                foothold_sensor,
+                                "_flat_provider_cfg",
+                                None,
+                            )
+                            if flat_provider_cfg is None:
+                                raise RuntimeError(
+                                    "runtime foothold reachability configuration is unavailable"
+                                )
+                            diagnostic = diagnose_foothold_policy(
+                                ppo_runner.alg.actor_critic,
+                                sac,
+                                policy_observation[env_id : env_id + 1],
+                                radius_x_m=float(
+                                    flat_provider_cfg.outer_radius_x
+                                ),
+                                radius_y_m=float(
+                                    flat_provider_cfg.outer_radius_y
+                                ),
+                            )
+                            sensitivity_line = format_policy_sensitivity(
+                                diagnostic
+                            ).replace(
+                                "] ",
+                                f"] env_id={env_id} ",
+                                1,
+                            )
+                            print(sensitivity_line, flush=True)
+                            for counterfactual in diagnostic[
+                                "counterfactuals"
+                            ]:
+                                q_line = format_q_sweep(
+                                    diagnostic,
+                                    nominal_y_m=counterfactual[
+                                        "nominal_y_m"
+                                    ],
+                                ).replace(
+                                    "] ",
+                                    f"] env_id={env_id} ",
+                                    1,
+                                )
+                                print(q_line, flush=True)
+                        except Exception as exc:
+                            print(
+                                "[FOOTHOLD_POLICY_DIAGNOSTIC_ERROR] "
+                                f"env_id={env_id} error={exc}",
+                                flush=True,
+                            )
                     if not interval_tick and not plan_event:
                         continue
                     if (

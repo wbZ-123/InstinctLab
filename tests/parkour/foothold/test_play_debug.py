@@ -22,6 +22,15 @@ def _load_play_debug_module():
     return module
 
 
+def _play_script_text() -> str:
+    return (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "instinct_rl"
+        / "play.py"
+    ).read_text()
+
+
 class FakeCommandManager:
     def __init__(self, command: torch.Tensor, term=None):
         self._command = command
@@ -720,6 +729,24 @@ def test_is_learned_foothold_debug_event_selects_only_evaluation_or_route():
         )
         is False
     )
+
+
+def test_play_integrates_read_only_foothold_policy_diagnostic():
+    play_text = _play_script_text()
+
+    assert '"--diagnose_foothold_policy"' in play_text
+    assert "diagnosed_foothold_policy_env_ids: set[int] = set()" in play_text
+    assert "policy_observation = obs.detach().clone()" in play_text
+    assert "actions = policy(obs)" in play_text
+    assert "diagnose_foothold_policy(" in play_text
+    assert "format_policy_sensitivity(" in play_text
+    assert "format_q_sweep(" in play_text
+    assert "or args_cli.diagnose_foothold_policy" in play_text
+
+    snapshot_index = play_text.index("policy_observation = obs.detach().clone()")
+    policy_index = play_text.index("actions = policy(obs)")
+    step_index = play_text.index("obs, rewards, dones, infos = env.step(actions)")
+    assert snapshot_index < policy_index < step_index
 
 
 def test_learned_foothold_debug_reports_nominal_deviation_without_side_gate():
