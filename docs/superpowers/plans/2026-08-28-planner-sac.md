@@ -4,7 +4,7 @@
 
 **Goal:** Replace only the learned foothold planner's event-gated PPO optimizer with a bounded SAC learner while preserving the motor PPO/AMP/MoE path and all existing foothold geometry/state-machine behavior.
 
-**Architecture:** Keep the existing combined actor-critic for motor rollout and planner action generation, but expose planner features and raw two-dimensional actions. Add a local planner SAC module with twin Q networks, target Q networks, automatic entropy temperature, and an event-only replay buffer. The hybrid algorithm records planner transitions during `process_env_step`, updates motor PPO and AMP as before, then performs at most two planner SAC updates.
+**Architecture:** Keep the existing combined actor-critic for motor rollout and planner action generation, but expose planner features and raw two-dimensional actions. Add a local planner SAC module with twin Q networks, target Q networks, automatic entropy temperature, and an event-only replay buffer. The hybrid algorithm records planner transitions during `process_env_step`, updates motor PPO and AMP as before, then schedules event-scaled planner SAC updates with a bounded per-rollout cap.
 
 **Tech Stack:** PyTorch, existing local `instinctlab.learning` modules, IsaacLab runner configuration, pytest.
 
@@ -42,8 +42,8 @@
 - Test: `tests/parkour/foothold/test_foothold_sac.py`
 
 **Interfaces:**
-- `FootholdSACConfig` contains `obs_dim`, `action_dim=2`, `hidden_dims=(128, 128)`, `replay_capacity=100000`, `batch_size=256`, `warmup_events=1024`, `updates_per_rollout=2`, `actor_lr=1e-4`, `critic_lr=1e-4`, `alpha_lr=1e-4`, `gamma=0.99`, `tau=0.005`, `target_entropy=-2.0`, and `max_grad_norm=1.0`.
-- `FootholdSAC` exposes `act(features, deterministic=False)`, `observe(...)`, `update()`, `state_dict()`, `load_state_dict(...)`, and diagnostics including replay size, update count, actor/critic losses, alpha, and skipped-update count.
+- `FootholdSACConfig` contains `obs_dim`, `action_dim=2`, `hidden_dims=(128, 128)`, `replay_capacity=100000`, `batch_size=256`, `warmup_events=1024`, `target_sample_ratio=0.125`, `max_updates_per_rollout=4`, `actor_lr=1e-4`, `critic_lr=1e-4`, `alpha_lr=1e-4`, `gamma=0.99`, `tau=0.005`, `target_entropy=-2.0`, and `max_grad_norm=1.0`.
+- `FootholdSAC` exposes `act(features, deterministic=False)`, `observe(...)`, `update(new_event_count=...)`, `state_dict()`, `load_state_dict(...)`, and diagnostics including replay size, event-scaled update counts, sample ratio, update time, actor/critic losses, alpha, and skipped-update count.
 
 - [x] Write failing deterministic-tensor tests for twin-Q minimum target, terminal target masking, Polyak averaging, automatic alpha update, warm-up skip, and finite-value rejection.
 - [x] Run the focused SAC tests after implementation; the pre-implementation failure check was intentionally skipped because the module was implemented in the same work session.

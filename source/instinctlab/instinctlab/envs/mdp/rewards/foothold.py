@@ -444,16 +444,21 @@ def learned_foothold_planning_event_reward(
     nominal_step_width_m: float = 0.18,
     velocity_std: float = 0.5,
     safety_margin_reference_m: float = 0.04,
-    safe_nominal_weight: float = 0.15,
-    unsafe_nominal_weight: float = 0.05,
+    # Kept for compatibility with older callers.  The branch-specific
+    # objective no longer mixes these scalar weights into the safe-nominal
+    # case.
+    safe_nominal_weight: float | None = None,
+    unsafe_nominal_weight: float | None = None,
 ) -> torch.Tensor:
-    """Score learned footholds with safety, progress, and reasonable steps.
+    """Score learned footholds with branch-specific objectives.
 
-    Every planner evaluation receives the signed command-progress signal. The
-    nominal-point term is stronger when the nominal target is safe and weaker
-    when the network must move toward a safer target. ``velocity_std`` remains
-    accepted for checkpoint/config compatibility; the signed projection and
-    step-shape terms replace the old exponential velocity-consistency score.
+    A safe nominal target is already the desired answer, so a safe learned
+    target is scored only by its bounded distance to that nominal target.  A
+    learned target that penetrates an obstacle receives only safety-driven
+    punishment, with optional one-sided penalties for excessive deviation or
+    reverse motion.  Progress and step-shape rewards are reserved for safe
+    corrections to an unsafe nominal target. ``velocity_std`` and the legacy
+    nominal weights remain accepted for checkpoint/config compatibility.
     """
 
     if (
@@ -463,8 +468,14 @@ def learned_foothold_planning_event_reward(
         or nominal_step_width_m < 0.0
         or velocity_std <= 0.0
         or safety_margin_reference_m <= 0.0
-        or not 0.0 <= safe_nominal_weight <= 1.0
-        or not 0.0 <= unsafe_nominal_weight <= 1.0
+        or (
+            safe_nominal_weight is not None
+            and not 0.0 <= safe_nominal_weight <= 1.0
+        )
+        or (
+            unsafe_nominal_weight is not None
+            and not 0.0 <= unsafe_nominal_weight <= 1.0
+        )
     ):
         raise ValueError("planner reward scales and weights must be valid.")
 
@@ -601,37 +612,31 @@ def learned_foothold_planning_event_reward(
     # A failed obstacle gate is never allowed to look like a clear target just
     # because a legacy buffer omitted its per-point penetration statistics.
     penetrating = penetrating | ~learned_safety_valid
-    nominal_weight = torch.where(
-        nominal_safe,
-        torch.full_like(learned_safety, safe_nominal_weight),
-        torch.full_like(learned_safety, unsafe_nominal_weight),
-    )
-    safety_weight = torch.where(
-        nominal_safe,
-        torch.full_like(learned_safety, 0.40),
-        torch.full_like(learned_safety, 0.45),
-    )
-    progress_weight = torch.where(
-        nominal_safe,
-        torch.full_like(learned_safety, 0.25),
-        torch.full_like(learned_safety, 0.30),
-    )
-    clear_raw_score = (
-        safety_weight * safety_margin
-        + progress_weight * signed_command_progress
+    # A safe nominal target has no reason to be optimized for a different
+    # direction or step shape.  Its learned counterpart should simply copy it.
+    unsafe_nominal_clear_score = (
+        0.45 * safety_margin
+        + 0.30 * signed_command_progress
         + 0.20 * reasonable_step
-        + nominal_weight * nominal_term
-    )
-    # Keep forward/step information on unsafe events, but do not let it
-    # overwhelm the count/depth safety penalty. This branch is still a soft
-    # learning signal, not an execution rejection.
-    penetrating_raw_score = (
-        0.70 * safety_margin
-        + 0.15 * signed_command_progress
-        + 0.10 * reasonable_step
         + 0.05 * nominal_term
     )
-    raw_score = torch.where(penetrating, penetrating_raw_score, clear_raw_score)
+
+    # Unsafe learned proposals must never obtain a positive score from making
+    # forward progress.  Keep safety dominant and retain only one-sided
+    # shaping penalties, so excessive deviation or reverse motion cannot be
+    # mistaken for a successful correction.
+    excessive_deviation_penalty = nominal_excess_cost.clamp(0.0, 1.0)
+    reverse_motion_penalty = (-signed_command_progress).clamp(0.0, 1.0)
+    penetrating_raw_score = (
+        0.85 * safety_margin
+        - 0.10 * excessive_deviation_penalty
+        - 0.05 * reverse_motion_penalty
+    )
+    raw_score = torch.where(
+        penetrating,
+        penetrating_raw_score,
+        torch.where(nominal_safe, nominal_term, unsafe_nominal_clear_score),
+    )
     score = raw_score.clamp(-1.0, 1.0)
     score = torch.where(
         penetrating,

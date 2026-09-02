@@ -1240,8 +1240,6 @@ class LearnedFootholdPlanningRewards:
                 _DEFAULT_FLAT_PROVIDER_CFG.nominal_step_width
             ),
             "safety_margin_reference_m": 0.04,
-            "safe_nominal_weight": 0.15,
-            "unsafe_nominal_weight": 0.05,
         },
     )
 

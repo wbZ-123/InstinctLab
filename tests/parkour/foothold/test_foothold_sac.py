@@ -64,27 +64,66 @@ def test_polyak_update_moves_target_toward_source():
     torch.testing.assert_close(target.weight, torch.full_like(target.weight, 0.5))
 
 
-def test_sac_skips_until_warmup_then_reports_updates():
+def test_sac_uses_event_scaled_update_credit_and_respects_cap():
     module = _load_sac_module()
     config = module.FootholdSACConfig(
         obs_dim=3,
         hidden_dims=(8, 8),
-        batch_size=4,
-        warmup_events=4,
-        updates_per_rollout=1,
+        batch_size=2,
+        warmup_events=2,
+        target_sample_ratio=1.0,
+        max_updates_per_rollout=2,
     )
     sac = module.FootholdSAC(config, device="cpu")
-    obs = torch.zeros(4, 3)
-    actions = torch.zeros(4, 2)
-    rewards = torch.ones(4)
-    next_obs = torch.ones(4, 3)
-    dones = torch.zeros(4, dtype=torch.bool)
+    obs = torch.zeros(6, 3)
+    actions = torch.zeros(6, 2)
+    rewards = torch.ones(6)
+    next_obs = torch.ones(6, 3)
+    dones = torch.zeros(6, dtype=torch.bool)
 
-    assert sac.update()["sac_update_count"] == 0.0
+    assert sac.update(new_event_count=0)["sac_update_count"] == 0.0
     sac.observe(obs, actions, rewards, next_obs, dones)
-    diagnostics = sac.update()
+    # Three new events at batch size two produce 1.5 updates of credit; the
+    # fractional remainder must be retained for the next rollout.
+    diagnostics = sac.update(new_event_count=3)
     assert diagnostics["sac_update_count"] == 1.0
-    assert diagnostics["replay_size"] == 4.0
+    assert diagnostics["sac_requested_update_count"] == 1.0
+    assert diagnostics["replay_size"] == 6.0
+    torch.testing.assert_close(
+        torch.tensor(diagnostics["sac_update_credit"]),
+        torch.tensor(0.5),
+    )
+
+    # The retained half-credit combines with three new events to request two
+    # updates, but the configured cap is still respected.
+    diagnostics = sac.update(new_event_count=3)
+    assert diagnostics["sac_update_count"] == 2.0
+    assert diagnostics["sac_dropped_update_count"] == 0.0
+
+
+def test_sac_drops_update_backlog_above_per_rollout_cap():
+    module = _load_sac_module()
+    config = module.FootholdSACConfig(
+        obs_dim=2,
+        hidden_dims=(8,),
+        batch_size=2,
+        warmup_events=0,
+        target_sample_ratio=1.0,
+        max_updates_per_rollout=2,
+    )
+    sac = module.FootholdSAC(config, device="cpu")
+    sac.observe(
+        torch.zeros(8, 2),
+        torch.zeros(8, 2),
+        torch.ones(8),
+        torch.ones(8, 2),
+        torch.zeros(8, dtype=torch.bool),
+    )
+    diagnostics = sac.update(new_event_count=8)
+    assert diagnostics["sac_update_count"] == 2.0
+    assert diagnostics["sac_requested_update_count"] == 4.0
+    assert diagnostics["sac_dropped_update_count"] == 2.0
+    assert diagnostics["sac_update_credit"] == 0.0
 
 
 def test_sac_rejects_nonfinite_replay_and_keeps_parameters_finite():
@@ -94,7 +133,8 @@ def test_sac_rejects_nonfinite_replay_and_keeps_parameters_finite():
         hidden_dims=(8,),
         batch_size=2,
         warmup_events=0,
-        updates_per_rollout=1,
+        target_sample_ratio=1.0,
+        max_updates_per_rollout=1,
     )
     sac = module.FootholdSAC(config, device="cpu")
     sac.observe(
@@ -104,7 +144,7 @@ def test_sac_rejects_nonfinite_replay_and_keeps_parameters_finite():
         torch.zeros(2, 2),
         torch.zeros(2, dtype=torch.bool),
     )
-    diagnostics = sac.update()
+    diagnostics = sac.update(new_event_count=2)
     assert diagnostics["sac_update_count"] == 0.0
     assert diagnostics["sac_skipped_update_count"] == 1.0
 
@@ -123,7 +163,8 @@ def test_sac_can_encode_raw_replay_into_compact_planner_features():
         hidden_dims=(8,),
         batch_size=2,
         warmup_events=0,
-        updates_per_rollout=1,
+        target_sample_ratio=1.0,
+        max_updates_per_rollout=1,
     )
     sac = module.FootholdSAC(
         config,
@@ -140,7 +181,7 @@ def test_sac_can_encode_raw_replay_into_compact_planner_features():
         torch.randn(2, 4),
         torch.zeros(2, dtype=torch.bool),
     )
-    assert sac.update()["sac_update_count"] == 1.0
+    assert sac.update(new_event_count=2)["sac_update_count"] == 1.0
     assert any(
         not torch.equal(old, new)
         for old, new in zip(before, planner.parameters())

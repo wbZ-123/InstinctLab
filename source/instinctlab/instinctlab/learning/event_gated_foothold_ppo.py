@@ -1208,7 +1208,8 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         sac_replay_capacity: int = 100_000,
         sac_batch_size: int = 256,
         sac_warmup_events: int = 1_024,
-        sac_updates_per_rollout: int = 2,
+        sac_target_sample_ratio: float = 0.125,
+        sac_max_updates_per_rollout: int = 4,
         sac_actor_learning_rate: float = 1.0e-4,
         sac_critic_learning_rate: float = 1.0e-4,
         sac_alpha_learning_rate: float = 1.0e-4,
@@ -1225,7 +1226,8 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
             "replay_capacity": int(sac_replay_capacity),
             "batch_size": int(sac_batch_size),
             "warmup_events": int(sac_warmup_events),
-            "updates_per_rollout": int(sac_updates_per_rollout),
+            "target_sample_ratio": float(sac_target_sample_ratio),
+            "max_updates_per_rollout": int(sac_max_updates_per_rollout),
             "actor_lr": float(sac_actor_learning_rate),
             "critic_lr": float(sac_critic_learning_rate),
             "alpha_lr": float(sac_alpha_learning_rate),
@@ -1389,7 +1391,7 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         event_count = self._planner_events_since_update
         mean_losses, average_stats = super().update(current_learning_iteration)
         sac = self._require_sac()
-        sac_stats = sac.update()
+        sac_stats = sac.update(new_event_count=event_count)
         self._planner_events_since_update = 0
         for key, value in sac_stats.items():
             average_stats[key] = torch.tensor(float(value), device=self.device)

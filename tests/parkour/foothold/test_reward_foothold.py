@@ -539,6 +539,47 @@ def test_safe_learned_target_on_unsafe_nominal_uses_command_consistency():
     torch.testing.assert_close(reward, torch.tensor([1.0]))
 
 
+def test_safe_nominal_event_uses_only_nominal_proximity_for_safe_learned_point():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True, True]),
+        learned_foothold_geometric_valid=torch.tensor([True, True]),
+        learned_foothold_safety_valid=torch.tensor([True, True]),
+        learned_foothold_safety_score=torch.tensor([1.0, 0.2]),
+        learned_foothold_safety_margin_score=torch.tensor([1.0, 0.2]),
+        learned_foothold_penetrating_point_count=torch.tensor([0.0, 0.0]),
+        nominal_geometric_valid=torch.tensor([True, True]),
+        nominal_safety_valid=torch.tensor([True, True]),
+        raw_unclipped_foothold_f=torch.tensor(
+            [[0.20, 0.18, 0.0], [0.20, -0.18, 0.0]]
+        ),
+        learned_foothold_decoded_f=torch.tensor(
+            [[0.20, 0.18, 0.0], [0.20, -0.18, 0.0]]
+        ),
+        # Deliberately different command terms: they must not affect a
+        # safe learned point when the nominal point is already safe.
+        nominal_feasible_velocity_f=torch.tensor(
+            [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0]]
+        ),
+        velocity_lookahead_s=torch.tensor([0.10, 0.10]),
+        swing_side=torch.tensor([0, 1]),
+        swing_preflight_ready=torch.tensor([False, False]),
+        swing_preflight_safe=torch.tensor([True, True]),
+        stabilization_active=torch.zeros(2, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={
+                "foothold_planner": SimpleNamespace(data=planner_data),
+            }
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(env)
+
+    torch.testing.assert_close(reward, torch.tensor([1.0, 1.0]))
+
+
 def test_safe_reverse_correction_scores_below_zero_for_unsafe_nominal():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(

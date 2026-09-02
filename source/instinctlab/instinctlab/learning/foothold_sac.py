@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Callable, Iterable
+from math import floor, isfinite
+from time import perf_counter
 
 import torch
 from torch import nn, optim
@@ -277,7 +279,8 @@ class FootholdSACConfig:
     replay_capacity: int = 100_000
     batch_size: int = 256
     warmup_events: int = 1_024
-    updates_per_rollout: int = 2
+    target_sample_ratio: float = 0.125
+    max_updates_per_rollout: int = 4
     actor_lr: float = 1.0e-4
     critic_lr: float = 1.0e-4
     alpha_lr: float = 1.0e-4
@@ -301,8 +304,12 @@ class FootholdSACConfig:
             raise ValueError("hidden_dims must contain positive widths.")
         if self.replay_capacity <= 0 or self.batch_size <= 0:
             raise ValueError("replay_capacity and batch_size must be positive.")
-        if self.warmup_events < 0 or self.updates_per_rollout < 0:
-            raise ValueError("warmup_events and updates_per_rollout cannot be negative.")
+        if self.warmup_events < 0 or self.max_updates_per_rollout < 0:
+            raise ValueError(
+                "warmup_events and max_updates_per_rollout cannot be negative."
+            )
+        if not isfinite(self.target_sample_ratio) or self.target_sample_ratio < 0.0:
+            raise ValueError("target_sample_ratio must be finite and non-negative.")
         for name in ("actor_lr", "critic_lr", "alpha_lr", "max_grad_norm"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive.")
@@ -398,6 +405,11 @@ class FootholdSAC(nn.Module):
         )
         self.total_updates = 0
         self.skipped_updates = 0
+        # Fractional update credit keeps the long-run sample ratio stable when
+        # event counts vary between rollouts (e.g. 64 vs. 4096 environments).
+        # It is always reduced to the fractional remainder after a rollout;
+        # integer work above the per-rollout cap is intentionally discarded.
+        self.update_credit = 0.0
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -523,9 +535,27 @@ class FootholdSAC(nn.Module):
         self.alpha_optimizer.zero_grad(set_to_none=True)
         self.skipped_updates += 1
 
-    def update(self) -> dict[str, float]:
+    def update(self, new_event_count: int = 0) -> dict[str, float]:
+        """Run event-scaled SAC updates for newly completed planner events.
+
+        ``new_event_count`` counts complete high-level planner transitions
+        appended since the previous call.  The update budget is accumulated as
+        fractional credit so the scheduler remains well behaved for both small
+        and large vectorized environments.
+        """
+
+        new_event_count = int(new_event_count)
+        if new_event_count < 0:
+            raise ValueError("new_event_count cannot be negative.")
+
         zero_stats = {
             "sac_update_count": 0.0,
+            "sac_requested_update_count": 0.0,
+            "sac_dropped_update_count": 0.0,
+            "sac_new_event_count": float(new_event_count),
+            "sac_sample_ratio": 0.0,
+            "sac_update_credit": float(self.update_credit),
+            "sac_update_time": 0.0,
             "replay_size": float(len(self.replay)),
             "sac_skipped_update_count": float(self.skipped_updates),
             "sac_actor_loss": 0.0,
@@ -539,17 +569,42 @@ class FootholdSAC(nn.Module):
             zero_stats["sac_skipped_update_count"] = float(self.skipped_updates)
             return zero_stats
 
+        self.update_credit += (
+            float(new_event_count) * self.config.target_sample_ratio
+            / float(self.config.batch_size)
+        )
+        requested_updates = floor(self.update_credit)
+        if requested_updates <= 0:
+            return zero_stats | {
+                "sac_update_credit": float(self.update_credit),
+            }
+
         actor_loss_value = 0.0
         critic_loss_value = 0.0
         alpha_loss_value = 0.0
         q_value = 0.0
-        updates = min(self.config.updates_per_rollout, len(self.replay) // self.config.batch_size)
+        available_updates = len(self.replay) // self.config.batch_size
+        updates = min(
+            requested_updates,
+            self.config.max_updates_per_rollout,
+            available_updates,
+        )
+        # Consume the requested integer credit even when the per-rollout cap
+        # limits actual work.  This prevents an event burst from creating an
+        # unbounded backlog that would slow every later rollout.
+        self.update_credit -= float(requested_updates)
+        dropped_updates = requested_updates - updates
         if updates <= 0:
             self.skipped_updates += 1
-            zero_stats["sac_skipped_update_count"] = float(self.skipped_updates)
-            return zero_stats
+            return zero_stats | {
+                "sac_requested_update_count": float(requested_updates),
+                "sac_dropped_update_count": float(dropped_updates),
+                "sac_update_credit": float(self.update_credit),
+                "sac_skipped_update_count": float(self.skipped_updates),
+            }
 
         completed_updates = 0
+        update_start = perf_counter()
         for _ in range(updates):
             try:
                 batch = self.replay.sample(self.config.batch_size)
@@ -642,6 +697,10 @@ class FootholdSAC(nn.Module):
 
         if completed_updates == 0:
             return zero_stats | {
+                "sac_requested_update_count": float(requested_updates),
+                "sac_dropped_update_count": float(dropped_updates),
+                "sac_update_credit": float(self.update_credit),
+                "sac_update_time": perf_counter() - update_start,
                 "replay_size": float(len(self.replay)),
                 "sac_skipped_update_count": float(self.skipped_updates),
             }
@@ -649,6 +708,17 @@ class FootholdSAC(nn.Module):
         divisor = float(completed_updates)
         return {
             "sac_update_count": float(completed_updates),
+            "sac_requested_update_count": float(requested_updates),
+            "sac_dropped_update_count": float(dropped_updates),
+            "sac_new_event_count": float(new_event_count),
+            "sac_sample_ratio": (
+                float(completed_updates * self.config.batch_size)
+                / float(new_event_count)
+                if new_event_count > 0
+                else 0.0
+            ),
+            "sac_update_credit": float(self.update_credit),
+            "sac_update_time": perf_counter() - update_start,
             "replay_size": float(len(self.replay)),
             "sac_skipped_update_count": float(self.skipped_updates),
             "sac_actor_loss": actor_loss_value / divisor,
@@ -666,6 +736,7 @@ class FootholdSAC(nn.Module):
         state["replay"] = self.replay.state_dict()
         state["total_updates"] = self.total_updates
         state["skipped_updates"] = self.skipped_updates
+        state["update_credit"] = self.update_credit
         return state
 
     def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[no-untyped-def]
@@ -676,6 +747,7 @@ class FootholdSAC(nn.Module):
             "replay",
             "total_updates",
             "skipped_updates",
+            "update_credit",
         }
         module_state = {
             key: value for key, value in state_dict.items() if key not in optimizer_keys
@@ -691,4 +763,7 @@ class FootholdSAC(nn.Module):
             self.replay.load_state_dict(state_dict["replay"])
         self.total_updates = int(state_dict.get("total_updates", 0))
         self.skipped_updates = int(state_dict.get("skipped_updates", 0))
+        self.update_credit = float(state_dict.get("update_credit", 0.0))
+        if not 0.0 <= self.update_credit < 1.0:
+            raise ValueError("SAC update_credit must lie in [0, 1).")
         return result

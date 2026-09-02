@@ -77,7 +77,8 @@ def _make_sac_algorithm(module, policy_module):
         foothold_kl_stop_multiplier=2.0,
         sac_batch_size=2,
         sac_warmup_events=0,
-        sac_updates_per_rollout=1,
+        sac_target_sample_ratio=1.0,
+        sac_max_updates_per_rollout=1,
     )
 
 
@@ -210,7 +211,7 @@ def test_hybrid_sac_updates_from_event_replay_without_ppo_planner_step():
         torch.randn(2, 4),
         torch.zeros(2, dtype=torch.bool),
     )
-    stats = sac.update()
+    stats = sac.update(new_event_count=2)
     assert stats["sac_update_count"] == 1.0
     assert any(
         not torch.equal(old, new)
@@ -270,6 +271,7 @@ def test_hybrid_sac_checkpoint_round_trip_restores_replay_and_temperature():
         torch.zeros(2, dtype=torch.bool),
     )
     algorithm.sac.log_alpha.data.fill_(-0.7)
+    algorithm.sac.update_credit = 0.375
     state = algorithm.state_dict()
 
     restored = _make_sac_algorithm(module, policy_module)
@@ -278,6 +280,7 @@ def test_hybrid_sac_checkpoint_round_trip_restores_replay_and_temperature():
     assert restored.sac is not None
     assert len(restored.sac.replay) == 2
     assert restored.sac.log_alpha.item() == pytest.approx(-0.7)
+    assert restored.sac.update_credit == pytest.approx(0.375)
 
 
 def test_legacy_event_sac_checkpoint_discards_incompatible_replay(capsys):

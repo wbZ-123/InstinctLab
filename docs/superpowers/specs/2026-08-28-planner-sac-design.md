@@ -85,6 +85,14 @@ boundary.
 Target networks use Polyak averaging. SAC updates are skipped, rather than
 blocking PPO, until the warm-up event count is reached.
 
+The learner keeps event-level transitions, but scales the amount of replay
+work with the number of newly completed events in each rollout.  The scheduler
+maintains a fractional update credit, adds
+`new_events * target_sample_ratio / batch_size` after warm-up, and executes the
+integer part subject to a per-rollout cap.  Any integer work above the cap is
+discarded (only the fractional remainder is retained), so an event burst cannot
+create an unbounded compute backlog.
+
 The initial implementation uses conservative, configurable defaults:
 
 - replay capacity: 100,000 planner events;
@@ -93,7 +101,21 @@ The initial implementation uses conservative, configurable defaults:
 - actor, critic, and temperature learning rates: `1e-4`;
 - `gamma = 0.99`;
 - target-network `tau = 0.005`;
-- at most two SAC gradient updates per environment rollout.
+- target sample ratio: `0.125`;
+- at most four SAC gradient updates per environment rollout;
+- no updates are scheduled when a rollout contains no new complete events.
+
+The reported sample ratio is explicit rather than relying on ambiguous UTD
+terminology:
+
+```text
+actual_updates * batch_size / new_complete_events
+```
+
+The first runtime acceptance test should compare this configuration against the
+old fixed-two baseline on the same checkpoint.  A target ratio of `0.25` and a
+cap of `8` are a follow-up experiment only after critic stability and runtime
+overhead are confirmed.
 
 The replay stores the flattened policy observation (about 3k values for the
 current G1 camera layout) so the dedicated planner depth encoder can remain

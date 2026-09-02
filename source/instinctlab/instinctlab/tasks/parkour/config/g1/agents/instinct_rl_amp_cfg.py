@@ -78,7 +78,8 @@ class AmpAlgoCfg(InstinctRlPpoAlgorithmCfg):
     sac_replay_capacity = 100000
     sac_batch_size = 256
     sac_warmup_events = 1024
-    sac_updates_per_rollout = 2
+    sac_target_sample_ratio = 0.125
+    sac_max_updates_per_rollout = 4
     sac_actor_learning_rate = 1.0e-4
     sac_critic_learning_rate = 1.0e-4
     sac_alpha_learning_rate = 1.0e-4
