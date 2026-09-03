@@ -52,7 +52,7 @@ class FootholdPlannerCfg(SensorBaseCfg):
     recovery_step_length_m: float = 0.04
     recovery_step_velocity_lookahead_s: float = 0.10
     recovery_step_max_length_m: float = 0.12
-    recovery_step_width_m: float = 0.18
+    recovery_step_width_m: float = 0.30
 
     contact_force_threshold_n: float = 1.0
 

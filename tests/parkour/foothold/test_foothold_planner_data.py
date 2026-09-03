@@ -553,6 +553,7 @@ def test_foothold_planner_cfg_exposes_all_state_machine_timing_fields():
     ):
         assert f"{field}=cfg.{field}" in planner_text
     assert "early_contact_phase: float = 0.65" in cfg_text
+    assert "recovery_step_width_m: float = 0.30" in cfg_text
 
 
 def test_parkour_cfg_updates_foothold_planner_at_control_period_not_physics_period():

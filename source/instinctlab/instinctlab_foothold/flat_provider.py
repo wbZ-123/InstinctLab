@@ -7,10 +7,12 @@ import torch
 class FlatProviderConfig:
     # Fixed reachability ellipse in the frozen support-foot frame.
     outer_radius_x: float = 1.00
-    outer_radius_y: float = 0.25
+    # Experimental lateral proposal bound.  This is an action/reach envelope,
+    # not a calibrated physical limit of the G1.
+    outer_radius_y: float = 0.50
     min_lateral_separation: float = 0.06
 
-    nominal_step_width: float = 0.18
+    nominal_step_width: float = 0.30
     velocity_lookahead_s: float = 0.10
     # Kept as zero-valued compatibility fields for existing telemetry and
     # checkpoints. The nominal XY foothold no longer receives curriculum
