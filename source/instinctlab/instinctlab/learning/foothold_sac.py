@@ -124,6 +124,11 @@ class PlannerEventAccumulator:
             self.num_envs, self.action_dim, device=self.device
         )
         self.pending_rewards = torch.zeros(self.num_envs, device=self.device)
+        self.pending_nominal_safe = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
     def _batch(
         self,
@@ -151,6 +156,18 @@ class PlannerEventAccumulator:
             [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
             None,
         ],
+        nominal_safe_event: torch.Tensor | None = None,
+        record_with_branch: Callable[
+            [
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            None,
+        ] | None = None,
     ) -> int:
         """Consume one low-level step and return completed event count."""
 
@@ -190,7 +207,35 @@ class PlannerEventAccumulator:
             shape=(self.num_envs,),
             dtype=torch.bool,
         )
+        if nominal_safe_event is None:
+            nominal_safe = torch.zeros_like(event)
+        else:
+            nominal_safe = self._batch(
+                nominal_safe_event,
+                name="nominal_safe_event",
+                shape=(self.num_envs,),
+                dtype=torch.bool,
+            )
+            if torch.any(nominal_safe & ~event).item():
+                raise ValueError("Nominal-safe events must be a subset of event_mask.")
         completed = 0
+
+        def emit(
+            indices: torch.Tensor,
+            record_dones: torch.Tensor,
+            record_next_obs: torch.Tensor,
+        ) -> None:
+            values = (
+                self.pending_obs[indices],
+                self.pending_actions[indices],
+                self.pending_rewards[indices],
+                record_next_obs,
+                record_dones,
+            )
+            if record_with_branch is None:
+                record(*values)
+            else:
+                record_with_branch(*values, self.pending_nominal_safe[indices])
 
         # The reward from a non-event step belongs to the currently pending
         # high-level action.  A step that starts a new event belongs to the
@@ -210,13 +255,7 @@ class PlannerEventAccumulator:
                 next_obs[indices],
                 obs[indices],
             )
-            record(
-                self.pending_obs[indices],
-                self.pending_actions[indices],
-                self.pending_rewards[indices],
-                boundary_next_obs,
-                boundary_dones,
-            )
+            emit(indices, boundary_dones, boundary_next_obs)
             completed += int(indices.numel())
             self.pending[indices] = False
 
@@ -225,12 +264,10 @@ class PlannerEventAccumulator:
         terminal = self.pending & ~event & done
         if torch.any(terminal):
             indices = terminal.nonzero(as_tuple=False).flatten()
-            record(
-                self.pending_obs[indices],
-                self.pending_actions[indices],
-                self.pending_rewards[indices],
-                next_obs[indices],
+            emit(
+                indices,
                 torch.ones(indices.numel(), dtype=torch.bool, device=self.device),
+                next_obs[indices],
             )
             completed += int(indices.numel())
             self.pending[indices] = False
@@ -242,6 +279,7 @@ class PlannerEventAccumulator:
             self.pending_obs[indices] = obs[indices]
             self.pending_actions[indices] = action[indices]
             self.pending_rewards[indices] = reward[indices]
+            self.pending_nominal_safe[indices] = nominal_safe[indices]
             self.pending[indices] = ~done[indices]
 
             # If a planner event and reset happen in one simulator step, the
@@ -249,16 +287,14 @@ class PlannerEventAccumulator:
             event_terminal = done[indices]
             if torch.any(event_terminal):
                 terminal_indices = indices[event_terminal]
-                record(
-                    self.pending_obs[terminal_indices],
-                    self.pending_actions[terminal_indices],
-                    self.pending_rewards[terminal_indices],
-                    next_obs[terminal_indices],
+                emit(
+                    terminal_indices,
                     torch.ones(
                         terminal_indices.numel(),
                         dtype=torch.bool,
                         device=self.device,
                     ),
+                    next_obs[terminal_indices],
                 )
                 completed += int(terminal_indices.numel())
 
@@ -269,6 +305,7 @@ class PlannerEventAccumulator:
 
         self.pending.zero_()
         self.pending_rewards.zero_()
+        self.pending_nominal_safe.zero_()
 
 
 @dataclass(frozen=True)
@@ -279,14 +316,19 @@ class FootholdSACConfig:
     replay_capacity: int = 100_000
     batch_size: int = 256
     warmup_events: int = 1_024
-    target_sample_ratio: float = 0.125
-    max_updates_per_rollout: int = 4
+    min_unsafe_events: int = 0
+    target_sample_ratio: float = 0.5
+    max_updates_per_rollout: int = 24
+    actor_update_frequency: int = 2
+    target_update_frequency: int = 2
     actor_lr: float = 1.0e-4
     critic_lr: float = 1.0e-4
     alpha_lr: float = 1.0e-4
-    gamma: float = 0.99
+    gamma: float = 0.95
     tau: float = 0.005
-    target_entropy: float = -2.0
+    target_entropy: float = -0.5
+    initial_alpha: float = 0.05
+    nominal_anchor_coef: float = 0.25
     max_grad_norm: float = 1.0
     log_std_min: float = -5.0
     log_std_max: float = 2.0
@@ -308,11 +350,19 @@ class FootholdSACConfig:
             raise ValueError(
                 "warmup_events and max_updates_per_rollout cannot be negative."
             )
+        if self.min_unsafe_events < 0:
+            raise ValueError("min_unsafe_events cannot be negative.")
+        if self.actor_update_frequency <= 0 or self.target_update_frequency <= 0:
+            raise ValueError("SAC update frequencies must be positive.")
         if not isfinite(self.target_sample_ratio) or self.target_sample_ratio < 0.0:
             raise ValueError("target_sample_ratio must be finite and non-negative.")
         for name in ("actor_lr", "critic_lr", "alpha_lr", "max_grad_norm"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive.")
+        if self.initial_alpha <= 0.0:
+            raise ValueError("initial_alpha must be positive.")
+        if self.nominal_anchor_coef < 0.0:
+            raise ValueError("nominal_anchor_coef cannot be negative.")
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must lie in [0, 1].")
         if not 0.0 < self.tau <= 1.0:
@@ -399,7 +449,9 @@ class FootholdSAC(nn.Module):
         for parameter in self.target_critic_2.parameters():
             parameter.requires_grad_(False)
 
-        self.log_alpha = nn.Parameter(torch.zeros((), device=self.device))
+        self.log_alpha = nn.Parameter(
+            torch.tensor(self.config.initial_alpha, device=self.device).log()
+        )
         self.actor_optimizer = optim.Adam(actor_parameters, lr=config.actor_lr)
         self.critic_optimizer = optim.Adam(
             tuple(self.critic_1.parameters())
@@ -418,8 +470,7 @@ class FootholdSAC(nn.Module):
         self.skipped_updates = 0
         # Fractional update credit keeps the long-run sample ratio stable when
         # event counts vary between rollouts (e.g. 64 vs. 4096 environments).
-        # It is always reduced to the fractional remainder after a rollout;
-        # integer work above the per-rollout cap is intentionally discarded.
+        # Work above the per-rollout cap remains queued for a later rollout.
         self.update_credit = 0.0
 
     @property
@@ -531,8 +582,9 @@ class FootholdSAC(nn.Module):
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        nominal_safe: torch.Tensor | None = None,
     ) -> None:
-        self.replay.add(obs, actions, rewards, next_obs, dones)
+        self.replay.add(obs, actions, rewards, next_obs, dones, nominal_safe)
 
     def _finite_batch(self, batch: FootholdReplayBatch) -> None:
         if not all(torch.isfinite(value).all().item() for value in batch if value.dtype != torch.bool):
@@ -579,8 +631,17 @@ class FootholdSAC(nn.Module):
             "sac_replay_reward_max": 0.0,
             "sac_target_q_mean": 0.0,
             "sac_q_abs_max": 0.0,
+            "sac_nominal_safe_count": float(self.replay.nominal_safe_count),
+            "sac_nominal_unsafe_count": float(self.replay.nominal_unsafe_count),
+            "sac_warmup_ready": 0.0,
+            "sac_anchor_loss": 0.0,
         }
-        if len(self.replay) < max(self.config.batch_size, self.config.warmup_events):
+        warmup_ready = (
+            len(self.replay) >= max(self.config.batch_size, self.config.warmup_events)
+            and self.replay.nominal_unsafe_count >= self.config.min_unsafe_events
+        )
+        zero_stats["sac_warmup_ready"] = 1.0 if warmup_ready else 0.0
+        if not warmup_ready:
             self.skipped_updates += 1
             zero_stats["sac_skipped_update_count"] = float(self.skipped_updates)
             return zero_stats
@@ -604,16 +665,19 @@ class FootholdSAC(nn.Module):
         replay_reward_max = float("-inf")
         target_q_mean = 0.0
         q_abs_max = 0.0
-        available_updates = len(self.replay) // self.config.batch_size
+        anchor_loss_value = 0.0
+        actor_update_count = 0
         updates = min(
             requested_updates,
             self.config.max_updates_per_rollout,
-            available_updates,
         )
-        # Consume the requested integer credit even when the per-rollout cap
-        # limits actual work.  This prevents an event burst from creating an
-        # unbounded backlog that would slow every later rollout.
-        self.update_credit -= float(requested_updates)
+        # Preserve event-derived update credit when a rollout reaches the
+        # safety cap.  The next rollout can consume the remainder, so events
+        # are not silently discarded.
+        self.update_credit -= float(updates)
+        # Keep the diagnostic name for dashboard compatibility. These are
+        # deferred (not discarded) updates; the corresponding credit remains
+        # queued for the next rollout.
         dropped_updates = requested_updates - updates
         if updates <= 0:
             self.skipped_updates += 1
@@ -628,6 +692,7 @@ class FootholdSAC(nn.Module):
         update_start = perf_counter()
         for _ in range(updates):
             try:
+                update_index = self.total_updates
                 batch = self.replay.sample(self.config.batch_size)
                 self._finite_batch(batch)
                 # The critic TD loss owns the dedicated planner feature
@@ -688,41 +753,62 @@ class FootholdSAC(nn.Module):
                     raise FloatingPointError("SAC critic gradients must be finite.") from exc
                 self.critic_optimizer.step()
 
-                # Actor optimization must not rewrite the visual
-                # representation learned by the critic. Shared motor features
-                # and the dedicated planner depth features are detached here.
-                actor_features = self._features_from_replay(batch.obs).detach()
-                action, log_prob = self._sample_action_and_log_prob(
-                    actor_features,
-                    deterministic=False,
-                )
-                q1 = self.critic_1(actor_features, action)
-                q2 = self.critic_2(actor_features, action)
-                q_min = torch.minimum(q1, q2)
-                actor_loss = (self.alpha.detach() * log_prob - q_min).mean()
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_loss.backward()
-                try:
-                    nn.utils.clip_grad_norm_(
-                        tuple(self.actor_optimizer.param_groups[0]["params"]),
-                        self.config.max_grad_norm,
-                        error_if_nonfinite=True,
+                q_min = torch.minimum(current_q1, current_q2)
+                actor_loss = torch.zeros((), device=self.device)
+                alpha_loss = torch.zeros((), device=self.device)
+                anchor_loss = torch.zeros((), device=self.device)
+                if update_index % self.config.actor_update_frequency == 0:
+                    # Actor optimization must not rewrite the visual
+                    # representation learned by the critic. Shared motor
+                    # features and the dedicated planner depth features are
+                    # detached here.
+                    actor_features = self._features_from_replay(batch.obs).detach()
+                    action, log_prob = self._sample_action_and_log_prob(
+                        actor_features,
+                        deterministic=False,
                     )
-                except RuntimeError as exc:
-                    raise FloatingPointError("SAC actor gradients must be finite.") from exc
-                self.actor_optimizer.step()
+                    q1 = self.critic_1(actor_features, action)
+                    q2 = self.critic_2(actor_features, action)
+                    q_min = torch.minimum(q1, q2)
+                    actor_loss = (self.alpha.detach() * log_prob - q_min).mean()
+                    safe_mask = batch.nominal_safe.to(dtype=actor_loss.dtype)
+                    if safe_mask.any().item() and self.config.nominal_anchor_coef > 0.0:
+                        # Safe nominal events should preserve the analytic
+                        # prior. Anchor the deterministic actor mean rather
+                        # than a noisy sample, so exploration is not treated
+                        # as a systematic nominal-point error.
+                        actor_mean = self._actor_distribution_fn(
+                            actor_features
+                        ).mean
+                        anchor = radial_squash(actor_mean).square().sum(dim=-1)
+                        anchor_loss = (anchor * safe_mask).sum() / safe_mask.sum().clamp_min(1.0)
+                        actor_loss = actor_loss + self.config.nominal_anchor_coef * anchor_loss
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    try:
+                        nn.utils.clip_grad_norm_(
+                            tuple(self.actor_optimizer.param_groups[0]["params"]),
+                            self.config.max_grad_norm,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        raise FloatingPointError("SAC actor gradients must be finite.") from exc
+                    self.actor_optimizer.step()
 
-                alpha_loss = -(
-                    self.log_alpha * (log_prob.detach() + self.config.target_entropy)
-                ).mean()
-                self.alpha_optimizer.zero_grad(set_to_none=True)
-                alpha_loss.backward()
-                self.alpha_optimizer.step()
-                with torch.no_grad():
-                    self.log_alpha.clamp_(-20.0, 2.0)
+                    alpha_loss = -(
+                        self.log_alpha * (log_prob.detach() + self.config.target_entropy)
+                    ).mean()
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss.backward()
+                    self.alpha_optimizer.step()
+                    with torch.no_grad():
+                        self.log_alpha.clamp_(-20.0, 2.0)
+                    anchor_loss_value += float(anchor_loss.detach().item())
+                    actor_update_count += 1
 
-                polyak_update(self.target_critic_1, self.critic_1, self.config.tau)
-                polyak_update(self.target_critic_2, self.critic_2, self.config.tau)
+                if update_index % self.config.target_update_frequency == 0:
+                    polyak_update(self.target_critic_1, self.critic_1, self.config.tau)
+                    polyak_update(self.target_critic_2, self.critic_2, self.config.tau)
                 self.total_updates += 1
                 completed_updates += 1
                 actor_loss_value += float(actor_loss.detach().item())
@@ -740,6 +826,9 @@ class FootholdSAC(nn.Module):
                 "sac_update_time": perf_counter() - update_start,
                 "replay_size": float(len(self.replay)),
                 "sac_skipped_update_count": float(self.skipped_updates),
+                "sac_warmup_ready": 1.0,
+                "sac_nominal_safe_count": float(self.replay.nominal_safe_count),
+                "sac_nominal_unsafe_count": float(self.replay.nominal_unsafe_count),
             }
 
         divisor = float(completed_updates)
@@ -768,6 +857,15 @@ class FootholdSAC(nn.Module):
             "sac_replay_reward_max": replay_reward_max,
             "sac_target_q_mean": target_q_mean / divisor,
             "sac_q_abs_max": q_abs_max,
+            "sac_anchor_loss": (
+                anchor_loss_value / float(actor_update_count)
+                if actor_update_count > 0
+                else 0.0
+            ),
+            "sac_actor_update_count": float(actor_update_count),
+            "sac_warmup_ready": 1.0,
+            "sac_nominal_safe_count": float(self.replay.nominal_safe_count),
+            "sac_nominal_unsafe_count": float(self.replay.nominal_unsafe_count),
         }
 
     def state_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -806,6 +904,6 @@ class FootholdSAC(nn.Module):
         self.total_updates = int(state_dict.get("total_updates", 0))
         self.skipped_updates = int(state_dict.get("skipped_updates", 0))
         self.update_credit = float(state_dict.get("update_credit", 0.0))
-        if not 0.0 <= self.update_credit < 1.0:
-            raise ValueError("SAC update_credit must lie in [0, 1).")
+        if not 0.0 <= self.update_credit:
+            raise ValueError("SAC update_credit must be non-negative.")
         return result

@@ -128,7 +128,7 @@ def test_sac_drops_update_backlog_above_per_rollout_cap():
     assert diagnostics["sac_update_count"] == 2.0
     assert diagnostics["sac_requested_update_count"] == 4.0
     assert diagnostics["sac_dropped_update_count"] == 2.0
-    assert diagnostics["sac_update_credit"] == 0.0
+    assert diagnostics["sac_update_credit"] == 2.0
 
 
 def test_sac_rejects_nonfinite_replay_and_keeps_parameters_finite():

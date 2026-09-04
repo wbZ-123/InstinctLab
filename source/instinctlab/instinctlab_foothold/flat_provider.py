@@ -12,7 +12,7 @@ class FlatProviderConfig:
     outer_radius_y: float = 0.50
     min_lateral_separation: float = 0.06
 
-    nominal_step_width: float = 0.30
+    nominal_step_width: float = 0.26
     velocity_lookahead_s: float = 0.10
     # Kept as zero-valued compatibility fields for existing telemetry and
     # checkpoints. The nominal XY foothold no longer receives curriculum

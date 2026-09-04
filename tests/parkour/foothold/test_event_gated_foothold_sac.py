@@ -101,6 +101,14 @@ def test_hybrid_algorithm_is_registered_and_has_separate_planner_learner():
     assert algorithm.motor_action_dim == 29
     assert algorithm.sac.config.action_dim == 2
     assert algorithm.use_foothold_ppo is False
+    assert "foothold_log_std_actor" in dict(algorithm.actor_critic.named_modules())
+    distribution = algorithm.actor_critic.planner_distribution_from_features(
+        torch.zeros(2, 4)
+    )
+    torch.testing.assert_close(
+        distribution.scale[0],
+        torch.tensor([0.05 / 0.12, 0.05 / 0.10]),
+    )
 
 
 def test_non_event_replay_is_a_noop_and_event_is_recorded():
@@ -145,7 +153,7 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
             "learned_foothold_action_event": torch.tensor([False, True]),
             "learned_foothold_nominal_safe_event": torch.tensor([False, True]),
             "learned_foothold_nominal_unsafe_event": torch.tensor([False, False]),
-            "learned_foothold_event_reward": torch.tensor([0.0, 0.73]),
+            "learned_foothold_event_reward": torch.tensor([0.91, 0.73]),
             "step": {},
         },
         obs + 1.0,
@@ -190,6 +198,7 @@ def test_non_event_replay_is_a_noop_and_event_is_recorded():
         algorithm.sac.replay.actions[0],
         torch.tensor([3.0, 4.0]) / 26.0**0.5,
     )
+    assert bool(algorithm.sac.replay.nominal_safe[0])
 
 
 def test_hybrid_sac_updates_from_event_replay_without_ppo_planner_step():
@@ -223,6 +232,36 @@ def test_hybrid_sac_updates_from_event_replay_without_ppo_planner_step():
         not torch.equal(old, new)
         for old, new in zip(before, algorithm.actor_critic.planner_policy_parameters())
     )
+
+
+def test_hybrid_sac_actor_frequency_is_global_across_rollouts():
+    module, policy_module = _load_modules()
+    algorithm = _make_sac_algorithm(module, policy_module)
+    algorithm.init_storage(
+        2,
+        1,
+        {
+            "policy": {"obs": (4,)},
+            "critic": {"obs": (4,)},
+            "amp_policy": {"state": (3,)},
+            "amp_reference": {"state": (3,)},
+        },
+        31,
+        num_rewards=2,
+    )
+    sac = algorithm.sac
+    assert sac is not None
+    sac.observe(
+        torch.randn(2, 4),
+        torch.zeros(2, 2),
+        torch.ones(2),
+        torch.randn(2, 4),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    first = sac.update(new_event_count=2)
+    second = sac.update(new_event_count=2)
+    assert first["sac_actor_update_count"] == 1.0
+    assert second["sac_actor_update_count"] == 0.0
 
 
 def test_planner_encoder_is_owned_by_critic_not_actor():
@@ -405,3 +444,36 @@ def test_legacy_event_sac_checkpoint_discards_incompatible_replay(capsys):
     assert restored.sac is not None
     assert len(restored.sac.replay) == 0
     assert "Legacy foothold SAC state" in capsys.readouterr().out
+
+
+def test_legacy_actor_without_state_dependent_std_head_remains_loadable():
+    module, policy_module = _load_modules()
+    algorithm = _make_sac_algorithm(module, policy_module)
+    storage_kwargs = {
+        "num_envs": 2,
+        "num_transitions_per_env": 1,
+        "obs_format": {
+            "policy": {"obs": (4,)},
+            "critic": {"obs": (4,)},
+            "amp_policy": {"state": (3,)},
+            "amp_reference": {"state": (3,)},
+        },
+        "num_actions": 31,
+        "num_rewards": 2,
+    }
+    algorithm.init_storage(**storage_kwargs)
+    state = algorithm.state_dict()
+    model_state = state["model_state_dict"]
+    for key in tuple(model_state):
+        if key.startswith("foothold_log_std_actor.") or key in {
+            "foothold_log_std_min",
+            "foothold_log_std_max",
+            "foothold_state_dependent_std",
+        }:
+            del model_state[key]
+    state["foothold_sac_version"] = 1
+
+    restored = _make_sac_algorithm(module, policy_module)
+    restored.init_storage(**storage_kwargs)
+    restored.load_state_dict(state)
+    assert bool(restored.actor_critic.foothold_state_dependent_std)

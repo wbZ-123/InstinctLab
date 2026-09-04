@@ -31,19 +31,31 @@ from .foothold_sac import (
 
 def normalized_foothold_std(
     std_m: Sequence[float],
-    radii_m: Sequence[float],
+    residual_limits_m: Sequence[float] | None = None,
+    *,
+    radii_m: Sequence[float] | None = None,
 ) -> torch.Tensor:
-    """Convert physical XY exploration scales into normalized ellipse units."""
+    """Convert physical residual exploration into normalized action units.
+
+    ``radii_m`` is retained as a keyword-only compatibility alias for old
+    focused tests and checkpoints. New callers must pass the decoder's
+    physical residual limits, not the robot reachability ellipse.
+    """
+
+    if residual_limits_m is None:
+        residual_limits_m = radii_m
+    elif radii_m is not None:
+        raise ValueError("Pass residual_limits_m or radii_m, not both.")
 
     std = torch.as_tensor(std_m, dtype=torch.float32)
-    radii = torch.as_tensor(radii_m, dtype=torch.float32)
-    if std.shape != (2,) or radii.shape != (2,):
-        raise ValueError("Foothold standard deviations and radii must be XY pairs.")
+    limits = torch.as_tensor(residual_limits_m, dtype=torch.float32)
+    if std.shape != (2,) or limits.shape != (2,):
+        raise ValueError("Foothold standard deviations and residual limits must be XY pairs.")
     if torch.any(std <= 0.0):
         raise ValueError("Foothold physical standard deviations must be positive.")
-    if torch.any(radii <= 0.0):
-        raise ValueError("Foothold reachability radii must be positive.")
-    return std / radii
+    if torch.any(limits <= 0.0):
+        raise ValueError("Foothold residual limits must be positive.")
+    return std / limits
 
 
 def should_run_full_finite_check(
@@ -267,6 +279,7 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         foothold_kl_stop_multiplier: float = 2.0,
         foothold_surrogate_coef: float = 1.0,
         foothold_entropy_coef: float | None = None,
+        foothold_residual_limits_m: Sequence[float] = (0.12, 0.10),
         full_finite_check_interval: int = 100,
         **kwargs,
     ):
@@ -336,6 +349,7 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
         self.foothold_reachability_radii_m = tuple(
             foothold_reachability_radii_m
         )
+        self.foothold_residual_limits_m = tuple(foothold_residual_limits_m)
         self.foothold_learning_rate = float(foothold_learning_rate)
         self.foothold_desired_kl = float(foothold_desired_kl)
         self.foothold_kl_stop_multiplier = float(
@@ -390,18 +404,18 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
 
         normalized_std = normalized_foothold_std(
             self.foothold_initial_std_m,
-            self.foothold_reachability_radii_m,
+            self.foothold_residual_limits_m,
         ).to(
             device=self.actor_critic.foothold_std.device,
             dtype=self.actor_critic.foothold_std.dtype,
         )
         self.foothold_min_std = normalized_foothold_std(
             self.foothold_min_std_m,
-            self.foothold_reachability_radii_m,
+            self.foothold_residual_limits_m,
         ).to(device=normalized_std.device, dtype=normalized_std.dtype)
         self.foothold_max_std = normalized_foothold_std(
             self.foothold_max_std_m,
-            self.foothold_reachability_radii_m,
+            self.foothold_residual_limits_m,
         ).to(device=normalized_std.device, dtype=normalized_std.dtype)
         if torch.any(self.foothold_min_std > self.foothold_max_std):
             raise ValueError(
@@ -415,6 +429,17 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
             )
         with torch.no_grad():
             self.actor_critic.foothold_std.copy_(normalized_std)
+            configure = getattr(
+                self.actor_critic,
+                "configure_foothold_std_bounds",
+                None,
+            )
+            if configure is not None:
+                configure(
+                    self.foothold_min_std,
+                    self.foothold_max_std,
+                    normalized_std,
+                )
 
     def init_storage(
         self,
@@ -1071,7 +1096,7 @@ class EventGatedWasabiPPO(WasabiAlgoMixin, PPO):
 
         foothold_std = self.actor_critic.foothold_std.detach()
         radii = torch.as_tensor(
-            self.foothold_reachability_radii_m,
+            self.foothold_residual_limits_m,
             device=foothold_std.device,
             dtype=foothold_std.dtype,
         )
@@ -1199,7 +1224,7 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
     twin Q critics; the legacy planner PPO objective is disabled explicitly.
     """
 
-    _SAC_STATE_VERSION = 2
+    _SAC_STATE_VERSION = 3
 
     def __init__(
         self,
@@ -1207,15 +1232,20 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         sac_hidden_dims: Sequence[int] = (128, 128),
         sac_replay_capacity: int = 100_000,
         sac_batch_size: int = 256,
-        sac_warmup_events: int = 1_024,
-        sac_target_sample_ratio: float = 0.125,
-        sac_max_updates_per_rollout: int = 4,
+        sac_warmup_events: int = 10_000,
+        sac_min_unsafe_events: int = 0,
+        sac_target_sample_ratio: float = 0.5,
+        sac_max_updates_per_rollout: int = 24,
+        sac_actor_update_frequency: int = 2,
+        sac_target_update_frequency: int = 2,
         sac_actor_learning_rate: float = 1.0e-4,
         sac_critic_learning_rate: float = 1.0e-4,
         sac_alpha_learning_rate: float = 1.0e-4,
-        sac_gamma: float = 0.99,
+        sac_gamma: float = 0.95,
         sac_tau: float = 0.005,
-        sac_target_entropy: float = -2.0,
+        sac_target_entropy: float = -0.5,
+        sac_initial_alpha: float = 0.05,
+        sac_nominal_anchor_coef: float = 0.25,
         sac_max_grad_norm: float = 1.0,
         **kwargs,
     ):
@@ -1226,14 +1256,19 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
             "replay_capacity": int(sac_replay_capacity),
             "batch_size": int(sac_batch_size),
             "warmup_events": int(sac_warmup_events),
+            "min_unsafe_events": int(sac_min_unsafe_events),
             "target_sample_ratio": float(sac_target_sample_ratio),
             "max_updates_per_rollout": int(sac_max_updates_per_rollout),
+            "actor_update_frequency": int(sac_actor_update_frequency),
+            "target_update_frequency": int(sac_target_update_frequency),
             "actor_lr": float(sac_actor_learning_rate),
             "critic_lr": float(sac_critic_learning_rate),
             "alpha_lr": float(sac_alpha_learning_rate),
             "gamma": float(sac_gamma),
             "tau": float(sac_tau),
             "target_entropy": float(sac_target_entropy),
+            "initial_alpha": float(sac_initial_alpha),
+            "nominal_anchor_coef": float(sac_nominal_anchor_coef),
             "max_grad_norm": float(sac_max_grad_norm),
         }
         self.sac: FootholdSAC | None = None
@@ -1335,8 +1370,47 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
                 "learned_foothold_event_reward must be finite."
             )
 
+        event = torch.as_tensor(event, device=self.device, dtype=torch.bool)
+        safe_event = torch.as_tensor(
+            infos["learned_foothold_nominal_safe_event"],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        if safe_event.shape != event.shape or torch.any(safe_event & ~event).item():
+            raise ValueError(
+                "learned_foothold_nominal_safe_event must be a subset of the event mask."
+            )
+        planner_rewards = torch.where(
+            event,
+            planner_rewards,
+            torch.zeros_like(planner_rewards),
+        )
+        if torch.any(planner_rewards < -1.0 - 1.0e-5).item() or torch.any(
+            planner_rewards > 1.0 + 1.0e-5
+        ).item():
+            raise ValueError(
+                "learned_foothold_event_reward must lie in the planner contract range [-1, 1]."
+            )
+
         def record_event(obs, action, reward, next_state, terminal):
             self._require_sac().observe(obs, action, reward, next_state, terminal)
+
+        def record_event_with_branch(
+            obs,
+            action,
+            reward,
+            next_state,
+            terminal,
+            nominal_safe,
+        ):
+            self._require_sac().observe(
+                obs,
+                action,
+                reward,
+                next_state,
+                terminal,
+                nominal_safe=nominal_safe,
+            )
 
         completed = accumulator.process_step(
             observations=self.transition.observations.detach(),
@@ -1350,8 +1424,10 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
             rewards=planner_rewards.detach(),
             next_observations=next_obs.detach(),
             dones=torch.as_tensor(dones, device=self.device, dtype=torch.bool),
-            event_mask=torch.as_tensor(event, device=self.device, dtype=torch.bool),
+            event_mask=event,
             record=record_event,
+            nominal_safe_event=safe_event,
+            record_with_branch=record_event_with_branch,
         )
         self._planner_events_since_update += completed
 
@@ -1434,7 +1510,31 @@ class EventGatedWasabiSAC(EventGatedWasabiPPO):
         return state
 
     def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
+        # The bounded state-dependent log-std head was added after the first
+        # Event-SAC checkpoints.  Its absence in an older actor state is
+        # recoverable: keep the freshly initialized head and load all legacy
+        # motor/mean/depth parameters normally.  Other missing actor keys are
+        # still rejected by the strict loader below.
+        parent_state = state_dict
+        model_state = state_dict.get("model_state_dict")
+        if isinstance(model_state, dict):
+            current_model_state = self.actor_critic.state_dict()
+            patched_model_state = model_state.copy()
+            optional_prefix = "foothold_log_std_actor."
+            optional_keys = {
+                "foothold_log_std_min",
+                "foothold_log_std_max",
+                "foothold_state_dependent_std",
+            }
+            for key, value in current_model_state.items():
+                if (
+                    key.startswith(optional_prefix) or key in optional_keys
+                ) and key not in patched_model_state:
+                    patched_model_state[key] = value
+            if len(patched_model_state) != len(model_state):
+                parent_state = state_dict.copy()
+                parent_state["model_state_dict"] = patched_model_state
+        super().load_state_dict(parent_state)
         sac = self._require_sac()
         if "foothold_sac" in state_dict:
             version = int(state_dict.get("foothold_sac_version", 0))

@@ -46,7 +46,24 @@ def test_event_replay_add_and_sample_have_expected_shapes():
     assert batch.rewards.shape == (2,)
     assert batch.next_obs.shape == (2, 4)
     assert batch.dones.shape == (2,)
+    assert batch.nominal_safe.shape == (2,)
     assert torch.all(batch.actions == 1.0)
+
+
+def test_event_replay_balances_safe_and_unsafe_branches():
+    module = _load_replay_module()
+    replay = module.FootholdReplayBuffer(16, 2, 2, "cpu")
+    replay.add(
+        torch.zeros(6, 2),
+        torch.zeros(6, 2),
+        torch.zeros(6),
+        torch.zeros(6, 2),
+        torch.zeros(6, dtype=torch.bool),
+        nominal_safe=torch.tensor([True, True, True, True, False, False]),
+    )
+    batch = replay.sample(6, balanced_branches=True)
+    assert int(batch.nominal_safe.sum()) == 3
+    assert int((~batch.nominal_safe).sum()) == 3
 
 
 def test_event_replay_is_circular_and_round_trips_state():

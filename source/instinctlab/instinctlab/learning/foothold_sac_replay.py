@@ -9,7 +9,7 @@ import torch
 
 FootholdReplayBatch = namedtuple(
     "FootholdReplayBatch",
-    ("obs", "actions", "rewards", "next_obs", "dones"),
+    ("obs", "actions", "rewards", "next_obs", "dones", "nominal_safe"),
 )
 
 
@@ -55,11 +55,30 @@ class FootholdReplayBuffer:
             dtype=torch.bool,
             device=self.device,
         )
+        # True means the transition came from a nominally safe event.  The
+        # complementary branch is the useful hard-example pool for the
+        # planner, so it is stored explicitly instead of inferred from the
+        # reward (a safe correction may also have a negative score).
+        self.nominal_safe = torch.zeros(
+            self.capacity,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.position = 0
         self.size = 0
 
     def __len__(self) -> int:
         return self.size
+
+    @property
+    def nominal_unsafe_count(self) -> int:
+        """Number of stored transitions from the nominally unsafe branch."""
+
+        return int((~self.nominal_safe[: self.size]).sum().item())
+
+    @property
+    def nominal_safe_count(self) -> int:
+        return int(self.nominal_safe[: self.size].sum().item())
 
     def _batch_tensor(
         self,
@@ -84,6 +103,7 @@ class FootholdReplayBuffer:
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        nominal_safe: torch.Tensor | None = None,
     ) -> None:
         obs = self._batch_tensor(
             obs,
@@ -115,12 +135,26 @@ class FootholdReplayBuffer:
             trailing_shape=(),
             dtype=torch.bool,
         )
+        if nominal_safe is None:
+            nominal_safe = torch.zeros(
+                obs.shape[0],
+                dtype=torch.bool,
+                device=self.device,
+            )
+        else:
+            nominal_safe = self._batch_tensor(
+                nominal_safe,
+                name="nominal_safe",
+                trailing_shape=(),
+                dtype=torch.bool,
+            )
         batch_size = obs.shape[0]
         if not (
             actions.shape[0]
             == rewards.shape[0]
             == next_obs.shape[0]
             == dones.shape[0]
+            == nominal_safe.shape[0]
             == batch_size
         ):
             raise ValueError("all replay fields must have the same batch size.")
@@ -133,6 +167,7 @@ class FootholdReplayBuffer:
             rewards = rewards[-self.capacity :]
             next_obs = next_obs[-self.capacity :]
             dones = dones[-self.capacity :]
+            nominal_safe = nominal_safe[-self.capacity :]
             batch_size = self.capacity
 
         indices = (
@@ -144,21 +179,43 @@ class FootholdReplayBuffer:
         self.rewards.index_copy_(0, indices, rewards)
         self.next_obs.index_copy_(0, indices, next_obs)
         self.dones.index_copy_(0, indices, dones)
+        self.nominal_safe.index_copy_(0, indices, nominal_safe)
         self.position = (self.position + batch_size) % self.capacity
         self.size = min(self.capacity, self.size + batch_size)
 
-    def sample(self, batch_size: int) -> FootholdReplayBatch:
+    def _sample_indices(self, batch_size: int) -> torch.Tensor:
+        safe_indices = torch.nonzero(self.nominal_safe[: self.size], as_tuple=False).flatten()
+        unsafe_indices = torch.nonzero(~self.nominal_safe[: self.size], as_tuple=False).flatten()
+        if safe_indices.numel() == 0 or unsafe_indices.numel() == 0:
+            return torch.randint(0, self.size, (batch_size,), device=self.device)
+
+        # Stratification is deliberately with replacement: replay is an
+        # off-policy buffer, and repeating the smaller branch is preferable
+        # to allowing the overwhelmingly common safe branch to erase unsafe
+        # foothold corrections from every minibatch.
+        safe_count = batch_size // 2
+        unsafe_count = batch_size - safe_count
+        safe_pick = safe_indices[
+            torch.randint(0, safe_indices.numel(), (safe_count,), device=self.device)
+        ]
+        unsafe_pick = unsafe_indices[
+            torch.randint(0, unsafe_indices.numel(), (unsafe_count,), device=self.device)
+        ]
+        indices = torch.cat((safe_pick, unsafe_pick), dim=0)
+        return indices[torch.randperm(batch_size, device=self.device)]
+
+    def sample(self, batch_size: int, *, balanced_branches: bool = True) -> FootholdReplayBatch:
         if int(batch_size) <= 0:
             raise ValueError("batch_size must be positive.")
         if self.size < int(batch_size):
             raise ValueError(
                 "batch_size cannot exceed the number of replay transitions."
             )
-        indices = torch.randint(
-            0,
-            self.size,
-            (int(batch_size),),
-            device=self.device,
+        batch_size = int(batch_size)
+        indices = (
+            self._sample_indices(batch_size)
+            if balanced_branches
+            else torch.randint(0, self.size, (batch_size,), device=self.device)
         )
         return FootholdReplayBatch(
             self.obs[indices],
@@ -166,6 +223,7 @@ class FootholdReplayBuffer:
             self.rewards[indices],
             self.next_obs[indices],
             self.dones[indices],
+            self.nominal_safe[indices],
         )
 
     def state_dict(self) -> dict[str, object]:
@@ -180,6 +238,7 @@ class FootholdReplayBuffer:
             "rewards": self.rewards.clone(),
             "next_obs": self.next_obs.clone(),
             "dones": self.dones.clone(),
+            "nominal_safe": self.nominal_safe.clone(),
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -202,3 +261,13 @@ class FootholdReplayBuffer:
             if value.shape != target.shape:
                 raise ValueError(f"Replay tensor {key} shape does not match.")
             target.copy_(value.to(dtype=target.dtype))
+        # Checkpoints written before branch labels existed remain loadable;
+        # their transitions are conservatively assigned to the unsafe pool
+        # so they cannot provide a false safe-nominal anchor.
+        if "nominal_safe" in state:
+            value = torch.as_tensor(state["nominal_safe"], device=self.device)
+            if value.shape != self.nominal_safe.shape:
+                raise ValueError("Replay tensor nominal_safe shape does not match.")
+            self.nominal_safe.copy_(value.to(dtype=self.nominal_safe.dtype))
+        else:
+            self.nominal_safe.zero_()

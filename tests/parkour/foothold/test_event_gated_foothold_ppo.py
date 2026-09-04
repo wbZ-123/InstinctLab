@@ -134,17 +134,17 @@ def _make_minibatch(
     )
 
 
-def test_physical_std_uses_reachability_source():
+def test_physical_std_uses_residual_limit_source():
     module = _load_ppo_module()
 
     result = module.normalized_foothold_std(
         std_m=(0.05, 0.05),
-        radii_m=(0.42, 0.25),
+        residual_limits_m=(0.12, 0.10),
     )
 
     torch.testing.assert_close(
         result,
-        torch.tensor([0.05 / 0.42, 0.05 / 0.25]),
+        torch.tensor([0.05 / 0.12, 0.05 / 0.10]),
     )
 
 
@@ -312,7 +312,7 @@ def test_algorithm_uses_foothold_storage_and_physical_initial_std():
     assert isinstance(algorithm.transition, module.FootholdTransition)
     torch.testing.assert_close(
         algorithm.actor_critic.foothold_std.detach(),
-        torch.tensor([0.05 / 0.42, 0.05 / 0.25]),
+            torch.tensor([0.05 / 0.12, 0.05 / 0.10]),
     )
 
 
@@ -349,7 +349,7 @@ def test_physical_foothold_std_bounds_do_not_modify_motor_std():
 
     torch.testing.assert_close(
         algorithm.actor_critic.foothold_std.detach(),
-        torch.tensor([0.02 / 0.42, 0.05 / 0.25]),
+            torch.tensor([0.02 / 0.12, 0.05 / 0.10]),
     )
     torch.testing.assert_close(
         algorithm.actor_critic.motor_std.detach(),

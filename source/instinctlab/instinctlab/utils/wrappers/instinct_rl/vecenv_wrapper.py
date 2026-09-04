@@ -58,6 +58,26 @@ def read_foothold_event_reward(reward_manager) -> torch.Tensor:
     return value
 
 
+def mask_foothold_event_reward(
+    reward: torch.Tensor,
+    event_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return only causal planner scores for environments with an event."""
+
+    reward = torch.as_tensor(reward, dtype=torch.float32)
+    event_mask = torch.as_tensor(event_mask, dtype=torch.bool, device=reward.device)
+    if reward.ndim != 1 or reward.shape != event_mask.shape:
+        raise ValueError("Planner event reward and mask must share a 1-D shape.")
+    if not torch.isfinite(reward).all().item():
+        raise FloatingPointError("Planner event reward must be finite.")
+    masked = torch.where(event_mask, reward, torch.zeros_like(reward))
+    if torch.any(masked < -1.0 - 1.0e-5).item() or torch.any(
+        masked > 1.0 + 1.0e-5
+    ).item():
+        raise ValueError("Planner event reward must lie in [-1, 1].")
+    return masked
+
+
 class InstinctRlVecEnvWrapper(VecEnv):
     """Wraps around Isaac Lab environment for Instinct-RL library
     Reference:
@@ -242,10 +262,14 @@ class InstinctRlVecEnvWrapper(VecEnv):
                 nominal_unsafe_event
             )
             if torch.any(foothold_event):
-                extras["learned_foothold_event_reward"] = (
-                    read_foothold_event_reward(self.unwrapped.reward_manager)
-                    .to(device=self.device, dtype=torch.float32)
+                event_reward = read_foothold_event_reward(
+                    self.unwrapped.reward_manager
+                ).to(device=self.device, dtype=torch.float32)
+                event_reward = mask_foothold_event_reward(
+                    event_reward,
+                    foothold_event,
                 )
+                extras["learned_foothold_event_reward"] = event_reward
             else:
                 extras["learned_foothold_event_reward"] = torch.zeros(
                     self.num_envs,

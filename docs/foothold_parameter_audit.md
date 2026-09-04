@@ -52,7 +52,7 @@
 | `outer_radius_x` | `1.00` | `instinctlab_foothold/flat_provider.py` | 固定前后可达半轴 | G1 腿部运动学可达范围扫描 | 临时固定，仍需实机标定 |
 | `outer_radius_y` | `0.50` | `instinctlab_foothold/flat_provider.py` | 2026-09-03 放宽的实验动作/搜索边界，不代表已标定的 G1 物理极限 | G1 腿部运动学可达范围扫描 | 需要标定 |
 | `min_lateral_separation` | `0.06` | `instinctlab_foothold/flat_provider.py` | 临时保守值 | 左右脚防交叉安全间距，至少要结合脚宽和脚间距 | 需要标定 |
-| `nominal_step_width` | `0.30` | `instinctlab_foothold/flat_provider.py` | 2026-09-03 放宽的实验期望步宽；active G1 shoe URDF 静态链路粗算左右 sole 中心距约 `0.237 m`，当前值高于静态几何值 | reset 初始站姿左右脚中心距离，或 gait/reference 中的默认脚宽 | 需要标定 |
+| `nominal_step_width` | `0.26` | `instinctlab_foothold/flat_provider.py` | 当前实验期望步宽；active G1 shoe URDF 静态链路粗算左右 sole 中心距约 `0.237 m`，当前值略高于静态几何值 | reset 初始站姿左右脚中心距离，或 gait/reference 中的默认脚宽 | 需要标定 |
 
 当前边界：`min_lateral_separation=0.06` 仍只属于解析平地名义目标生成器的临时参数；学习式落点的几何有效性不再使用它作左右脚硬拒绝。学习式目标只检查有限性、世界地形高度、最大步高和可达椭圆，横向偏离通过名义点距离代价和真实安全评分学习。
 | `flat_target_lookahead_phase` | `0.8` | `sensors/foothold_planner/foothold_planner_cfg.py` | 临时标定比例：预计在 swing phase 的 80% 处触地 | 真实 touchdown phase 分布、`last_air_time / swing_duration_s` 分布 | 需要标定 |
@@ -69,7 +69,7 @@
 | `recovery_step_length_m` | `0.04` | `sensors/foothold_planner/foothold_planner_cfg.py` | 保守恢复步设定 | recovery 后真实稳定率和速度偏差 | 需要统计验证 |
 | `recovery_step_velocity_lookahead_s` | `0.10` | `sensors/foothold_planner/foothold_planner_cfg.py` | 保守恢复步设定 | recovery 阶段实际可控时间窗 | 需要标定 |
 | `recovery_step_max_length_m` | `0.12` | `sensors/foothold_planner/foothold_planner_cfg.py` | 保守恢复步设定 | 运动学可达范围和稳定性 | 需要标定 |
-| `recovery_step_width_m` | `0.30` | `sensors/foothold_planner/foothold_planner_cfg.py` | 与当前实验 `nominal_step_width` 保持一致；尚未标定 | reset 初始站姿左右脚中心距离，或 recovery 阶段更保守的同源缩放值 | 需要和 `nominal_step_width` 合并来源 |
+| `recovery_step_width_m` | `0.26` | `sensors/foothold_planner/foothold_planner_cfg.py` | 与当前实验 `nominal_step_width` 保持一致；尚未标定 | reset 初始站姿左右脚中心距离，或 recovery 阶段更保守的同源缩放值 | 需要和 `nominal_step_width` 合并来源 |
 | `sole_center_offset_b` | `(0.039, 0.0, -0.058)` | `sensors/foothold_planner/foothold_planner_cfg.py` | active G1 shoe URDF 脚底接触圆柱外包络：x 中心 `0.039`，底面 z `-0.058` | 换机器人/换鞋版 URDF 时重新解析 ankle roll link 下的 foot contact collisions | 已对齐 |
 | `sole_half_length` | `0.093` | `sensors/foothold_planner/foothold_planner_cfg.py` | active G1 shoe URDF 外包络 x 范围 `[-0.054, 0.132]`，长度 `0.186` | 换机器人/换鞋版 URDF 时重新解析 | 已对齐 |
 | `sole_half_width` | `0.036` | `sensors/foothold_planner/foothold_planner_cfg.py` | active G1 shoe URDF 外包络 y 范围 `[-0.036, 0.036]`，宽度 `0.072` | 换机器人/换鞋版 URDF 时重新解析 | 已对齐 |
@@ -199,7 +199,7 @@ right sole center y ≈ -0.1185 m
 left-right width    ≈  0.2370 m
 ```
 
-这不是最终 `nominal_step_width` 的标定值，因为实际 reset 后的关节姿态、motion reference 和策略站姿都会影响真实脚宽。当前实验值 `nominal_step_width=0.30` 和 `recovery_step_width_m=0.30` 高于该静态几何粗算值，必须通过正常 touchdown 数据继续验证，不能视为已经完成标定。
+这不是最终 `nominal_step_width` 的标定值，因为实际 reset 后的关节姿态、motion reference 和策略站姿都会影响真实脚宽。当前实验值 `nominal_step_width=0.26` 和 `recovery_step_width_m=0.26` 略高于该静态几何粗算值，必须通过正常 touchdown 数据继续验证，不能视为已经完成标定。
 
 下一步应该用运行时统计确认：
 
@@ -365,3 +365,45 @@ python tests/parkour/foothold/analyze_foothold_play_log.py \
 - 根据完整 `last_air_time_s` 中位数给出的参考 lookahead；
 - `swing_air_time_s`、`last_air_time_s`、`target_delta_f`、`ellipse_usage`、`ref_xy_err`、`td_xy_err` 的统计；
 - 左右脚分开统计，用于检查左右腿是否再次失衡。
+
+## 7. Event-SAC planner 基线（2026-09-04）
+
+本节只描述学习式落足 planner 的 SAC，不改变电机 PPO、AMP、MoE 或状态机。
+planner 的动作仍是名义落足点周围的二维归一化残差，物理解码范围为
+`x=0.12 m`、`y=0.10 m`。
+
+| 项目 | 基线值 | 说明 |
+| --- | --- | --- |
+| replay 容量 | `100000` | 只保存完整落足事件转移 |
+| batch | `256` | 事件级 SAC 小批量 |
+| warmup | `10000` 个事件 | 总事件数达到后才更新 |
+| unsafe warmup | `512` 个事件 | 防止只用平地安全事件启动 |
+| 事件采样比 | `0.5` | 每个新事件平均贡献约 0.5 个梯度更新 |
+| 单轮更新上限 | `24` | 超出部分保留为 update credit，不丢失 |
+| actor/target 更新频率 | 每 `2` 次 critic 更新 | 降低稀疏事件下的 actor 抖动 |
+| actor/critic/alpha 学习率 | `1e-4` | planner 专用，不影响电机 PPO |
+| 折扣因子 | `0.95` | 落足事件的短期后果更重要 |
+| 目标网络软更新 | `tau=0.005` | SAC 常用稳定值 |
+| 初始 alpha | `0.05` | 二维落点动作的初始探索温度 |
+| 目标熵 | `-0.5` | 不按电机 29 维动作数设置 |
+| 安全名义锚定 | `0.25` | 只对“名义点安全”事件约束残差接近零 |
+
+SAC 回放额外保存“名义点安全/不安全”分支，并在两类样本都存在时按约
+`1:1` 抽样。事件奖励先按环境事件掩码清零，再进入回放；奖励必须保持在
+`[-1,1]`，否则立即报错，避免把别的环境的分数或重复加权带入 planner。
+
+planner 的高斯标准差改用残差解码范围归一化，而不是可达椭圆半径：
+
+```text
+初始物理标准差 = (0.025 m, 0.020 m)
+最小物理标准差 = (0.005 m, 0.005 m)
+最大物理标准差 = (0.040 m, 0.040 m)
+```
+
+因此初始归一化标准差约为 `(0.208, 0.200)`。标准差由 planner 特征给出，
+并在上述物理范围对应的归一化上下界内裁剪；电机动作分布仍使用原有 PPO
+路径。新增的 `foothold_log_std_actor` 只属于 planner actor 参数组。
+
+旧的 SAC 回放/critic 状态不能直接续接到这版：事件奖励掩码、分支标签、
+动作探索尺度都已改变。加载版本低于 3 的 checkpoint 时只保留 planner
+actor 权重，并重新建立 SAC replay、critic、温度和优化器状态。

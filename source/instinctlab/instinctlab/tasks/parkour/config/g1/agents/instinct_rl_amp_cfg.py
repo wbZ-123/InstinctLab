@@ -77,16 +77,25 @@ class AmpAlgoCfg(InstinctRlPpoAlgorithmCfg):
     sac_hidden_dims = [128, 128]
     sac_replay_capacity = 100000
     sac_batch_size = 256
-    sac_warmup_events = 1024
-    sac_target_sample_ratio = 0.125
-    sac_max_updates_per_rollout = 4
+    sac_warmup_events = 10000
+    sac_min_unsafe_events = 512
+    sac_target_sample_ratio = 0.5
+    sac_max_updates_per_rollout = 24
+    sac_actor_update_frequency = 2
+    sac_target_update_frequency = 2
     sac_actor_learning_rate = 1.0e-4
     sac_critic_learning_rate = 1.0e-4
     sac_alpha_learning_rate = 1.0e-4
-    sac_gamma = 0.99
+    sac_gamma = 0.95
     sac_tau = 0.005
-    sac_target_entropy = -2.0
+    sac_target_entropy = -0.5
+    sac_initial_alpha = 0.05
+    sac_nominal_anchor_coef = 0.25
     sac_max_grad_norm = 1.0
+    # The planner action is a normalized residual around the analytic
+    # nominal point; these are the decoder's physical XY limits, not the
+    # larger reachability ellipse used for geometric validation.
+    foothold_residual_limits_m = (0.12, 0.10)
 
 
 @configclass
@@ -155,9 +164,10 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
         self.algorithm.motor_action_dim = 29
         self.algorithm.execution_reward_index = 0
         self.algorithm.foothold_reward_index = 1
-        self.algorithm.foothold_initial_std_m = (0.05, 0.05)
-        self.algorithm.foothold_min_std_m = (0.02, 0.02)
-        self.algorithm.foothold_max_std_m = (0.05, 0.05)
+        self.algorithm.foothold_initial_std_m = (0.025, 0.020)
+        self.algorithm.foothold_min_std_m = (0.005, 0.005)
+        self.algorithm.foothold_max_std_m = (0.040, 0.040)
+        self.algorithm.foothold_residual_limits_m = (0.12, 0.10)
         self.algorithm.foothold_reachability_radii_m = reachability_radii_m
         # A 64-env acceptance run showed that one 1e-3 planner update creates
         # O(1e2) KL.  Start at PPO's existing adaptive lower bound; the

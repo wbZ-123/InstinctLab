@@ -123,8 +123,8 @@ def test_learned_training_selects_independent_policy_and_sourced_bounds():
     assert "self.policy.motor_action_dim = 29" in config_text
     assert "self.policy.foothold_depth_output_size = 64" in config_text
     assert "self.policy.foothold_depth_hidden_channels = 8" in config_text
-    assert "self.algorithm.foothold_min_std_m = (0.02, 0.02)" in config_text
-    assert "self.algorithm.foothold_max_std_m = (0.05, 0.05)" in config_text
+    assert "self.algorithm.foothold_min_std_m = (0.005, 0.005)" in config_text
+    assert "self.algorithm.foothold_max_std_m = (0.040, 0.040)" in config_text
     assert "self.algorithm.foothold_learning_rate = 1.0e-5" in config_text
     assert (
         "self.algorithm.foothold_entropy_coef = self.algorithm.entropy_coef"

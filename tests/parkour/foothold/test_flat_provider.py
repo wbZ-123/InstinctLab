@@ -15,7 +15,7 @@ def test_default_velocity_lookahead_is_short_enough_for_training_curriculum():
     assert cfg.velocity_lookahead_s == 0.10
     assert cfg.outer_radius_x == 1.00
     assert cfg.outer_radius_y == 0.50
-    assert cfg.nominal_step_width == 0.30
+    assert cfg.nominal_step_width == 0.26
     assert cfg.curriculum_radius_x == (0.0, 0.0, 0.0)
     assert cfg.curriculum_radius_y == (0.0, 0.0, 0.0)
 

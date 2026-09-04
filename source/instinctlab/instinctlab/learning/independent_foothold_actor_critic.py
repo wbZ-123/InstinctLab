@@ -80,6 +80,17 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         self.motor_std = nn.Parameter(joint_std[: self.motor_action_dim])
         self.foothold_std = nn.Parameter(joint_std[self.motor_action_dim :])
         self.foothold_actor = self._build_foothold_actor()
+        # Keep the planner mean head two-dimensional (the environment action
+        # shape must stay 29 motor + 2 planner actions) and add a separate
+        # two-dimensional state-dependent log-standard-deviation head for
+        # SAC exploration.
+        self.foothold_log_std_actor = self._build_foothold_log_std_actor()
+        self.register_buffer("foothold_log_std_min", torch.zeros(2))
+        self.register_buffer("foothold_log_std_max", torch.zeros(2))
+        self.register_buffer(
+            "foothold_state_dependent_std",
+            torch.tensor(False, dtype=torch.bool),
+        )
 
     def _build_actor(self, _num_actions):
         # Keep the historical ``actor.*`` key space and only change its output
@@ -100,6 +111,54 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
             if index < len(dimensions) - 2:
                 layers.append(get_activation(self.activation))
         return nn.Sequential(*layers)
+
+    def _build_foothold_log_std_actor(self) -> nn.Sequential:
+        dimensions = (
+            self.mlp_input_dim_a + self.foothold_depth_output_size,
+            *self.foothold_hidden_dims,
+            self.foothold_action_dim,
+        )
+        layers: list[nn.Module] = []
+        for index, (input_dim, output_dim) in enumerate(
+            zip(dimensions[:-1], dimensions[1:])
+        ):
+            layer = nn.Linear(input_dim, output_dim)
+            if index == len(dimensions) - 2:
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+            layers.append(layer)
+            if index < len(dimensions) - 2:
+                layers.append(get_activation(self.activation))
+        return nn.Sequential(*layers)
+
+    @torch.no_grad()
+    def configure_foothold_std_bounds(
+        self,
+        minimum: torch.Tensor,
+        maximum: torch.Tensor,
+        initial: torch.Tensor,
+    ) -> None:
+        """Enable bounded state-dependent planner exploration."""
+
+        minimum = torch.as_tensor(minimum, device=self.foothold_std.device, dtype=self.foothold_std.dtype)
+        maximum = torch.as_tensor(maximum, device=self.foothold_std.device, dtype=self.foothold_std.dtype)
+        initial = torch.as_tensor(initial, device=self.foothold_std.device, dtype=self.foothold_std.dtype)
+        if minimum.shape != (2,) or maximum.shape != (2,) or initial.shape != (2,):
+            raise ValueError("Planner standard-deviation bounds must be XY pairs.")
+        if (
+            torch.any(minimum <= 0.0)
+            or torch.any(minimum >= maximum)
+            or torch.any(initial < minimum)
+            or torch.any(initial > maximum)
+        ):
+            raise ValueError("Planner standard-deviation bounds are invalid.")
+        self.foothold_log_std_min.copy_(minimum.log())
+        self.foothold_log_std_max.copy_(maximum.log())
+        self.foothold_std.copy_(initial)
+        final = self.foothold_log_std_actor[-1]
+        assert isinstance(final, nn.Linear)
+        final.bias.copy_(initial.log())
+        self.foothold_state_dependent_std.fill_(True)
 
     def _action_mean(
         self,
@@ -171,9 +230,16 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
                 f"{features.shape[-1]} != {self.foothold_actor[0].in_features}."
             )
         mean = self.foothold_actor(features)
-        # SAC updates this parameter directly; keep the distribution valid
-        # between the existing post-update physical-bound clamps.
-        scale = self.foothold_std.clamp_min(1.0e-4).expand_as(mean)
+        if bool(self.foothold_state_dependent_std.item()):
+            log_std = self.foothold_log_std_actor(features).clamp(
+                self.foothold_log_std_min,
+                self.foothold_log_std_max,
+            )
+            scale = log_std.exp()
+        else:
+            # Keep the historical global parameter as a fallback for legacy
+            # callers that do not configure SAC bounds.
+            scale = self.foothold_std.clamp_min(1.0e-4).expand_as(mean)
         return Normal(mean, scale)
 
     def sample_planner_action(
@@ -242,6 +308,7 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         return self._parameters_with_prefixes(
             (
                 "foothold_actor",
+                "foothold_log_std_actor",
                 "foothold_depth_encoder",
                 "foothold_std",
                 "critics.1",
@@ -260,6 +327,7 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         return self._parameters_with_prefixes(
             (
                 "foothold_actor",
+                "foothold_log_std_actor",
                 "foothold_std",
             ),
             include=True,
@@ -274,7 +342,7 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         """
 
         return self._parameters_with_prefixes(
-            ("foothold_actor", "foothold_std"),
+            ("foothold_actor", "foothold_log_std_actor", "foothold_std"),
             include=True,
         )
 
@@ -290,6 +358,7 @@ class IndependentFootholdMoEActorCritic(MoEActorCritic):
         return self._parameters_with_prefixes(
             (
                 "foothold_actor",
+                "foothold_log_std_actor",
                 "foothold_depth_encoder",
                 "foothold_std",
                 "critics.1",

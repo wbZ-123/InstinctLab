@@ -28,10 +28,11 @@ def test_sac_defaults_are_planner_only():
     ).read_text()
     assert "self.algorithm.class_name = algorithm_class_name" in source
     assert "sac_batch_size = 256" in source
-    assert "sac_warmup_events = 1024" in source
-    assert "sac_target_sample_ratio = 0.125" in source
-    assert "sac_max_updates_per_rollout = 4" in source
-    assert "sac_target_entropy = -2.0" in source
+    assert "sac_warmup_events = 10000" in source
+    assert "sac_min_unsafe_events = 512" in source
+    assert "sac_target_sample_ratio = 0.5" in source
+    assert "sac_max_updates_per_rollout = 24" in source
+    assert "sac_target_entropy = -0.5" in source
 
 
 def test_training_diagnostics_print_event_scaled_sac_settings():
