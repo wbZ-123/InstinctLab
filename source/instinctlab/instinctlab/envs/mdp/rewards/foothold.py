@@ -444,6 +444,8 @@ def learned_foothold_planning_event_reward(
     nominal_step_width_m: float = 0.18,
     velocity_std: float = 0.5,
     safety_margin_reference_m: float = 0.04,
+    nominal_deviation_radius_x_m: float | None = None,
+    nominal_deviation_radius_y_m: float | None = None,
     # Kept for compatibility with older callers.  The branch-specific
     # objective no longer mixes these scalar weights into the safe-nominal
     # case.
@@ -453,12 +455,15 @@ def learned_foothold_planning_event_reward(
     """Score learned footholds with branch-specific objectives.
 
     A safe nominal target is already the desired answer, so a safe learned
-    target is scored only by its bounded distance to that nominal target.  A
-    learned target that penetrates an obstacle receives only safety-driven
-    punishment, with optional one-sided penalties for excessive deviation or
-    reverse motion.  Progress and step-shape rewards are reserved for safe
-    corrections to an unsafe nominal target. ``velocity_std`` and the legacy
-    nominal weights remain accepted for checkpoint/config compatibility.
+    target is scored only by its bounded residual distance to that nominal
+    target.  The residual radii default to the legacy arguments for backwards
+    compatibility, but the simulator passes the learned action envelope
+    explicitly.  A learned target that penetrates an obstacle receives only
+    safety-driven punishment, with optional one-sided penalties for excessive
+    deviation or reverse motion.  Progress and step-shape rewards are
+    reserved for safe corrections to an unsafe nominal target.
+    ``velocity_std`` and the legacy nominal weights remain accepted for
+    checkpoint/config compatibility.
     """
 
     if (
@@ -468,6 +473,18 @@ def learned_foothold_planning_event_reward(
         or nominal_step_width_m < 0.0
         or velocity_std <= 0.0
         or safety_margin_reference_m <= 0.0
+        or (
+            nominal_deviation_radius_x_m is not None
+            and nominal_deviation_radius_x_m <= 0.0
+        )
+        or (
+            nominal_deviation_radius_y_m is not None
+            and nominal_deviation_radius_y_m <= 0.0
+        )
+        or (
+            (nominal_deviation_radius_x_m is None)
+            != (nominal_deviation_radius_y_m is None)
+        )
         or (
             safe_nominal_weight is not None
             and not 0.0 <= safe_nominal_weight <= 1.0
@@ -481,19 +498,29 @@ def learned_foothold_planning_event_reward(
 
     data = _foothold_planner_data(env, sensor_name)
     event = data.learned_foothold_evaluated.bool()
+    nominal_radius_x = (
+        reachability_radius_x
+        if nominal_deviation_radius_x_m is None
+        else nominal_deviation_radius_x_m
+    )
+    nominal_radius_y = (
+        reachability_radius_y
+        if nominal_deviation_radius_y_m is None
+        else nominal_deviation_radius_y_m
+    )
     delta_xy = (
         data.learned_foothold_decoded_f[:, :2]
         - data.raw_unclipped_foothold_f[:, :2]
     )
     nominal_affinity = _nominal_deviation_reward(
         delta_xy,
-        reachability_radius_x=reachability_radius_x,
-        reachability_radius_y=reachability_radius_y,
+        reachability_radius_x=nominal_radius_x,
+        reachability_radius_y=nominal_radius_y,
     ).clamp_min(0.0)
     nominal_excess_cost = _nominal_excess_deviation_cost(
         delta_xy,
-        reachability_radius_x=reachability_radius_x,
-        reachability_radius_y=reachability_radius_y,
+        reachability_radius_x=nominal_radius_x,
+        reachability_radius_y=nominal_radius_y,
     )
     nominal_term = nominal_affinity - nominal_excess_cost
 
@@ -614,11 +641,27 @@ def learned_foothold_planning_event_reward(
     penetrating = penetrating | ~learned_safety_valid
     # A safe nominal target has no reason to be optimized for a different
     # direction or step shape.  Its learned counterpart should simply copy it.
+    # For an unsafe nominal target, safety is necessary but not sufficient:
+    # retain a bounded preference for command-consistent progress and a close
+    # residual.  The residual term is deliberately large enough to stop an
+    # unnecessary jump to the edge of the adjustment envelope, while the
+    # command terms still allow a backward correction when the nominal point
+    # overshoots a valid tread.
     unsafe_nominal_clear_score = (
         0.45 * safety_margin
-        + 0.30 * signed_command_progress
-        + 0.20 * reasonable_step
-        + 0.05 * nominal_term
+        + 0.25 * signed_command_progress
+        + 0.10 * reasonable_step
+        + 0.20 * nominal_term
+    )
+    # A final foothold whose displacement is opposite to the frozen command is
+    # not a valid way to handle a nominal point that overshot a tread.  A
+    # backward *correction* is still allowed whenever the final displacement
+    # remains command-consistent; only this true reverse-motion case is forced
+    # below zero.
+    unsafe_nominal_clear_score = torch.where(
+        signed_command_progress < 0.0,
+        -0.05 - 0.45 * (-signed_command_progress).clamp(0.0, 1.0),
+        unsafe_nominal_clear_score,
     )
 
     # Unsafe learned proposals must never obtain a positive score from making

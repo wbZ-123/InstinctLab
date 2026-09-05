@@ -99,7 +99,10 @@ parser.add_argument(
     "--show_foothold_debug_markers",
     action="store_true",
     default=False,
-    help="Show foothold target, swing reference, actual swing foot, and reference trajectory markers in play.",
+    help=(
+        "Show nominal (red) and selected/proposed (yellow) footholds, "
+        "swing reference, actual swing foot, and reference trajectory markers in play."
+    ),
 )
 parser.add_argument(
     "--foothold_debug_trajectory_samples",

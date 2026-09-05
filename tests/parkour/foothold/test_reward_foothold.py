@@ -469,6 +469,52 @@ def test_nominal_excess_deviation_cost_has_two_cm_deadband():
     )
 
 
+def test_planning_reward_uses_learned_residual_bounds_for_nominal_affinity():
+    foothold = _load_foothold_reward_module()
+    planner_data = SimpleNamespace(
+        learned_foothold_evaluated=torch.tensor([True, True, True]),
+        learned_foothold_geometric_valid=torch.tensor([True, True, True]),
+        learned_foothold_safety_valid=torch.tensor([True, True, True]),
+        learned_foothold_safety_score=torch.tensor([1.0, 1.0, 1.0]),
+        nominal_geometric_valid=torch.tensor([True, True, True]),
+        nominal_safety_valid=torch.tensor([True, True, True]),
+        raw_unclipped_foothold_f=torch.tensor(
+            [[0.20, 0.18, 0.0], [0.20, 0.18, 0.0], [0.20, 0.18, 0.0]]
+        ),
+        learned_foothold_decoded_f=torch.tensor(
+            [[0.20, 0.18, 0.0], [0.22, 0.18, 0.0], [0.32, 0.18, 0.0]]
+        ),
+        nominal_feasible_velocity_f=torch.tensor(
+            [[2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+        ),
+        velocity_lookahead_s=torch.tensor([0.10, 0.10, 0.10]),
+        swing_side=torch.tensor([0, 0, 0]),
+        swing_preflight_ready=torch.tensor([False, False, False]),
+        swing_preflight_safe=torch.tensor([True, True, True]),
+        stabilization_active=torch.zeros(3, dtype=torch.bool),
+    )
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            sensors={"foothold_planner": SimpleNamespace(data=planner_data)},
+        )
+    )
+
+    reward = foothold.learned_foothold_planning_event_reward(
+        env,
+        # Physical reachability is deliberately much wider than the learned
+        # residual envelope.  Nominal affinity must use the latter.
+        reachability_radius_x=0.42,
+        reachability_radius_y=0.25,
+        nominal_deviation_radius_x_m=0.12,
+        nominal_deviation_radius_y_m=0.10,
+    )
+
+    torch.testing.assert_close(
+        reward,
+        torch.tensor([1.0, 0.0, -1.0]),
+    )
+
+
 def test_penetrating_learned_target_cannot_receive_positive_planner_reward():
     foothold = _load_foothold_reward_module()
     planner_data = SimpleNamespace(
@@ -657,7 +703,7 @@ def test_safe_correction_combines_command_and_deviation_quality():
     )
 
     assert reward.item() > 0.0
-    torch.testing.assert_close(reward, torch.tensor([0.93]), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(reward, torch.tensor([0.79]), rtol=1e-5, atol=1e-5)
 
 
 def test_planning_reward_uses_runtime_lookahead_for_velocity_consistency():

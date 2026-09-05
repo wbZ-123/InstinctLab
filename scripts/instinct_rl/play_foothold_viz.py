@@ -13,6 +13,7 @@ MARKER_REFERENCE = 1
 MARKER_ACTUAL = 2
 MARKER_START = 3
 MARKER_TRAJECTORY = 4
+MARKER_NOMINAL = 5
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,32 @@ def _visible_planner_target_w(
     return None
 
 
+def _visible_nominal_foothold_w(
+    data: Any,
+    *,
+    env_id: int,
+) -> torch.Tensor | None:
+    """Return the prepared analytic nominal target for comparison."""
+
+    nominal_w = _select_env_tensor(
+        _safe_getattr(data, "nominal_foothold_w"),
+        env_id,
+    )
+    if (
+        nominal_w is None
+        or nominal_w.numel() != 3
+        or not bool(torch.isfinite(nominal_w).all().item())
+    ):
+        return None
+
+    prepared = _safe_getattr(data, "nominal_foothold_prepared")
+    if prepared is not None:
+        prepared_value = _select_env_int(prepared, env_id)
+        if prepared_value is not None and not bool(prepared_value):
+            return None
+    return nominal_w
+
+
 def _build_trajectory_points(
     *,
     start_w: torch.Tensor,
@@ -117,19 +144,28 @@ def build_foothold_marker_batch(
     swing_duration_s: float = 0.8,
 ) -> FootholdMarkerBatch | None:
     gait_mode = _select_env_int(_safe_getattr(data, "gait_mode"), env_id)
+    nominal_w = _visible_nominal_foothold_w(data, env_id=env_id)
     visible_target_w = _visible_planner_target_w(
         data,
         env_id=env_id,
         gait_mode=gait_mode,
     )
     if not _is_active_swing_mode(gait_mode):
-        if visible_target_w is None:
+        visible_points: list[torch.Tensor] = []
+        visible_indices: list[int] = []
+        if nominal_w is not None:
+            visible_points.append(nominal_w.reshape(1, 3))
+            visible_indices.append(MARKER_NOMINAL)
+        if visible_target_w is not None:
+            visible_points.append(visible_target_w.reshape(1, 3))
+            visible_indices.append(MARKER_TARGET)
+        if not visible_points:
             return None
         return FootholdMarkerBatch(
-            translations=visible_target_w.reshape(1, 3),
+            translations=torch.cat(visible_points, dim=0),
             marker_indices=torch.tensor(
-                [MARKER_TARGET],
-                device=visible_target_w.device,
+                visible_indices,
+                device=visible_points[0].device,
                 dtype=torch.long,
             ),
         )
@@ -166,31 +202,28 @@ def build_foothold_marker_batch(
         swing_duration_s=swing_duration_s,
     )
 
-    translations = torch.cat(
-        (
-            visible_target_w.reshape(1, 3),
-            reference_w.reshape(1, 3),
-            actual_w.reshape(1, 3),
-            start_w.reshape(1, 3),
-            trajectory_w,
-        ),
-        dim=0,
-    )
-    marker_indices = torch.cat(
-        (
-            torch.tensor(
-                [MARKER_TARGET, MARKER_REFERENCE, MARKER_ACTUAL, MARKER_START],
-                device=translations.device,
-                dtype=torch.long,
-            ),
-            torch.full(
-                (trajectory_w.shape[0],),
-                MARKER_TRAJECTORY,
-                device=translations.device,
-                dtype=torch.long,
-            ),
-        ),
-        dim=0,
+    marker_points = [
+        visible_target_w.reshape(1, 3),
+        reference_w.reshape(1, 3),
+        actual_w.reshape(1, 3),
+        start_w.reshape(1, 3),
+    ]
+    marker_indices_list = [
+        MARKER_TARGET,
+        MARKER_REFERENCE,
+        MARKER_ACTUAL,
+        MARKER_START,
+    ]
+    if nominal_w is not None:
+        marker_points.insert(0, nominal_w.reshape(1, 3))
+        marker_indices_list.insert(0, MARKER_NOMINAL)
+    marker_points.append(trajectory_w)
+    marker_indices_list.extend([MARKER_TRAJECTORY] * trajectory_w.shape[0])
+    translations = torch.cat(marker_points, dim=0)
+    marker_indices = torch.tensor(
+        marker_indices_list,
+        device=translations.device,
+        dtype=torch.long,
     )
     return FootholdMarkerBatch(
         translations=translations,
@@ -233,6 +266,12 @@ def make_foothold_visualizer():
                 radius=0.014,
                 visual_material=sim_utils.PreviewSurfaceCfg(
                     diffuse_color=(1.0, 0.0, 1.0),
+                ),
+            ),
+            "nominal_foothold": sim_utils.SphereCfg(
+                radius=0.045,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.0, 0.0),
                 ),
             ),
         },

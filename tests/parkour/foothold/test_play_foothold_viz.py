@@ -98,3 +98,30 @@ def test_build_foothold_marker_batch_shows_unsafe_planner_proposal_during_hold()
     assert torch.allclose(
         batch.translations[0], torch.tensor([1.2, -0.3, 0.25])
     )
+
+
+def test_build_foothold_marker_batch_shows_nominal_and_learned_targets_during_hold():
+    module = _load_play_foothold_viz_module()
+    data = SimpleNamespace(
+        gait_mode=torch.tensor([0]),
+        nominal_foothold_prepared=torch.tensor([True]),
+        nominal_foothold_w=torch.tensor([[0.8, 0.1, 0.0]]),
+        learned_foothold_transaction_evaluated=torch.tensor([True]),
+        learned_foothold_prepared_w=torch.tensor([[1.2, -0.3, 0.25]]),
+        learned_foothold_safety_valid=torch.tensor([False]),
+    )
+
+    batch = module.build_foothold_marker_batch(data, env_id=0)
+
+    assert batch is not None
+    assert batch.translations.shape == (2, 3)
+    assert batch.marker_indices.tolist() == [
+        module.MARKER_NOMINAL,
+        module.MARKER_TARGET,
+    ]
+    assert torch.allclose(
+        batch.translations[0], torch.tensor([0.8, 0.1, 0.0])
+    )
+    assert torch.allclose(
+        batch.translations[1], torch.tensor([1.2, -0.3, 0.25])
+    )

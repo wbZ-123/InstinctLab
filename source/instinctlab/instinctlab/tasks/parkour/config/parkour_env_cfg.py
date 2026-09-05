@@ -28,7 +28,11 @@ from instinctlab.managers import MultiRewardCfg
 from instinctlab.monitors import FootholdPlannerMonitorTerm, MonitorTermCfg
 from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.sensors import Grid3dPointsGeneratorCfg, NoisyGroupedRayCasterCameraCfg, VolumePointsCfg
-from instinctlab.sensors.foothold_planner import FootholdPlannerCfg
+from instinctlab.sensors.foothold_planner import (
+    LEARNED_FOOTHOLD_MAX_ADJUSTMENT_X_M,
+    LEARNED_FOOTHOLD_MAX_ADJUSTMENT_Y_M,
+    FootholdPlannerCfg,
+)
 from instinctlab.terrains import GreedyconcatEdgeCylinderCfg, TerrainImporterCfg
 from instinctlab.utils.noise import (
     CropAndResizeCfg,
@@ -1238,6 +1242,14 @@ class LearnedFootholdPlanningRewards:
             ),
             "nominal_step_width_m": (
                 _DEFAULT_FLAT_PROVIDER_CFG.nominal_step_width
+            ),
+            # Nominal affinity is a residual-shaping term.  It must use the
+            # learned action envelope, not the physical reachability ellipse.
+            "nominal_deviation_radius_x_m": (
+                LEARNED_FOOTHOLD_MAX_ADJUSTMENT_X_M
+            ),
+            "nominal_deviation_radius_y_m": (
+                LEARNED_FOOTHOLD_MAX_ADJUSTMENT_Y_M
             ),
             "safety_margin_reference_m": 0.04,
         },

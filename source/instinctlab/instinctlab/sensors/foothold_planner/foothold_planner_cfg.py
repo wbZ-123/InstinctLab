@@ -4,6 +4,14 @@ from isaaclab.utils import configclass
 from .foothold_planner import FootholdPlanner
 
 
+# The learned planner predicts a bounded residual around the analytic nominal
+# foothold.  Keep these values in one place so decoding and reward shaping use
+# the same envelope rather than accidentally normalizing the residual by the
+# much larger physical reachability ellipse.
+LEARNED_FOOTHOLD_MAX_ADJUSTMENT_X_M = 0.12
+LEARNED_FOOTHOLD_MAX_ADJUSTMENT_Y_M = 0.10
+
+
 @configclass
 class FootholdPlannerCfg(SensorBaseCfg):
     """Configuration for the foothold planner sensor."""
@@ -83,8 +91,12 @@ class FootholdPlannerCfg(SensorBaseCfg):
     # Learned actions are residuals around the frozen analytic nominal point.
     # Bounds are intentionally separate from the physical reachability ellipse:
     # they limit how far the learned planner may alter the analytic gait.
-    learned_foothold_max_adjustment_x_m: float = 0.12
-    learned_foothold_max_adjustment_y_m: float = 0.10
+    learned_foothold_max_adjustment_x_m: float = (
+        LEARNED_FOOTHOLD_MAX_ADJUSTMENT_X_M
+    )
+    learned_foothold_max_adjustment_y_m: float = (
+        LEARNED_FOOTHOLD_MAX_ADJUSTMENT_Y_M
+    )
 
     # Contact-adaptive recovery is opt-in until a calibration file is
     # available. Its motion/slip fields remain diagnostics; one confirmed
